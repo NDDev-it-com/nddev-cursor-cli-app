@@ -1,0 +1,8 @@
+{
+  "contract_version": 1,
+  "product_name": "nddev-cursor-cli-app",
+  "github_repository": "NDDev-it-com/nddev-cursor-cli-app",
+  "license": "AGPL-3.0-or-later",
+  "status": "skeleton",
+  "harness_id": "cursor-cli"
+}
