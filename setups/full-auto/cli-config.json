@@ -1,0 +1,29 @@
+{
+  "approvalMode": "unrestricted",
+  "editor": {
+    "vimMode": false
+  },
+  "hints": false,
+  "network": {
+    "useHttp1ForAgent": false
+  },
+  "notifications": true,
+  "permissions": {
+    "allow": [
+      "Shell(cat)",
+      "Shell(git diff)",
+      "Shell(git status)",
+      "Shell(ls)",
+      "Shell(pwd)",
+      "Shell(test)"
+    ],
+    "deny": [
+      "Shell(sudo)"
+    ]
+  },
+  "sandbox": {
+    "mode": "disabled",
+    "networkAccess": "enabled"
+  },
+  "version": 1
+}

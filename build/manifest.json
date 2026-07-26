@@ -1,0 +1,71 @@
+{
+  "schema_version": 2,
+  "name": "nddev-cursor-cli-app",
+  "build_version": "0.1.0",
+  "entrypoint": "python3 cli-tools/nddev_cursor_cli.py",
+  "source_root": "setups",
+  "setup_ids": ["full-auto", "review", "safe"],
+  "managed_files": [
+    "cli-config.json",
+    "NDDEV-CURSOR-CLI-SETUP.json"
+  ],
+  "command_policy": {
+    "json_supported": ["list", "status", "plan", "install", "switch", "restore", "remove"],
+    "plan_mutates": false,
+    "restore_backup_option": "--backup <0..9>",
+    "target_required": ["status", "plan", "install", "switch", "restore", "remove", "launch"]
+  },
+  "backup_policy": {
+    "canonical_target_bound": true,
+    "envelope": "NDDEV-CURSOR-CLI-BACKUP.json",
+    "location": "sibling .<target-name>.nddev-cursor-cli-backups",
+    "slots": 10
+  },
+  "runtime_compatibility": {
+    "baseline_ref": "references/cursor-cli-baseline.json",
+    "version_ref": "build/version.json"
+  },
+  "runtime_launch": {
+    "command": "agent",
+    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> agent [args...]",
+    "environment_variable": "CURSOR_CONFIG_DIR",
+    "forwards_arguments": true,
+    "forwards_child_exit_code": true,
+    "json_manager_errors_supported": true,
+    "manager_command": "python3 cli-tools/nddev_cursor_cli.py launch --target <absolute-target> -- [args...]",
+    "requires_clean_managed_target": true,
+    "streams_child_stdio": true,
+    "successful_child_output_wrapped": false,
+    "target_environment_scope": "child-process-only"
+  },
+  "builder_projection": {
+    "status": "native-local-plugin-projection",
+    "default_on": true,
+    "plugin_manifest": "plugins/nddev-builder/.cursor-plugin/plugin.json",
+    "target_plugin_path": "plugins/local/nddev-builder",
+    "surfaces": ["plugin", "rules", "skills", "agents"],
+    "official_documentation": {
+      "plugins": "https://cursor.com/docs/plugins",
+      "plugins_reference": "https://cursor.com/docs/reference/plugins",
+      "rules": "https://cursor.com/docs/rules",
+      "skills": "https://cursor.com/docs/skills",
+      "agents": "https://cursor.com/docs/subagents"
+    },
+    "marketplace": {
+      "team_marketplace_supported_by_cursor": true,
+      "module_installs_marketplace": false,
+      "reason": "The setup manager projects a local native Cursor plugin into the selected target; it does not provision Cursor team marketplace state."
+    }
+  },
+  "transaction_policy": {
+    "managed_file_mode": "0600",
+    "new_target_mode": "0700",
+    "preserve_existing_target_mode": true,
+    "preserve_unmanaged_files": true,
+    "preserve_unmanaged_config_keys": true,
+    "reject_symlink_managed_files": true,
+    "rollback_on_failure": true,
+    "staging": "same-parent temporary directory",
+    "lock": "exclusive sibling directory"
+  }
+}

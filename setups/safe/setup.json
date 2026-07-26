@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "id": "safe",
+  "description": "Cursor CLI defaults for read-heavy work with allowlisted shell access and sandboxed execution.",
+  "managed_files": ["cli-config.json"],
+  "builder_projection": "default-on"
+}

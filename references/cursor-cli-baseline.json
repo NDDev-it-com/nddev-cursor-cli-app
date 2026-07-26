@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "verified_ref": "references/cursor-cli-baseline.json",
+  "verified_date": "2026-07-26",
+  "cli_identity": {
+    "command": "agent",
+    "documentation": "https://cursor.com/docs/cli/reference/parameters"
+  },
+  "configuration": {
+    "file": "cli-config.json",
+    "default_location": "~/.cursor/cli-config.json",
+    "environment_override": "CURSOR_CONFIG_DIR",
+    "schema_version": 1,
+    "documentation": "https://cursor.com/docs/cli/reference/configuration"
+  },
+  "native_capability_surfaces": {
+    "rules": "https://cursor.com/docs/rules",
+    "skills": "https://cursor.com/docs/skills",
+    "agents": "https://cursor.com/docs/subagents",
+    "plugins": "https://cursor.com/docs/reference/plugins"
+  }
+}

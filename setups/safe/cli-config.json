@@ -1,0 +1,30 @@
+{
+  "approvalMode": "allowlist",
+  "editor": {
+    "vimMode": false
+  },
+  "hints": true,
+  "network": {
+    "useHttp1ForAgent": false
+  },
+  "notifications": true,
+  "permissions": {
+    "allow": [
+      "Shell(cat)",
+      "Shell(git status)",
+      "Shell(ls)",
+      "Shell(pwd)"
+    ],
+    "deny": [
+      "Shell(curl)",
+      "Shell(rm)",
+      "Shell(sudo)",
+      "Shell(wget)"
+    ]
+  },
+  "sandbox": {
+    "mode": "enabled",
+    "networkAccess": "disabled"
+  },
+  "version": 1
+}
