@@ -42,7 +42,9 @@ python3 cli-tools/nddev_cursor_cli.py launch --target /absolute/cursor-config --
 ```
 
 `launch` requires a clean managed setup plus current target-owned software,
-executes only the absolute target `bin/agent`, and never falls back to `PATH`.
+executes only the absolute target `bin/agent`, never falls back to `PATH`, and
+rejects Cursor flags or subcommands that would override the managed approval,
+sandbox, worktree, shell-integration, worker, or self-update lifecycle.
 
 The setup variants also project `nddev-builder` as a local native Cursor plugin
 under the selected target. The projection uses Cursor's plugin, rules, skills,

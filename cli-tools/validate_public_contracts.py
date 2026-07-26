@@ -78,6 +78,24 @@ SOFTWARE_LIFECYCLE_KEYS = {
     "update_precondition",
 }
 STATUS_FIELDS = ["installed", "current", "present", "presence", "drift"]
+BLOCKED_LAUNCH_OVERRIDES = [
+    "--approve-mcps",
+    "--force",
+    "-f",
+    "--network",
+    "--sandbox",
+    "--skip-worktree-setup",
+    "--trust",
+    "--worktree",
+    "-w",
+    "--yolo",
+    "acp",
+    "install-shell-integration",
+    "sandbox",
+    "uninstall-shell-integration",
+    "update",
+    "worker",
+]
 
 
 def load_json(relative: str, errors: list[str]) -> dict | None:
@@ -138,6 +156,10 @@ def main() -> int:
             errors.append(
                 "build/manifest.json: runtime_launch must require current target-owned software"
             )
+        if launch.get("managed_override_args_blocked") != BLOCKED_LAUNCH_OVERRIDES:
+            errors.append(
+                "build/manifest.json: runtime_launch managed override block list mismatch"
+            )
         software = manifest.get("software_install", {})
         if software.get("version") != CURSOR_RELEASE_ID:
             errors.append("build/manifest.json: software_install.version mismatch")
@@ -168,6 +190,10 @@ def main() -> int:
         if launch.get("requires_current_target_owned_software") is not True:
             errors.append(
                 "config/nddev-contract.json: runtime_launch must require current target-owned software"
+            )
+        if launch.get("managed_override_args_blocked") != BLOCKED_LAUNCH_OVERRIDES:
+            errors.append(
+                "config/nddev-contract.json: runtime_launch managed override block list mismatch"
             )
         software = contract.get("software_install")
         if not isinstance(software, dict):

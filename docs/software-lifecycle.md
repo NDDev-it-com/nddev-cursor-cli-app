@@ -17,6 +17,9 @@ caller home, system prefix, npm global prefix, or pip environment.
   If the target is already current, it returns an idempotent no-op without downloading.
 - `launch --target <absolute-target> -- ...` requires both a clean setup stamp
   and current target-owned software, then executes only `<target>/bin/agent`.
+  It rejects Cursor flags or subcommands that would override the managed
+  approval, sandbox, worktree, shell-integration, worker, or self-update
+  lifecycle.
 
 ## Source and integrity
 

@@ -76,6 +76,28 @@ PROVIDER_SECRET_NAMES = {
     "CURSOR_API_KEY",
     "CURSOR_TOKEN",
 }
+BLOCKED_LAUNCH_LONG_FLAGS = {
+    "--approve-mcps",
+    "--force",
+    "--network",
+    "--sandbox",
+    "--skip-worktree-setup",
+    "--trust",
+    "--worktree",
+    "--yolo",
+}
+BLOCKED_LAUNCH_SHORT_FLAGS = {
+    "f": "--force",
+    "w": "--worktree",
+}
+BLOCKED_LAUNCH_COMMANDS = {
+    "acp",
+    "install-shell-integration",
+    "sandbox",
+    "uninstall-shell-integration",
+    "update",
+    "worker",
+}
 SETUP_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 MANAGED_CONFIG_KEYS = (
     "version",
@@ -930,6 +952,13 @@ def read_artifact(source: str) -> bytes:
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         expected = response.headers.get("Content-Length")
+        if expected is not None:
+            try:
+                expected_size = int(expected)
+            except ValueError:
+                fail("Cursor software artifact returned an invalid Content-Length")
+        else:
+            expected_size = None
         blocks: list[bytes] = []
         total = 0
         while True:
@@ -941,7 +970,7 @@ def read_artifact(source: str) -> bytes:
                 fail("Cursor software artifact exceeds the bounded download limit")
             blocks.append(block)
     content = b"".join(blocks)
-    if expected is not None and int(expected) != len(content):
+    if expected_size is not None and expected_size != len(content):
         fail("Cursor software artifact download length changed while reading")
     return content
 
@@ -1259,6 +1288,11 @@ def prepare_cursor_artifact() -> dict[str, Any]:
 
 
 def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
+    if command == "update-cli":
+        preflight = software_status(target)
+        if not preflight["present"]:
+            fail("update-cli requires existing target-owned Cursor CLI software presence")
+    before_target_exists = target.exists() or target.is_symlink()
     with target_lock(target):
         ensure_target_directory(target)
         status = software_status(target)
@@ -1391,6 +1425,7 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
             remove_empty_directory_if_created(versions, before_versions_exists)
             remove_empty_directory_if_created(root, before_root_exists)
             remove_empty_directory_if_created(container, before_container_exists)
+            remove_empty_directory_if_created(target, before_target_exists)
             raise
         if rollback_parent is not None:
             with contextlib.suppress(FileNotFoundError):
@@ -1411,8 +1446,27 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
         }
 
 
+def reject_managed_launch_overrides(cursor_args: list[str]) -> None:
+    if cursor_args[:1] and cursor_args[0] in BLOCKED_LAUNCH_COMMANDS:
+        fail(f"launch refuses Cursor command that bypasses managed lifecycle: {cursor_args[0]}")
+    for argument in cursor_args:
+        if argument == "--":
+            continue
+        if argument.startswith("--"):
+            option = argument.split("=", 1)[0]
+            if option in BLOCKED_LAUNCH_LONG_FLAGS:
+                fail(f"launch refuses managed Cursor override option: {option}")
+            continue
+        if argument.startswith("-") and argument != "-":
+            for flag in argument[1:]:
+                blocked = BLOCKED_LAUNCH_SHORT_FLAGS.get(flag)
+                if blocked is not None:
+                    fail(f"launch refuses managed Cursor override option: -{flag} ({blocked})")
+
+
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
     forwarded = cursor_args[1:] if cursor_args[:1] == ["--"] else cursor_args
+    reject_managed_launch_overrides(forwarded)
     with target_lock(target):
         require_clean_managed(target)
         software = software_status(target)

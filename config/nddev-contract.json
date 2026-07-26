@@ -37,6 +37,7 @@
     "forwards_child_exit_code": true,
     "json_manager_errors_supported": true,
     "manager_command": "python3 cli-tools/nddev_cursor_cli.py launch --target <absolute-target> -- [args...]",
+    "managed_override_args_blocked": ["--approve-mcps", "--force", "-f", "--network", "--sandbox", "--skip-worktree-setup", "--trust", "--worktree", "-w", "--yolo", "acp", "install-shell-integration", "sandbox", "uninstall-shell-integration", "update", "worker"],
     "requires_clean_managed_target": true,
     "requires_current_target_owned_software": true,
     "path_fallback": false,
