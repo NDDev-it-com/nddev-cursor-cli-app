@@ -10,10 +10,10 @@
     "NDDEV-CURSOR-CLI-SETUP.json"
   ],
   "command_policy": {
-    "json_supported": ["list", "status", "plan", "install", "switch", "restore", "remove"],
+    "json_supported": ["list", "status", "plan", "install", "switch", "restore", "remove", "software-status", "install-cli", "update-cli"],
     "plan_mutates": false,
     "restore_backup_option": "--backup <0..9>",
-    "target_required": ["status", "plan", "install", "switch", "restore", "remove", "launch"]
+    "target_required": ["status", "plan", "install", "switch", "restore", "remove", "software-status", "install-cli", "update-cli", "launch"]
   },
   "backup_policy": {
     "canonical_target_bound": true,
@@ -27,16 +27,38 @@
   },
   "runtime_launch": {
     "command": "agent",
-    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> agent [args...]",
+    "managed_command": "bin/agent",
+    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> <absolute-target>/bin/agent [args...]",
     "environment_variable": "CURSOR_CONFIG_DIR",
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
     "json_manager_errors_supported": true,
     "manager_command": "python3 cli-tools/nddev_cursor_cli.py launch --target <absolute-target> -- [args...]",
     "requires_clean_managed_target": true,
+    "requires_current_target_owned_software": true,
+    "path_fallback": false,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
     "target_environment_scope": "child-process-only"
+  },
+  "software_install": {
+    "supported": true,
+    "mechanism": "official-cursor-agent-artifact",
+    "version": "2026.07.23-e383d2b",
+    "command": "agent",
+    "status_command": "python3 cli-tools/nddev_cursor_cli.py software-status --target <absolute-target> [--json]",
+    "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target <absolute-target> [--json]",
+    "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target <absolute-target> [--json]",
+    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
+    "status_fields": ["installed", "current", "present", "presence", "drift"],
+    "install_precondition": "absent target-owned software presence",
+    "update_precondition": "existing target-owned software presence, including repairable missing or corrupt identity stamp",
+    "update_current_behavior": "idempotent no-op without downloading",
+    "stage_and_atomic_swap": true,
+    "managed_command": "bin/agent",
+    "layout": ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/",
+    "npm": null,
+    "pip": null
   },
   "builder_projection": {
     "status": "native-local-plugin-projection",

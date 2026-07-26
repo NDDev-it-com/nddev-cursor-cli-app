@@ -8,3 +8,5 @@ All notable changes to `nddev-cursor-cli-app` are documented here.
 - `safe`, `review`, and `full-auto` setup variants for `cli-config.json`.
 - Default-on native `nddev-builder` Cursor plugin projection with rules,
   skills, and agents components.
+- Target-owned Cursor Agent software status/install/update lifecycle using
+  pinned official Cursor artifacts.
