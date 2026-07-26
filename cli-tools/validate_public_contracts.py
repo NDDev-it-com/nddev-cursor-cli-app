@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_VERSION_KEYS = {
     "build_version",
     "cursor_cli_identity",
+    "cursor_cli_tested",
     "cursor_config_schema",
     "nddev_builder_plugin_version",
     "python_requires",
@@ -76,6 +77,10 @@ def main() -> int:
             errors.append("config/nddev-contract.json: managed_state.managed_files mismatch")
 
     if baseline is not None:
+        if version is not None and baseline.get("release", {}).get("id") != version.get(
+            "cursor_cli_tested"
+        ):
+            errors.append("references/cursor-cli-baseline.json: release id disagrees with version")
         if baseline.get("cli_identity", {}).get("command") != "agent":
             errors.append("references/cursor-cli-baseline.json: CLI command must be agent")
         if baseline.get("configuration", {}).get("environment_override") != "CURSOR_CONFIG_DIR":

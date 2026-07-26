@@ -3,6 +3,7 @@
   "build_version": "0.1.0",
   "python_requires": ">=3.10",
   "cursor_cli_identity": "agent",
+  "cursor_cli_tested": "2026.07.23-e383d2b",
   "cursor_config_schema": 1,
   "runtime_baseline_ref": "references/cursor-cli-baseline.json",
   "nddev_builder_plugin_version": "0.1.0"
