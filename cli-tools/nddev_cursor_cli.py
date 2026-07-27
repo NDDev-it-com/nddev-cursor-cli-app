@@ -77,8 +77,6 @@ CURSOR_OFFICIAL_ASSETS = {
         82521188,
     ),
 }
-INTERNAL_FAIL_AFTER_VERSION_SWAP_ENV = "NDDEV_CURSOR_CLI_TEST_FAIL_AFTER_VERSION_SWAP"
-INTERNAL_FAIL_AFTER_BINARY_SWAP_ENV = "NDDEV_CURSOR_CLI_TEST_FAIL_AFTER_BINARY_SWAP"
 PROVIDER_SECRET_NAMES = {
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -2052,11 +2050,7 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
             if before_version_exists:
                 version_dir.rename(rollback)
             staging.rename(version_dir)
-            if os.environ.get(INTERNAL_FAIL_AFTER_VERSION_SWAP_ENV) == "1":
-                fail("injected failure after Cursor version swap")
             atomic_write_executable(binary_path, entrypoint)
-            if os.environ.get(INTERNAL_FAIL_AFTER_BINARY_SWAP_ENV) == "1":
-                fail("injected failure after Cursor binary swap")
             atomic_write(stamp_path, stamp_bytes)
             final_status = software_status(target)
             if not final_status["installed"]:

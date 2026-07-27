@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -386,12 +387,16 @@ def with_restored_attr(module: Any, name: str, value: Any):
 
 def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
     manager_source = (ROOT / "cli-tools" / "nddev_cursor_cli.py").read_text(encoding="utf-8")
-    if "NDDEV_CURSOR_CLI_TEST_ARTIFACT_URL" in manager_source:
-        errors.append("nddev_cursor_cli.py must not expose a test artifact URL env override")
-    if "INTERNAL_ARTIFACT_ENV" in manager_source:
-        errors.append("nddev_cursor_cli.py must not retain internal artifact env plumbing")
-    if "file://" in manager_source:
-        errors.append("nddev_cursor_cli.py must not accept file:// software artifacts")
+    disallowed_source_patterns = {
+        "NDDEV test switch": r"NDDEV_[A-Z0-9_]*TEST[A-Z0-9_]*",
+        "ALLOW_TEST switch": r"ALLOW_TEST[A-Z0-9_]*",
+        "fixture override": r"(?:FIXTURE|SOURCE_OVERRIDE|ARTIFACT_URL|TEST_TIMEOUT)",
+        "artificial failure switch": r"(?:FAIL_AFTER|INTERNAL_FAIL)",
+        "local artifact scheme": r"file://",
+    }
+    for label, pattern in disallowed_source_patterns.items():
+        if re.search(pattern, manager_source):
+            errors.append(f"nddev_cursor_cli.py must not expose {label}")
 
     artifact = b"official artifact bytes"
     asset_path = "linux/x64/agent-cli-package.tar.gz"
