@@ -46,6 +46,7 @@ CURSOR_RUNTIME_ENTRYPOINT = Path("cursor-agent")
 CURSOR_RUNTIME_REQUIRED_FILES = frozenset(
     {CURSOR_RUNTIME_ENTRYPOINT, Path("node"), Path("index.js")}
 )
+CURSOR_RUNTIME_EPHEMERAL_ROOTS = frozenset({Path(".running")})
 CURSOR_OFFICIAL_ASSETS = {
     ("darwin", "arm64"): (
         "darwin/arm64/agent-cli-package.tar.gz",
@@ -1286,6 +1287,24 @@ def runtime_tree_identity_from_disk(root: Path) -> dict[str, Any] | None:
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         entry_info = path.lstat()
+        if relative.parts and Path(relative.parts[0]) in CURSOR_RUNTIME_EPHEMERAL_ROOTS:
+            if stat.S_ISLNK(entry_info.st_mode):
+                fail(f"Cursor runtime ephemeral state must not be a symlink: {relative.as_posix()}")
+            if stat.S_ISREG(entry_info.st_mode):
+                if entry_info.st_nlink != 1:
+                    fail(
+                        "Cursor runtime ephemeral file must not have hard-link aliases: "
+                        f"{relative.as_posix()}"
+                    )
+                require_bounded_size(
+                    entry_info,
+                    f"Cursor runtime ephemeral file {relative.as_posix()}",
+                    METADATA_MAX_BYTES,
+                )
+                continue
+            if stat.S_ISDIR(entry_info.st_mode):
+                continue
+            fail(f"Cursor runtime ephemeral state is unsafe: {relative.as_posix()}")
         if stat.S_ISLNK(entry_info.st_mode):
             fail(f"Cursor runtime tree must not contain symlinks: {relative.as_posix()}")
         if stat.S_ISDIR(entry_info.st_mode):
@@ -1671,6 +1690,30 @@ def reject_managed_launch_overrides(cursor_args: list[str]) -> None:
                     fail(f"launch refuses managed Cursor override option: -{flag} ({blocked})")
 
 
+def restore_managed_config_after_launch(target: Path) -> None:
+    with target_lock(target):
+        stamp = load_stamp(target)
+        if stamp is None:
+            fail("managed target stamp disappeared during Cursor launch")
+        setup_id = str(stamp["setup_id"])
+        _, rendered = render_setup(setup_id)
+        setup_config = parse_json_object(rendered[CONFIG_NAME], f"setup {setup_id}/{CONFIG_NAME}")
+        config_path = target / CONFIG_NAME
+        if config_path.exists() or config_path.is_symlink():
+            current = parse_json_object(
+                read_regular_file(
+                    config_path,
+                    f"target {CONFIG_NAME}",
+                    max_bytes=METADATA_MAX_BYTES,
+                ),
+                f"target {CONFIG_NAME}",
+            )
+        else:
+            current = {}
+        desired = {CONFIG_NAME: canonical_json(merge_config(current, setup_config))}
+        replace_managed_state(target, desired, names=(CONFIG_NAME,))
+
+
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
     forwarded = cursor_args[1:] if cursor_args[:1] == ["--"] else cursor_args
     reject_managed_launch_overrides(forwarded)
@@ -1696,6 +1739,7 @@ def launch_cursor(target: Path, cursor_args: list[str]) -> int:
             environment.pop(name, None)
         executable = managed_agent_path(target)
     completed = subprocess.run([str(executable), *forwarded], env=environment, check=False)
+    restore_managed_config_after_launch(target)
     if completed.returncode < 0:
         return 128 + abs(completed.returncode)
     return completed.returncode
