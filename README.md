@@ -7,12 +7,18 @@ absolute Cursor config target, never the caller's live `~/.cursor` by default.
 
 ```bash
 python3 cli-tools/nddev_cursor_cli.py list
-python3 cli-tools/nddev_cursor_cli.py plan --setup safe --target /absolute/cursor-config
-python3 cli-tools/nddev_cursor_cli.py install --setup safe --target /absolute/cursor-config
-python3 cli-tools/nddev_cursor_cli.py switch --setup review --target /absolute/cursor-config
+python3 cli-tools/nddev_cursor_cli.py plan --setup nddev-builder --profile full-auto --target /absolute/cursor-config
+python3 cli-tools/nddev_cursor_cli.py install --setup nddev-builder --profile full-auto --target /absolute/cursor-config
+python3 cli-tools/nddev_cursor_cli.py switch --setup nddev-builder --profile safe --target /absolute/cursor-config
+python3 cli-tools/nddev_cursor_cli.py migrate --setup nddev-builder --profile safe --target /absolute/cursor-config
 python3 cli-tools/nddev_cursor_cli.py restore --backup 0 --target /absolute/cursor-config
 python3 cli-tools/nddev_cursor_cli.py remove --target /absolute/cursor-config
 ```
+
+The active public model is one content setup, `nddev-builder`, plus orthogonal
+permission profiles. The default profile is `full-auto`; `safe` is available for
+sandboxed allowlisted work. Legacy managed targets can be inspected, migrated,
+restored, or removed, but they are not launchable.
 
 ## Software lifecycle
 
@@ -36,7 +42,8 @@ existing software presence, can repair safe partial state such as a missing or
 mode-drifted identity stamp, and is an idempotent no-op when `software-status`
 reports `current=true`.
 
-`launch` runs `agent` with `CURSOR_CONFIG_DIR` scoped only to the child process:
+`launch` runs `agent` with `CURSOR_CONFIG_DIR` and an isolated `HOME` scoped
+only to the child process:
 
 ```bash
 python3 cli-tools/nddev_cursor_cli.py launch --target /absolute/cursor-config -- -p "summarize"
@@ -50,6 +57,7 @@ managed `bin/agent` launcher uses only the pinned target-owned runtime tree,
 including its bundled Node.js binary.
 
 The setup variants also project `nddev-builder` as a local native Cursor plugin
-under the selected target. The projection uses Cursor's plugin, rules, skills,
-and custom agents surfaces. This module does not provision Cursor team
-marketplaces.
+under `.nddev-cursor-home/.cursor/plugins/local/nddev-builder` inside the
+selected target. The projection uses Cursor's plugin, rules, skills, custom
+agents, and commands surfaces. It does not activate hooks or MCP servers and
+does not provision Cursor team marketplaces.

@@ -19,7 +19,7 @@ caller home, system prefix, npm global prefix, or pip environment.
   and current target-owned software, then executes only `<target>/bin/agent`.
   It rejects Cursor flags or subcommands that would override the managed
   approval, sandbox, worktree, shell-integration, worker, or self-update
-  lifecycle.
+  lifecycle. Legacy setup stamps must be migrated or removed before launch.
 
 ## Source and integrity
 
@@ -34,7 +34,7 @@ are pinned in `references/cursor-cli-baseline.json`.
 The archive reader never extracts an artifact wholesale. It streams only the
 official `dist-package/` runtime tree, requires `cursor-agent`, `node`, and
 `index.js`, normalizes target-owned file modes, and rejects absolute paths,
-parent traversal, Windows-drive paths, NUL paths, symlink, hardlink, device,
+parent traversal, drive-qualified paths, NUL paths, symlink, hardlink, device,
 duplicate, group/world-writable, special-mode, and oversize members.
 
 Updates stage a complete version tree under
@@ -51,3 +51,14 @@ child exits, manager `launch` reacquires the target lock, restores the selected
 setup's managed config keys while preserving unowned config keys, and treats
 only safe target-owned `.running` runtime state as ephemeral status-neutral
 state.
+
+## Builder plugin projection
+
+The setup manager projects the public `nddev-builder` toolkit as a native local
+Cursor plugin under the launch-isolated home:
+
+`.nddev-cursor-home/.cursor/plugins/local/nddev-builder`
+
+The toolkit includes rules, Agent Skills with routed references and validation
+scripts, custom agents, and commands. It does not install hook definitions, MCP
+server definitions, live credentials, or marketplace state.
