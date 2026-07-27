@@ -16,10 +16,13 @@ caller home, system prefix, npm global prefix, or pip environment.
   paths fail closed before artifact reads.
   If the target is already current, it returns an idempotent no-op without downloading.
 - `launch --target <absolute-target> -- ...` requires both a clean setup stamp
-  and current target-owned software, then executes only `<target>/bin/agent`.
+  and current target-owned software, then executes a verified target-internal
+  launch image built from the managed runtime.
   It rejects Cursor flags or subcommands that would override the managed
   approval, sandbox, worktree, shell-integration, worker, or self-update
   lifecycle. Legacy setup stamps must be migrated or removed before launch.
+  The child receives a target-internal `TMPDIR` at
+  `.nddev-cursor-runtime/tmp`; ambient `TMPDIR` is not inherited.
 
 Initial target creation is allowed only under a real parent directory that is
 current-user-owned and not writable by group/other, or sticky. Existing targets
@@ -75,15 +78,17 @@ falls back to a live or system Node.js binary and uses a fixed child `PATH` of
 Cursor `--version` and `--help` can write target-local runtime/process state and
 can rewrite managed config defaults even when no login is attempted. Manager
 `launch` keeps the target lock from preflight through child execution and
-managed-config restoration. While the child runs, the real `bin` and
-`.nddev-software/...` parent directories are `0500` so ordinary unlink/replace
-attempts fail. The manager then revalidates the verified-path `bin/agent` inode
-and digest immediately before `Popen`, restores the selected setup's managed
-config keys while preserving unowned config keys, and treats only safe
-target-owned `.running` runtime state as ephemeral status-neutral state. This is
-a write-protected verified-path handoff under a no-sandbox same-UID boundary,
-not portable fd execution; a deliberate same-UID chmod is outside the claimed
-boundary.
+managed-config restoration. While the child runs, only the lock parent and an
+ephemeral verified launch image are `0500` so ordinary unlink/replace attempts
+against the lock and actual executable fail. The managed target root, isolated
+HOME, `.nddev-cursor-runtime/tmp`, config/session paths, and installed runtime
+tree stay writable for expected Cursor state. The manager then revalidates the
+launch-image executable inode and digest immediately before `Popen`, restores
+the selected setup's managed config keys while preserving unowned config keys,
+and treats only safe target-owned `.running` runtime state as ephemeral
+status-neutral state. This is a write-protected verified-path handoff under a
+no-sandbox same-UID boundary, not portable fd execution; a deliberate same-UID
+chmod is outside the claimed boundary.
 
 ## Builder plugin projection
 

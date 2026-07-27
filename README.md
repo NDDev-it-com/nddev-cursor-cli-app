@@ -56,26 +56,27 @@ existing software presence, can repair safe partial state such as a missing or
 mode-drifted identity stamp, and is an idempotent no-op when `software-status`
 reports `current=true`.
 
-`launch` runs `agent` with `CURSOR_CONFIG_DIR` and an isolated `HOME` scoped
-only to the child process:
+`launch` runs `agent` with `CURSOR_CONFIG_DIR`, an isolated `HOME`, and a
+target-internal `TMPDIR` scoped only to the child process:
 
 ```bash
 python3 cli-tools/nddev_cursor_cli.py launch --target /absolute/cursor-config -- -p "summarize"
 ```
 
 `launch` requires a clean managed setup plus current target-owned software,
-executes only the absolute target `bin/agent`, never falls back to `PATH`, and
-uses a fixed minimal child `PATH` of `/usr/bin:/bin`. The launcher uses
+executes a verified target-internal launch image, never falls back to `PATH`,
+and uses a fixed minimal child `PATH` of `/usr/bin:/bin`. The launcher uses
 `/bin/bash`, rejects Cursor flags or subcommands that would override the managed
 approval, sandbox, worktree, shell-integration, worker, or self-update
 lifecycle, and uses only the pinned target-owned runtime tree, including its
 bundled Node.js binary. The manager keeps the target lock through child
-execution and managed-config restoration. During launch it makes the lock
-parent and executable/software parent directories read/execute-only (`0500`)
-for ordinary unlink/replace denial, then revalidates the verified-path
-`bin/agent` inode and digest immediately before the subprocess handoff. This is
-not portable fd execution and does not claim resistance to deliberate same-UID
-chmod without a sandbox.
+execution and managed-config restoration. During launch it makes only the lock
+parent and an ephemeral verified launch image read/execute-only (`0500`) for
+ordinary unlink/replace denial; the managed target root, isolated HOME,
+target-local TMPDIR, config/session paths, and installed runtime tree remain
+writable. It revalidates the launch-image executable inode and digest
+immediately before the subprocess handoff. This is not portable fd execution
+and does not claim resistance to deliberate same-UID chmod without a sandbox.
 
 The setup/profile model also projects `nddev-builder` as a local native Cursor plugin
 under `.nddev-cursor-home/.cursor/plugins/local/nddev-builder` inside the

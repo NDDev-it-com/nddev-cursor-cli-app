@@ -206,6 +206,13 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         != "component real current-user-owned 0700 before subprocess"
     ):
         errors.append(f"{owner}: runtime_launch isolated_home parent validation mismatch")
+    if launch.get("tmpdir") != ".nddev-cursor-runtime/tmp":
+        errors.append(f"{owner}: runtime_launch TMPDIR mismatch")
+    if (
+        launch.get("tmpdir_source")
+        != "target-internal real current-user-owned 0700 directory; ambient TMPDIR is not inherited"
+    ):
+        errors.append(f"{owner}: runtime_launch TMPDIR source mismatch")
     if launch.get("path_policy") != "fixed-minimal-system-path":
         errors.append(f"{owner}: runtime_launch path_policy mismatch")
     if launch.get("path_value") != "/usr/bin:/bin":
@@ -229,11 +236,18 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch lock mechanism mismatch")
     if launch.get("lock_parent_mode_while_launching") != "0500":
         errors.append(f"{owner}: runtime_launch lock parent mode mismatch")
-    if launch.get("software_parent_mode_while_launching") != "0500":
-        errors.append(f"{owner}: runtime_launch software parent mode mismatch")
+    if (
+        launch.get("protected_directory_scope")
+        != "dedicated lock parent and ephemeral verified launch image only; target root, isolated HOME, TMPDIR, config/session paths, and installed runtime tree remain writable"
+    ):
+        errors.append(f"{owner}: runtime_launch protected directory scope mismatch")
+    if launch.get("launch_image") != ".nddev-software/cursor-cli/launch-images/<ephemeral>":
+        errors.append(f"{owner}: runtime_launch launch image mismatch")
+    if launch.get("launch_image_mode_while_launching") != "0500":
+        errors.append(f"{owner}: runtime_launch launch image mode mismatch")
     if (
         launch.get("exec_handoff_revalidation")
-        != "verified-path bin/agent inode and digest immediately before subprocess"
+        != "verified launch-image executable inode and digest immediately before subprocess"
     ):
         errors.append(f"{owner}: runtime_launch exec handoff revalidation mismatch")
     if (
@@ -907,20 +921,16 @@ def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
         target = Path(tmp) / "target"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
         install_smoke_current_software(module, target)
-        real_software_status = module.software_status
-        calls = 0
+        real_create_launch_image = module.create_launch_image
         child_ran = False
 
-        def swapping_software_status(path: Path) -> dict[str, Any]:
-            nonlocal calls
-            result = real_software_status(path)
-            calls += 1
-            if calls == 1:
-                module.atomic_write_executable(
-                    module.managed_agent_path(target),
-                    b"#!/bin/bash\necho swapped\n",
-                )
-            return result
+        def swapped_create_launch_image(path: Path) -> dict[str, Any]:
+            image = real_create_launch_image(path)
+            module.atomic_write_executable(
+                image["executable"],
+                b"#!/bin/bash\necho swapped\n",
+            )
+            return image
 
         def fake_run_cursor_child(
             executable: Path, forwarded: list[str], environment: dict[str, str]
@@ -931,7 +941,7 @@ def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
             return type("Completed", (), {"returncode": 0})()
 
         with (
-            with_restored_attr(module, "software_status", swapping_software_status),
+            with_restored_attr(module, "create_launch_image", swapped_create_launch_image),
             with_restored_attr(module, "run_cursor_child", fake_run_cursor_child),
         ):
             try:
@@ -941,8 +951,6 @@ def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
                     errors.append(f"swap-at-exec smoke failed with unexpected error: {exc}")
             else:
                 errors.append("swap-at-exec smoke unexpectedly allowed launch")
-        if calls < 1:
-            errors.append("swap-at-exec smoke did not run software status preflight")
         if child_ran:
             errors.append("swap-at-exec smoke executed the replaced agent")
 
@@ -971,17 +979,57 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
         target = root / "target"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
         install_smoke_current_software(module, target)
+        ambient_tmp = root / "ambient-tmp"
+        ambient_tmp.mkdir(mode=0o700)
+        writes = {
+            "config": target / "stub-session-state",
+            "home": target / module.ISOLATED_HOME_ROOT / "stub-home-state",
+            "tmp": target / module.MUTABLE_RUNTIME_TMP_ROOT / "stub-tmp-state",
+            "runtime": module.software_version_dir(target) / ".running" / "stub-runtime-state",
+            "image": None,
+        }
+        seen_image_root: Path | None = None
 
         def fake_run_cursor_child(
             executable: Path, forwarded: list[str], environment: dict[str, str]
         ) -> Any:
-            del executable, forwarded, environment
+            nonlocal seen_image_root
+            del forwarded
             control = module.control_root(target)
             lock = control / module.CONTROL_LOCK_NAME
+            seen_image_root = executable.parent
             if not lock.is_file() or lock.is_symlink():
                 errors.append("launch protection smoke did not expose lock as regular file")
             if stat.S_IMODE(control.lstat().st_mode) != module.LOCK_HELD_DIRECTORY_MODE:
                 errors.append("launch protection smoke did not protect control root")
+            if stat.S_IMODE(executable.parent.lstat().st_mode) != module.LOCK_HELD_DIRECTORY_MODE:
+                errors.append("launch protection smoke did not protect launch image")
+            for path, label in (
+                (target, "target root"),
+                (Path(environment["CURSOR_CONFIG_DIR"]), "CURSOR_CONFIG_DIR"),
+                (Path(environment["HOME"]), "isolated HOME"),
+                (Path(environment["TMPDIR"]), "TMPDIR"),
+                (module.software_container(target), "software container"),
+                (module.software_root(target), "software root"),
+                (module.software_version_dir(target), "installed runtime root"),
+            ):
+                mode = stat.S_IMODE(path.lstat().st_mode)
+                if mode != module.OWNER_DIRECTORY_MODE:
+                    errors.append(f"launch protection smoke made {label} read-only: {oct(mode)}")
+            tmpdir = Path(environment["TMPDIR"])
+            expected_tmpdir = (target / module.MUTABLE_RUNTIME_TMP_ROOT).resolve(strict=False)
+            if tmpdir.resolve(strict=False) != expected_tmpdir:
+                errors.append(f"launch protection smoke used wrong TMPDIR: {tmpdir}")
+            if tmpdir.resolve(strict=False) == ambient_tmp.resolve(strict=False):
+                errors.append("launch protection smoke inherited ambient TMPDIR")
+            writes["config"].write_text("config write\n", encoding="utf-8")
+            writes["home"].write_text("home write\n", encoding="utf-8")
+            writes["tmp"].write_text("tmp write\n", encoding="utf-8")
+            writes["runtime"].parent.mkdir(mode=module.OWNER_DIRECTORY_MODE, exist_ok=True)
+            writes["runtime"].write_text("runtime write\n", encoding="utf-8")
+            image_running = executable.parent / ".running" / "stub-image-state"
+            image_running.write_text("image write\n", encoding="utf-8")
+            writes["image"] = image_running
             expect_permission_denied(
                 lambda: lock.unlink(), errors, "launch protection lock unlink"
             )
@@ -990,41 +1038,46 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
             replacement.write_bytes(b"replacement\n")
             replacement.chmod(module.OWNER_EXEC_MODE)
             expect_permission_denied(
-                lambda: module.managed_agent_path(target).unlink(),
+                lambda: executable.unlink(),
                 errors,
-                "launch protection bin/agent unlink",
+                "launch protection executable unlink",
             )
             expect_permission_denied(
-                lambda: os.replace(replacement, module.managed_agent_path(target)),
+                lambda: os.replace(replacement, executable),
                 errors,
-                "launch protection bin/agent replace",
+                "launch protection executable replace",
             )
             if replacement.exists():
                 replacement.unlink()
 
-            runtime_replacement = target / "replacement-runtime-agent"
-            runtime_replacement.write_bytes(b"replacement runtime\n")
-            runtime_replacement.chmod(module.OWNER_EXEC_MODE)
-            expect_permission_denied(
-                lambda: os.replace(runtime_replacement, module.software_tree_binary(target)),
-                errors,
-                "launch protection runtime binary replace",
-            )
-            if runtime_replacement.exists():
-                runtime_replacement.unlink()
-
             assert_concurrent_switch_denied(target, errors, "launch protection smoke")
             return type("Completed", (), {"returncode": 0})()
 
-        with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
-            result = module.launch_cursor(target, ["--", "-p", "noop"])
+        old_tmp = os.environ.get("TMPDIR")
+        os.environ["TMPDIR"] = str(ambient_tmp)
+        try:
+            with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
+                result = module.launch_cursor(target, ["--", "-p", "noop"])
+        finally:
+            if old_tmp is None:
+                os.environ.pop("TMPDIR", None)
+            else:
+                os.environ["TMPDIR"] = old_tmp
         if result != 0:
             errors.append(f"launch protection smoke returned {result}")
         if stat.S_IMODE(module.control_root(target).lstat().st_mode) != module.OWNER_DIRECTORY_MODE:
             errors.append("launch protection smoke did not restore control root mode")
-        for directory in module.launch_protected_directories(target):
-            if stat.S_IMODE(directory.lstat().st_mode) != module.OWNER_DIRECTORY_MODE:
-                errors.append(f"launch protection smoke did not restore {directory}")
+        if seen_image_root is None:
+            errors.append("launch protection smoke never observed a launch image")
+        elif seen_image_root.exists() or seen_image_root.is_symlink():
+            errors.append("launch protection smoke did not remove the launch image")
+        for name, path in writes.items():
+            if name == "image":
+                continue
+            if path is None or not path.is_file():
+                errors.append(f"launch protection smoke did not persist {name} runtime write")
+        if writes["image"] is not None and writes["image"].exists():
+            errors.append("launch protection smoke left launch-image runtime state behind")
         status = module.software_status(target)
         if not status["current"]:
             errors.append(f"launch protection smoke left software drift: {status['drift']}")
@@ -1120,6 +1173,26 @@ def validate_target_local_parent_symlink_smokes(module: Any, errors: list[str]) 
         expect_launch_blocked_without_child(
             module, target, ".nddev-software:unsafe", errors, "runtime parent symlink"
         )
+
+        target = root / "runtime-tmp"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        runtime_tmp_root = target / module.MUTABLE_RUNTIME_ROOT
+        external_runtime_tmp = root / "external-runtime-tmp"
+        external_runtime_tmp.mkdir(mode=0o700)
+        os.symlink(external_runtime_tmp, runtime_tmp_root)
+        external_runtime_tmp.chmod(0o755)
+        state = module.inspect_target(target)
+        if ".nddev-cursor-runtime:unsafe" not in state["drift"] or state["launchable"]:
+            errors.append("runtime TMP symlink smoke left setup status launchable")
+        software = module.software_status(target)
+        if ".nddev-cursor-runtime:unsafe" not in software["drift"] or software["current"]:
+            errors.append("runtime TMP symlink smoke did not block software current status")
+        expect_launch_blocked_without_child(
+            module, target, ".nddev-cursor-runtime:unsafe", errors, "runtime TMP symlink"
+        )
+        if stat.S_IMODE(external_runtime_tmp.lstat().st_mode) != 0o755:
+            errors.append("runtime TMP symlink smoke chmodded the external directory")
 
 
 def validate_public_manager_smokes(errors: list[str]) -> None:
@@ -1246,6 +1319,8 @@ def main() -> int:
             errors.append("build/manifest.json: lock file mode mismatch")
         if transaction.get("lock_parent_mode_while_launching") != "0500":
             errors.append("build/manifest.json: lock parent launch mode mismatch")
+        if transaction.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
+            errors.append("build/manifest.json: mutable runtime TMPDIR mismatch")
         if (
             transaction.get("target_local_directory_parents")
             != "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed"
@@ -1295,6 +1370,8 @@ def main() -> int:
             errors.append("config/nddev-contract.json: lock parent launch mode mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
             errors.append("config/nddev-contract.json: backup path mismatch")
+        if safety.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
+            errors.append("config/nddev-contract.json: mutable runtime TMPDIR mismatch")
         if (
             safety.get("target_local_directory_parents")
             != "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed"

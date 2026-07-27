@@ -57,6 +57,8 @@ CURSOR_VERSION = "2026.07.23-e383d2b"
 CURSOR_RELEASE_BASE_URL = f"https://downloads.cursor.com/lab/{CURSOR_VERSION}"
 CURSOR_RUNTIME_ROOT = Path("dist-package")
 CURSOR_RUNTIME_ENTRYPOINT = Path("cursor-agent")
+LAUNCH_IMAGES_NAME = "launch-images"
+LAUNCH_IMAGE_AGENT_NAME = "agent"
 CURSOR_RUNTIME_REQUIRED_FILES = frozenset(
     {CURSOR_RUNTIME_ENTRYPOINT, Path("node"), Path("index.js")}
 )
@@ -128,6 +130,8 @@ MANAGED_CONFIG_KEYS = (
 )
 BUILDER_SOURCE_ROOT = ROOT / "plugins" / "nddev-builder"
 ISOLATED_HOME_ROOT = Path(".nddev-cursor-home")
+MUTABLE_RUNTIME_ROOT = Path(".nddev-cursor-runtime")
+MUTABLE_RUNTIME_TMP_ROOT = MUTABLE_RUNTIME_ROOT / "tmp"
 LEGACY_BUILDER_TARGET_ROOT = Path("plugins") / "local" / "nddev-builder"
 BUILDER_TARGET_ROOT = (
     ISOLATED_HOME_ROOT / ".cursor" / "plugins" / "local" / "nddev-builder"
@@ -1133,10 +1137,13 @@ def runtime_parent_directories(target: Path) -> set[Path]:
     directories = {
         software_container(target),
         software_root(target),
+        launch_images_root(target),
         software_root(target) / "versions",
         software_version_dir(target),
         managed_agent_path(target).parent,
         ISOLATED_HOME_ROOT,
+        MUTABLE_RUNTIME_ROOT,
+        MUTABLE_RUNTIME_TMP_ROOT,
     }
     relatives: set[Path] = set()
     for directory in directories:
@@ -1682,6 +1689,14 @@ def managed_agent_path(target: Path) -> Path:
     return target / "bin" / CURSOR_COMMAND
 
 
+def launch_images_root(target: Path) -> Path:
+    return software_root(target) / LAUNCH_IMAGES_NAME
+
+
+def mutable_runtime_tmp_dir(target: Path) -> Path:
+    return target / MUTABLE_RUNTIME_TMP_ROOT
+
+
 def software_stamp_path(target: Path) -> Path:
     return software_root(target) / SOFTWARE_STAMP_NAME
 
@@ -1869,9 +1884,8 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def managed_agent_launcher_bytes(target: Path) -> bytes:
-    version_dir = software_version_dir(target).resolve(strict=False)
-    script_dir = shell_quote(str(version_dir))
+def agent_launcher_bytes_for_runtime_dir(runtime_dir: Path) -> bytes:
+    script_dir = shell_quote(str(runtime_dir.resolve(strict=False)))
     return (
         "#!/bin/bash\n"
         "set -euo pipefail\n"
@@ -1896,6 +1910,10 @@ def managed_agent_launcher_bytes(target: Path) -> bytes:
         "fi\n"
         'exec -a "$0" "$NODE_BIN" "$SCRIPT_DIR/index.js" "$@"\n'
     ).encode("utf-8")
+
+
+def managed_agent_launcher_bytes(target: Path) -> bytes:
+    return agent_launcher_bytes_for_runtime_dir(software_version_dir(target))
 
 
 def atomic_write_with_mode(path: Path, content: bytes, mode: int) -> None:
@@ -2164,6 +2182,43 @@ def runtime_tree_identity_from_disk(root: Path) -> dict[str, Any] | None:
         "mode_drift": mode_drift,
         "missing": [],
     }
+
+
+def snapshot_runtime_payload(root: Path) -> dict[str, tuple[bytes, int]]:
+    require_owner_private_directory(root, "Cursor runtime tree")
+    files: dict[str, tuple[bytes, int]] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        info = path.lstat()
+        if relative.parts and Path(relative.parts[0]) in CURSOR_RUNTIME_EPHEMERAL_ROOTS:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"Cursor runtime tree must not contain symlinks: {relative.as_posix()}")
+        if stat.S_ISDIR(info.st_mode):
+            if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+                fail(f"Cursor runtime directory must have mode 0700: {relative.as_posix()}")
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"Cursor runtime tree must contain only regular files: {relative.as_posix()}")
+        if info.st_nlink != 1:
+            fail(f"Cursor runtime file must not have hard-link aliases: {relative.as_posix()}")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode not in {OWNER_FILE_MODE, OWNER_EXEC_MODE}:
+            fail(f"Cursor runtime file has unsafe mode: {relative.as_posix()}")
+        files[relative.as_posix()] = (
+            read_regular_file(
+                path,
+                f"Cursor launch payload file {relative.as_posix()}",
+                max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+            ),
+            mode,
+        )
+    missing = sorted(
+        path.as_posix() for path in CURSOR_RUNTIME_REQUIRED_FILES - {Path(name) for name in files}
+    )
+    if missing:
+        fail(f"Cursor launch payload is missing required files: {missing}")
+    return files
 
 
 def software_file_mode_is(path: Path, mode: int) -> bool:
@@ -2546,7 +2601,7 @@ def restore_managed_config_after_launch(target: Path) -> None:
         restore_managed_config_after_launch_locked(target)
 
 
-def revalidate_launch_executable(target: Path) -> dict[str, Any]:
+def revalidate_software_stamp_for_launch(target: Path) -> dict[str, Any]:
     stamp = load_software_stamp(target)
     if stamp is None:
         fail("Cursor software stamp disappeared before exec handoff")
@@ -2562,24 +2617,29 @@ def revalidate_launch_executable(target: Path) -> dict[str, Any]:
     for key, value in expected.items():
         if stamp[key] != value:
             fail(f"Cursor software stamp {key} changed before exec handoff")
-    executable = managed_agent_path(target)
+    return stamp
+
+
+def revalidate_executable_identity(
+    executable: Path, expected_sha256: str, label: str
+) -> dict[str, Any]:
     before = require_regular_file(
-        executable, f"Cursor launch executable {executable}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
+        executable, f"{label} {executable}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
     )
     if stat.S_IMODE(before.st_mode) != OWNER_EXEC_MODE:
         fail("Cursor launch executable must have mode 0700")
     content = read_regular_file(
         executable,
-        f"Cursor launch executable {executable}",
+        f"{label} {executable}",
         max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
     )
     after = require_regular_file(
-        executable, f"Cursor launch executable {executable}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
+        executable, f"{label} {executable}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
     )
     if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
         fail("Cursor launch executable changed before exec handoff")
     digest = sha256_bytes(content)
-    if digest != stamp["entrypoint_sha256"]:
+    if digest != expected_sha256:
         fail("Cursor launch executable digest changed before exec handoff")
     return {
         "device": after.st_dev,
@@ -2606,30 +2666,73 @@ def report_cleanup_failure_after_child_exception(
         print(f"nddev-cursor-cli: warning: {note}", file=sys.stderr)
 
 
-def launch_protected_directories(target: Path) -> tuple[Path, ...]:
-    return (
-        managed_agent_path(target).parent,
-        software_container(target),
-        software_root(target),
-        software_root(target) / "versions",
-        software_version_dir(target),
+def ensure_mutable_runtime_tmp_dir(target: Path) -> Path:
+    ensure_real_directory(target, MUTABLE_RUNTIME_TMP_ROOT)
+    return require_target_local_directory_chain(
+        target, MUTABLE_RUNTIME_TMP_ROOT, "Cursor mutable runtime TMPDIR"
     )
 
 
-def require_launch_protected_directories(target: Path) -> tuple[Path, ...]:
-    directories = launch_protected_directories(target)
+def make_tree_owner_writable(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink():
+        path.unlink()
+        return
+    if path.is_dir():
+        for child in path.iterdir():
+            make_tree_owner_writable(child)
+        path.chmod(OWNER_DIRECTORY_MODE)
+    elif path.is_file():
+        path.chmod(OWNER_FILE_MODE)
+
+
+def cleanup_launch_image(path: Path | None) -> None:
+    if path is None:
+        return
+    with contextlib.suppress(FileNotFoundError):
+        make_tree_owner_writable(path)
+        shutil.rmtree(path)
+
+
+def create_launch_image(target: Path) -> dict[str, Any]:
+    images_root = launch_images_root(target)
+    ensure_real_directory_path(images_root, "Cursor launch images root")
+    image_root = Path(tempfile.mkdtemp(prefix=".launch-", dir=str(images_root)))
+    image_root.chmod(OWNER_DIRECTORY_MODE)
+    try:
+        files = snapshot_runtime_payload(software_version_dir(target))
+        write_cursor_runtime_tree(image_root, files)
+        running = image_root / ".running"
+        running.mkdir(mode=OWNER_DIRECTORY_MODE)
+        running.chmod(OWNER_DIRECTORY_MODE)
+        launcher = agent_launcher_bytes_for_runtime_dir(image_root)
+        executable = image_root / LAUNCH_IMAGE_AGENT_NAME
+        atomic_write_executable(executable, launcher)
+        return {
+            "root": image_root,
+            "executable": executable,
+            "entrypoint_sha256": sha256_bytes(launcher),
+        }
+    except BaseException:
+        cleanup_launch_image(image_root)
+        raise
+
+
+def launch_protected_directories(launch_image_root: Path) -> tuple[Path, ...]:
+    return (launch_image_root,)
+
+
+def require_launch_protected_directories(launch_image_root: Path) -> tuple[Path, ...]:
+    directories = launch_protected_directories(launch_image_root)
     for directory in directories:
-        try:
-            relative = directory.relative_to(target)
-        except ValueError:
-            fail(f"launch protected directory is outside target: {directory}")
-        require_target_local_directory_chain(target, relative, "launch protected directory")
+        require_owner_private_directory(directory, "launch protected directory")
     return directories
 
 
 @contextlib.contextmanager
-def launch_write_protection(target: Path) -> Iterator[None]:
-    directories = require_launch_protected_directories(target)
+def launch_write_protection(launch_image_root: Path) -> Iterator[None]:
+    directories = require_launch_protected_directories(launch_image_root)
     protected: list[Path] = []
     try:
         for directory in directories:
@@ -2677,35 +2780,54 @@ def launch_cursor(target: Path, cursor_args: list[str]) -> int:
         child_home = require_target_local_directory_chain(
             target, ISOLATED_HOME_ROOT, "Cursor isolated HOME"
         )
+        child_tmp = ensure_mutable_runtime_tmp_dir(target)
         environment: dict[str, str] = {
             "CURSOR_CONFIG_DIR": str(target.resolve(strict=False)),
             "HOME": str(child_home.resolve(strict=False)),
+            "TMPDIR": str(child_tmp.resolve(strict=False)),
             "PATH": "/usr/bin:/bin",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
-        for name in ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "TMPDIR"):
+        for name in ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"):
             value = os.environ.get(name)
             if value:
                 environment[name] = value
         for name in PROVIDER_SECRET_NAMES:
             environment.pop(name, None)
-        executable = managed_agent_path(target)
+        launch_image: dict[str, Any] | None = None
         child_error: BaseException | None = None
-        with launch_write_protection(target):
-            try:
-                revalidate_launch_executable(target)
-                completed = run_cursor_child(executable, forwarded, environment)
-            except BaseException as exc:
-                child_error = exc
-                raise
-            finally:
+        try:
+            launch_image = create_launch_image(target)
+            executable = launch_image["executable"]
+            image_root = launch_image["root"]
+            with launch_write_protection(image_root):
                 try:
-                    restore_managed_config_after_launch_locked(target)
-                except BaseException as cleanup_error:
-                    if child_error is not None:
-                        report_cleanup_failure_after_child_exception(child_error, cleanup_error)
-                    else:
-                        raise
+                    revalidate_software_stamp_for_launch(target)
+                    revalidate_executable_identity(
+                        executable,
+                        str(launch_image["entrypoint_sha256"]),
+                        "Cursor launch image executable",
+                    )
+                    completed = run_cursor_child(executable, forwarded, environment)
+                except BaseException as exc:
+                    child_error = exc
+                    raise
+                finally:
+                    try:
+                        restore_managed_config_after_launch_locked(target)
+                    except BaseException as cleanup_error:
+                        if child_error is not None:
+                            report_cleanup_failure_after_child_exception(child_error, cleanup_error)
+                        else:
+                            raise
+        finally:
+            try:
+                cleanup_launch_image(None if launch_image is None else launch_image["root"])
+            except BaseException as cleanup_error:
+                if child_error is not None:
+                    report_cleanup_failure_after_child_exception(child_error, cleanup_error)
+                else:
+                    raise
         if completed.returncode < 0:
             return 128 + abs(completed.returncode)
         return completed.returncode
