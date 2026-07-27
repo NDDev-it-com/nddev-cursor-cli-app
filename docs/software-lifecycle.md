@@ -27,6 +27,11 @@ used by mutating commands, restore, remove, migrate, software install/update, or
 launch must already be current-user-owned real directories with mode `0700`.
 Read-only status surfaces report `target:owner` or `target:mode` drift; the
 manager does not silently chmod an existing target root.
+Existing target-local builder and runtime parent directories, including
+`.nddev-cursor-home`, `bin`, and `.nddev-software`, are validated
+component-by-component as real current-user-owned `0700` directories. Unsafe
+parents are reported as drift, are not chmodded through symlinks, and block
+launch before a child process starts.
 
 Lifecycle control state is target-internal under `.nddev-cursor-cli/`: active
 locks use `.nddev-cursor-cli/lock`, and backups use

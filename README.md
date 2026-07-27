@@ -28,6 +28,10 @@ install/update, or launch must already be owned by the current user and mode
 silently changing existing root permissions. Lifecycle lock and backup state
 lives inside the target under `.nddev-cursor-cli/{lock,backups}`; sibling
 `.nddev-*` lock or backup paths are ignored.
+Existing target-local builder and runtime parent directories, including
+`.nddev-cursor-home`, `bin`, and `.nddev-software`, must also be real
+current-user-owned directories with mode `0700`; unsafe parents are reported as
+drift and block launch before a child process starts.
 
 ## Software lifecycle
 

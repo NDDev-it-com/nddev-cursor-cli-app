@@ -24,6 +24,10 @@ private configuration, or backup contents in an issue or pull request.
   rotation, postcondition checks, and rollback on failure.
 - Existing target roots used for mutation, restore, migrate, remove, software
   install/update, or launch must be current-user-owned and mode `0700`.
+- Existing target-local builder and runtime parent directories, including
+  `.nddev-cursor-home`, `bin`, and `.nddev-software`, must be real
+  current-user-owned `0700` directories; unsafe parents are drift and block
+  launch before subprocess handoff.
 - Launch keeps the target lock through child execution and managed-config
   restoration; `.nddev-cursor-cli/lock` is the cooperative same-user boundary
   and target-root `0700` is the cross-user boundary.

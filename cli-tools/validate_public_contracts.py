@@ -172,6 +172,11 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch must use managed bin/agent")
     if launch.get("isolated_home") != ".nddev-cursor-home":
         errors.append(f"{owner}: runtime_launch isolated_home mismatch")
+    if (
+        launch.get("isolated_home_parent_validation")
+        != "component real current-user-owned 0700 before subprocess"
+    ):
+        errors.append(f"{owner}: runtime_launch isolated_home parent validation mismatch")
     if launch.get("path_policy") != "fixed-minimal-system-path":
         errors.append(f"{owner}: runtime_launch path_policy mismatch")
     if launch.get("path_value") != "/usr/bin:/bin":
@@ -819,6 +824,98 @@ def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
             errors.append("swap-at-exec smoke executed the replaced agent")
 
 
+def expect_launch_blocked_without_child(
+    module: Any,
+    target: Path,
+    expected_fragment: str,
+    errors: list[str],
+    label: str,
+) -> None:
+    child_ran = False
+
+    def fake_run_cursor_child(
+        executable: Path, forwarded: list[str], environment: dict[str, str]
+    ) -> Any:
+        nonlocal child_ran
+        del executable, forwarded, environment
+        child_ran = True
+        return type("Completed", (), {"returncode": 0})()
+
+    with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
+        try:
+            module.launch_cursor(target, ["--", "--help"])
+        except module.CursorSetupError as exc:
+            if expected_fragment not in str(exc):
+                errors.append(f"{label} launch failed with unexpected error: {exc}")
+        else:
+            errors.append(f"{label} launch unexpectedly succeeded")
+    if child_ran:
+        errors.append(f"{label} launch reached child subprocess")
+
+
+def replace_with_external_symlink(path: Path, external: Path) -> None:
+    path.rename(external)
+    os.symlink(external, path)
+
+
+def validate_target_local_parent_symlink_smokes(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-parent-symlink-smoke-") as tmp:
+        root = Path(tmp)
+
+        target = root / "isolated-home"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        isolated_home = target / module.ISOLATED_HOME_ROOT
+        external_home = root / "external-home"
+        replace_with_external_symlink(isolated_home, external_home)
+        external_home.chmod(0o755)
+        state = module.inspect_target(target)
+        if ".nddev-cursor-home:unsafe" not in state["drift"]:
+            errors.append("isolated HOME symlink smoke did not report setup drift")
+        if state["builder_projection"] != "unsafe" or state["launchable"]:
+            errors.append("isolated HOME symlink smoke left target launchable")
+        software = module.software_status(target)
+        if ".nddev-cursor-home:unsafe" not in software["drift"] or software["current"]:
+            errors.append("isolated HOME symlink smoke did not block software current status")
+        expect_launch_blocked_without_child(
+            module, target, ".nddev-cursor-home:unsafe", errors, "isolated HOME symlink"
+        )
+        if stat.S_IMODE(external_home.lstat().st_mode) != 0o755:
+            errors.append("isolated HOME symlink smoke chmodded the external directory")
+
+        target = root / "builder-parent"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        builder_parent = target / module.ISOLATED_HOME_ROOT / ".cursor" / "plugins" / "local"
+        external_builder_parent = root / "external-builder-parent"
+        replace_with_external_symlink(builder_parent, external_builder_parent)
+        state = module.inspect_target(target)
+        expected = ".nddev-cursor-home/.cursor/plugins/local:unsafe"
+        if expected not in state["drift"]:
+            errors.append("builder parent symlink smoke did not report setup drift")
+        if state["builder_projection"] != "unsafe" or state["launchable"]:
+            errors.append("builder parent symlink smoke left target launchable")
+        expect_launch_blocked_without_child(
+            module, target, expected, errors, "builder parent symlink"
+        )
+
+        target = root / "runtime-parent"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        runtime_parent = target / ".nddev-software"
+        external_runtime_parent = root / "external-runtime-parent"
+        replace_with_external_symlink(runtime_parent, external_runtime_parent)
+        state = module.inspect_target(target)
+        if ".nddev-software:unsafe" not in state["drift"] or state["launchable"]:
+            errors.append("runtime parent symlink smoke left setup status launchable")
+        software = module.software_status(target)
+        if ".nddev-software:unsafe" not in software["drift"] or software["current"]:
+            errors.append("runtime parent symlink smoke did not block software current status")
+        expect_launch_blocked_without_child(
+            module, target, ".nddev-software:unsafe", errors, "runtime parent symlink"
+        )
+
+
 def validate_public_manager_smokes(errors: list[str]) -> None:
     module = load_manager(errors)
     if module is None:
@@ -831,6 +928,7 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
     validate_initial_target_parent_smoke(module, errors)
     validate_launch_exception_restore_smoke(module, errors)
     validate_launch_swap_at_exec_smoke(module, errors)
+    validate_target_local_parent_symlink_smokes(module, errors)
 
 
 def validate_no_forbidden_public_paths(errors: list[str]) -> None:
@@ -935,6 +1033,11 @@ def main() -> int:
             errors.append("build/manifest.json: control root mismatch")
         if transaction.get("lock") != ".nddev-cursor-cli/lock":
             errors.append("build/manifest.json: lock path mismatch")
+        if (
+            transaction.get("target_local_directory_parents")
+            != "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed"
+        ):
+            errors.append("build/manifest.json: target-local parent policy mismatch")
         if "preserve_existing_target_mode" in transaction:
             errors.append("build/manifest.json: must not preserve arbitrary target mode")
         commands = manifest.get("command_policy", {}).get("json_supported", [])
@@ -973,6 +1076,11 @@ def main() -> int:
             errors.append("config/nddev-contract.json: lock path mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
             errors.append("config/nddev-contract.json: backup path mismatch")
+        if (
+            safety.get("target_local_directory_parents")
+            != "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed"
+        ):
+            errors.append("config/nddev-contract.json: target-local parent policy mismatch")
         if "preserve_existing_target_mode" in safety:
             errors.append("config/nddev-contract.json: must not preserve arbitrary target mode")
         validate_launch_contract("config/nddev-contract.json", contract.get("runtime_launch", {}), errors)

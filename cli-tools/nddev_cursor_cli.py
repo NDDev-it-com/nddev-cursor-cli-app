@@ -808,6 +808,11 @@ def drift_for_target(target: Path, stamp: dict[str, Any]) -> list[str]:
     )
     if managed_config_view(current) != managed_config_view(expected_config):
         drift.append(CONFIG_NAME)
+    builder_findings = builder_parent_findings(target)
+    if builder_findings:
+        drift.extend(builder_findings)
+        drift.append(BUILDER_TARGET_ROOT.as_posix())
+        return drift
     builder_state = inspect_builder_projection(target)
     if builder_state == "drifted":
         drift.append(BUILDER_TARGET_ROOT.as_posix())
@@ -835,6 +840,9 @@ def inspect_target(target: Path) -> dict[str, Any]:
     stamp = load_stamp(target)
     config_exists = (target / CONFIG_NAME).exists() or (target / CONFIG_NAME).is_symlink()
     if stamp is None:
+        builder_findings = builder_parent_findings(target)
+        runtime_findings = target_local_parent_findings(target, runtime_parent_directories(target))
+        drift = [*target_safety, *builder_findings, *runtime_findings]
         return {
             "state": "unmanaged" if config_exists else "empty",
             "setup_id": None,
@@ -842,13 +850,22 @@ def inspect_target(target: Path) -> dict[str, Any]:
             "profile_id": None,
             "legacy_setup_id": None,
             "legacy": False,
-            "drift": target_safety,
-            "builder_projection": inspect_builder_projection(target)
-            if target.exists()
-            else "missing",
+            "drift": list(dict.fromkeys(drift)),
+            "builder_projection": (
+                "unsafe"
+                if builder_findings
+                else inspect_builder_projection(target)
+                if target.exists()
+                else "missing"
+            ),
             "launchable": False,
         }
-    drift = [*target_safety, *drift_for_target(target, stamp)]
+    drift = [
+        *target_safety,
+        *drift_for_target(target, stamp),
+        *target_local_parent_findings(target, runtime_parent_directories(target)),
+    ]
+    drift = list(dict.fromkeys(drift))
     if stamp_is_legacy(stamp):
         builder_state = inspect_builder_projection(
             target,
@@ -856,11 +873,14 @@ def inspect_target(target: Path) -> dict[str, Any]:
             compare_content=False,
         )
     else:
-        builder_state = (
-            "current"
-            if BUILDER_TARGET_ROOT.as_posix() not in drift
-            else inspect_builder_projection(target)
-        )
+        if builder_parent_drifted(drift):
+            builder_state = "unsafe"
+        else:
+            builder_state = (
+                "current"
+                if BUILDER_TARGET_ROOT.as_posix() not in drift
+                else inspect_builder_projection(target)
+            )
     content_setup_id = stamp_content_setup_id(stamp)
     profile_id = stamp_profile_id(stamp)
     legacy_setup_id = stamp_legacy_setup_id(stamp)
@@ -931,6 +951,109 @@ def require_owner_private_directory(path: Path, label: str) -> os.stat_result:
     if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
         fail(f"{label} must have mode 0700")
     return info
+
+
+def directory_component_label(relative: Path) -> str:
+    return relative.as_posix()
+
+
+def directory_component_finding(relative: Path, reason: str) -> str:
+    return f"{directory_component_label(relative)}:{reason}"
+
+
+def target_local_directory_chain_findings(target: Path, relative: Path) -> list[str]:
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        fail(f"unsafe target-local directory path: {relative.as_posix()}")
+    findings: list[str] = []
+    current = target
+    walked = Path()
+    uid = current_user_id()
+    for part in relative.parts:
+        walked = walked / part
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            findings.append(directory_component_finding(walked, "unsafe"))
+            break
+        if uid is not None and info.st_uid != uid:
+            findings.append(directory_component_finding(walked, "owner"))
+        if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+            findings.append(directory_component_finding(walked, "mode"))
+    return findings
+
+
+def require_target_local_directory_chain(target: Path, relative: Path, label: str) -> Path:
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        fail(f"unsafe {label} path: {relative.as_posix()}")
+    current = target
+    walked = Path()
+    uid = current_user_id()
+    for part in relative.parts:
+        walked = walked / part
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            fail(f"{label} directory is missing: {walked.as_posix()}")
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} directory path is unsafe: {walked.as_posix()}")
+        if uid is not None and info.st_uid != uid:
+            fail(f"{label} directory must be owned by the current user: {walked.as_posix()}")
+        if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+            fail(f"{label} directory must have mode 0700: {walked.as_posix()}")
+    return target / relative
+
+
+def builder_parent_directories() -> set[Path]:
+    parents = {ISOLATED_HOME_ROOT}
+    for _, target_path in builder_source_files(BUILDER_TARGET_ROOT):
+        parent = target_path.parent
+        while parent != Path("."):
+            parents.add(parent)
+            parent = parent.parent
+    return parents
+
+
+def runtime_parent_directories(target: Path) -> set[Path]:
+    directories = {
+        software_container(target),
+        software_root(target),
+        software_root(target) / "versions",
+        software_version_dir(target),
+        managed_agent_path(target).parent,
+        ISOLATED_HOME_ROOT,
+    }
+    relatives: set[Path] = set()
+    for directory in directories:
+        if directory.is_absolute():
+            try:
+                relative = directory.relative_to(target)
+            except ValueError:
+                continue
+        else:
+            relative = directory
+        if relative != Path("."):
+            relatives.add(relative)
+    return relatives
+
+
+def target_local_parent_findings(target: Path, relatives: set[Path]) -> list[str]:
+    findings: list[str] = []
+    for relative in sorted(relatives, key=lambda item: item.as_posix()):
+        findings.extend(target_local_directory_chain_findings(target, relative))
+    return sorted(dict.fromkeys(findings))
+
+
+def builder_parent_findings(target: Path) -> list[str]:
+    return target_local_parent_findings(target, builder_parent_directories())
+
+
+def builder_parent_drifted(drift: list[str]) -> bool:
+    builder_roots = (ISOLATED_HOME_ROOT.as_posix(), f"{ISOLATED_HOME_ROOT.as_posix()}/")
+    return any(item == builder_roots[0] or item.startswith(builder_roots[1]) for item in drift)
 
 
 def path_exists_no_follow(path: Path) -> bool:
@@ -1069,6 +1192,7 @@ def remove_empty_parents(target: Path, path: Path) -> None:
 
 def ensure_real_directory(root: Path, relative: Path) -> None:
     current = root
+    uid = current_user_id()
     for part in relative.parts:
         current = current / part
         if current.exists() or current.is_symlink():
@@ -1078,6 +1202,10 @@ def ensure_real_directory(root: Path, relative: Path) -> None:
                 fail(f"managed directory appeared concurrently: {current}")
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                 fail(f"managed directory path is unsafe: {current}")
+            if uid is not None and info.st_uid != uid:
+                fail(f"managed directory must be owned by the current user: {current}")
+            if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+                fail(f"managed directory must have mode 0700: {current}")
             continue
         current.mkdir(mode=OWNER_DIRECTORY_MODE)
         current.chmod(OWNER_DIRECTORY_MODE)
@@ -1686,23 +1814,43 @@ def ensure_real_directory_path(path: Path, label: str) -> None:
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             fail(f"{label} must be a real directory")
+        uid = current_user_id()
+        if uid is not None and info.st_uid != uid:
+            fail(f"{label} must be owned by the current user")
         if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
             fail(f"{label} must have mode 0700")
         return
-    path.mkdir(mode=OWNER_DIRECTORY_MODE, parents=True)
-    path.chmod(OWNER_DIRECTORY_MODE)
+    missing: list[Path] = []
+    current = path
+    while not (current.exists() or current.is_symlink()):
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            fail(f"{label} has no existing owner-private parent")
+        current = parent
+    require_owner_private_directory(current, f"{label} parent")
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=OWNER_DIRECTORY_MODE)
+        except FileExistsError:
+            fail(f"{label} appeared concurrently")
+        directory.chmod(OWNER_DIRECTORY_MODE)
+        require_owner_private_directory(directory, label)
 
 
 def ensure_private_directory_chain(root: Path, relative_parent: Path) -> None:
     current = root
     if relative_parent == Path("."):
         return
+    uid = current_user_id()
     for part in relative_parent.parts:
         current = current / part
         if current.exists() or current.is_symlink():
             info = current.lstat()
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                 fail(f"Cursor runtime directory path is unsafe: {current}")
+            if uid is not None and info.st_uid != uid:
+                fail(f"Cursor runtime directory must be owned by the current user: {current}")
             if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
                 fail(f"Cursor runtime directory must have mode 0700: {current}")
             continue
@@ -1938,7 +2086,23 @@ def software_status(target: Path) -> dict[str, Any]:
     version_binary = software_tree_binary(target)
     installed = False
     drift: list[str] = target_safety_findings(target)
-    presence = software_presence(target)
+    runtime_findings = target_local_parent_findings(target, runtime_parent_directories(target))
+    drift.extend(runtime_findings)
+    presence = [] if runtime_findings else software_presence(target)
+    if runtime_findings:
+        return {
+            "schema_version": 1,
+            "command": "software-status",
+            "target": str(target.resolve(strict=False)),
+            "installed": False,
+            "current": False,
+            "present": False,
+            "presence": presence,
+            "version": None,
+            "expected_version": CURSOR_VERSION,
+            "managed_command": str(binary),
+            "drift": drift,
+        }
     directory_mode_drift = False
     for directory, label in (
         (software_container(target), ".nddev-software"),
@@ -2330,9 +2494,9 @@ def launch_cursor(target: Path, cursor_args: list[str]) -> int:
         software = software_status(target)
         if not software["installed"] or not software["current"]:
             fail("launch requires current target-owned Cursor CLI software")
-        child_home = target / ".nddev-cursor-home"
-        child_home.mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
-        child_home.chmod(OWNER_DIRECTORY_MODE)
+        child_home = require_target_local_directory_chain(
+            target, ISOLATED_HOME_ROOT, "Cursor isolated HOME"
+        )
         environment: dict[str, str] = {
             "CURSOR_CONFIG_DIR": str(target.resolve(strict=False)),
             "HOME": str(child_home.resolve(strict=False)),
