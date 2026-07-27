@@ -132,6 +132,34 @@ REQUIRED_BUILDER_COMMANDS = {
 }
 BUILDER_ROOT_FILES = {"README.md"}
 BUILDER_COMPONENT_ROOTS = {".cursor-plugin", "agents", "commands", "rules", "skills"}
+REQUIRED_ARCHIVE_ROOTS = {
+    ".github",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "VERSION",
+    "build",
+    "cli-tools",
+    "config",
+    "docs",
+    "plugins",
+    "profiles",
+    "references",
+    "setups",
+}
+REQUIRED_RUNTIME_ROOTS = {
+    "LICENSE",
+    "README.md",
+    "VERSION",
+    "build",
+    "cli-tools",
+    "config",
+    "plugins",
+    "profiles",
+    "references",
+    "setups",
+}
 
 
 def load_json(relative: str, errors: list[str]) -> dict | None:
@@ -383,6 +411,43 @@ def validate_builder_projection_parity(errors: list[str]) -> None:
             "manager builder projection does not match toolkit files "
             f"(missing={missing}, extra={extra})"
         )
+
+
+def release_workflow_roots(field: str, errors: list[str]) -> set[str]:
+    path = ROOT / ".github" / "workflows" / "release.yml"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        errors.append(f".github/workflows/release.yml: unreadable: {exc}")
+        return set()
+    roots: list[str] = []
+    collecting = False
+    for line in lines:
+        if not collecting:
+            if line.strip() == f"{field}: >-":
+                collecting = True
+            continue
+        if line.startswith("        "):
+            roots.extend(line.split())
+            continue
+        break
+    if not collecting:
+        errors.append(f".github/workflows/release.yml: missing {field}")
+    return set(roots)
+
+
+def validate_release_roots(errors: list[str]) -> None:
+    for field, required in (
+        ("archive_paths", REQUIRED_ARCHIVE_ROOTS),
+        ("runtime_paths", REQUIRED_RUNTIME_ROOTS),
+    ):
+        roots = release_workflow_roots(field, errors)
+        missing = sorted(required - roots)
+        if missing:
+            errors.append(f".github/workflows/release.yml: {field} missing {missing}")
+        for root in sorted(roots):
+            if not (ROOT / root).exists():
+                errors.append(f".github/workflows/release.yml: {field} root missing: {root}")
 
 
 def load_manager(errors: list[str]) -> Any | None:
@@ -1312,6 +1377,7 @@ def main() -> int:
 
     validate_profiles(errors)
     validate_builder_toolkit(version, build_version, errors)
+    validate_release_roots(errors)
     validate_public_manager_smokes(errors)
     validate_no_forbidden_public_paths(errors)
 
