@@ -77,7 +77,6 @@ CURSOR_OFFICIAL_ASSETS = {
         82521188,
     ),
 }
-INTERNAL_ARTIFACT_ENV = "NDDEV_CURSOR_CLI_TEST_ARTIFACT_URL"
 INTERNAL_FAIL_AFTER_VERSION_SWAP_ENV = "NDDEV_CURSOR_CLI_TEST_FAIL_AFTER_VERSION_SWAP"
 INTERNAL_FAIL_AFTER_BINARY_SWAP_ENV = "NDDEV_CURSOR_CLI_TEST_FAIL_AFTER_BINARY_SWAP"
 PROVIDER_SECRET_NAMES = {
@@ -822,13 +821,76 @@ def backup_pool(target: Path) -> Path:
     return target.parent / f".{target.name}.nddev-cursor-cli-backups"
 
 
+def current_user_id() -> int | None:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return None
+    return int(getuid())
+
+
+def require_owner_private_directory(path: Path, label: str) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} must be a real directory")
+    uid = current_user_id()
+    if uid is not None and info.st_uid != uid:
+        fail(f"{label} must be owned by the current user")
+    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail(f"{label} must have mode 0700")
+    return info
+
+
+def path_exists_no_follow(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def ensure_backup_pool(pool: Path) -> None:
+    try:
+        pool.mkdir(mode=OWNER_DIRECTORY_MODE)
+    except FileExistsError:
+        require_owner_private_directory(pool, "backup pool")
+    else:
+        pool.chmod(OWNER_DIRECTORY_MODE)
+        require_owner_private_directory(pool, "backup pool")
+
+
+def require_backup_envelope_file(path: Path, label: str) -> os.stat_result:
+    info = require_regular_file(path, label, max_bytes=METADATA_MAX_BYTES)
+    uid = current_user_id()
+    if uid is not None and info.st_uid != uid:
+        fail(f"{label} must be owned by the current user")
+    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail(f"{label} must have mode 0600")
+    return info
+
+
+def remove_backup_slot(slot_path: Path) -> None:
+    require_owner_private_directory(slot_path, f"backup slot {slot_path.name}")
+    entries = list(slot_path.iterdir())
+    if len(entries) > 1 or (entries and entries[0].name != BACKUP_NAME):
+        fail(f"backup slot {slot_path.name} contains unmanaged files")
+    if entries:
+        envelope = entries[0]
+        require_backup_envelope_file(envelope, f"backup slot {slot_path.name} envelope")
+        envelope.unlink()
+    slot_path.rmdir()
+
+
 def choose_backup_slot(pool: Path) -> int:
-    pool.mkdir(mode=OWNER_DIRECTORY_MODE, exist_ok=True)
-    pool.chmod(OWNER_DIRECTORY_MODE)
+    ensure_backup_pool(pool)
     for slot in range(10):
-        if not (pool / str(slot)).exists():
+        slot_path = pool / str(slot)
+        if not path_exists_no_follow(slot_path):
             return slot
-    oldest = min(range(10), key=lambda slot: (pool / str(slot)).stat().st_mtime_ns)
+        require_owner_private_directory(slot_path, f"backup slot {slot}")
+    oldest = min(range(10), key=lambda slot: (pool / str(slot)).lstat().st_mtime_ns)
     return oldest
 
 
@@ -851,9 +913,10 @@ def write_backup(target: Path, source_state: dict[str, Any]) -> int:
     pool = backup_pool(target)
     slot = choose_backup_slot(pool)
     slot_path = pool / str(slot)
-    if slot_path.exists():
-        shutil.rmtree(slot_path)
+    if path_exists_no_follow(slot_path):
+        remove_backup_slot(slot_path)
     slot_path.mkdir(mode=OWNER_DIRECTORY_MODE)
+    slot_path.chmod(OWNER_DIRECTORY_MODE)
     files = capture_managed_files(target)
     envelope = {
         "schema_version": 2,
@@ -877,7 +940,10 @@ def write_backup(target: Path, source_state: dict[str, Any]) -> int:
 
 
 def load_backup(target: Path, slot: int) -> dict[str, Any]:
-    path = backup_pool(target) / str(slot) / BACKUP_NAME
+    slot_path = backup_pool(target) / str(slot)
+    require_owner_private_directory(slot_path, f"backup slot {slot}")
+    path = slot_path / BACKUP_NAME
+    require_backup_envelope_file(path, f"backup slot {slot} envelope")
     envelope = load_json_object(path, f"backup slot {slot}")
     schema_version = envelope.get("schema_version")
     if schema_version == 1:
@@ -1342,13 +1408,8 @@ def validate_archive_path(raw_name: str) -> Path:
 
 
 def read_artifact(source: str) -> bytes:
-    if source.startswith("file://"):
-        path = Path(source[7:])
-        return read_regular_file(
-            path,
-            f"Cursor software artifact {path}",
-            max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
-        )
+    if not source.startswith(f"{CURSOR_RELEASE_BASE_URL}/"):
+        fail("Cursor software artifact source must be the pinned official release URL")
     request = urllib.request.Request(
         source,
         headers={"User-Agent": f"{PRODUCT_NAME}/{VERSION}"},
@@ -1471,7 +1532,7 @@ def managed_agent_launcher_bytes(target: Path) -> bytes:
     version_dir = software_version_dir(target).resolve(strict=False)
     script_dir = shell_quote(str(version_dir))
     return (
-        "#!/usr/bin/env bash\n"
+        "#!/bin/bash\n"
         "set -euo pipefail\n"
         'export CURSOR_INVOKED_AS="${0##*/}"\n'
         f"SCRIPT_DIR={script_dir}\n"
@@ -1887,12 +1948,11 @@ def software_status(target: Path) -> dict[str, Any]:
 
 def prepare_cursor_artifact() -> dict[str, Any]:
     asset_path, expected_sha, expected_size = current_platform_asset()
-    source_url = os.environ.get(INTERNAL_ARTIFACT_ENV) or official_asset_url(asset_path)
+    source_url = official_asset_url(asset_path)
     archive = read_artifact(source_url)
     artifact_sha = sha256_bytes(archive)
-    if os.environ.get(INTERNAL_ARTIFACT_ENV) is None:
-        if artifact_sha != expected_sha or len(archive) != expected_size:
-            fail("official Cursor artifact digest or size mismatch")
+    if artifact_sha != expected_sha or len(archive) != expected_size:
+        fail("official Cursor artifact digest or size mismatch")
     runtime = extract_cursor_runtime(archive)
     return {
         "asset_path": asset_path,
@@ -2003,19 +2063,8 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
                 fail(
                     "Cursor software install did not produce a structurally complete target-owned CLI"
                 )
-            if os.environ.get(INTERNAL_ARTIFACT_ENV) is None:
-                if not final_status["current"]:
-                    fail("Cursor software install did not produce the current pinned CLI identity")
-            else:
-                tolerated_identity_drift = {"official_source", "artifact_sha256", "artifact_size"}
-                structural_drift = [
-                    item for item in final_status["drift"] if item not in tolerated_identity_drift
-                ]
-                if structural_drift:
-                    fail(
-                        "Cursor software test artifact produced structural drift: "
-                        + ", ".join(structural_drift)
-                    )
+            if not final_status["current"]:
+                fail("Cursor software install did not produce the current pinned CLI identity")
         except BaseException:
             if version_dir.exists() or version_dir.is_symlink():
                 if version_dir.is_dir() and not version_dir.is_symlink():
@@ -2119,6 +2168,24 @@ def restore_managed_config_after_launch(target: Path) -> None:
         replace_managed_state(target, desired, names=(CONFIG_NAME,))
 
 
+def run_cursor_child(
+    executable: Path, forwarded: list[str], environment: dict[str, str]
+) -> subprocess.CompletedProcess[Any]:
+    return subprocess.run([str(executable), *forwarded], env=environment, check=False)
+
+
+def report_cleanup_failure_after_child_exception(
+    child_error: BaseException, cleanup_error: BaseException
+) -> None:
+    note = f"managed config restore failed after child exception: {cleanup_error}"
+    add_note = getattr(child_error, "add_note", None)
+    if add_note is not None:
+        with contextlib.suppress(Exception):
+            add_note(note)
+    with contextlib.suppress(Exception):
+        print(f"nddev-cursor-cli: warning: {note}", file=sys.stderr)
+
+
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
     forwarded = cursor_args[1:] if cursor_args[:1] == ["--"] else cursor_args
     reject_managed_launch_overrides(forwarded)
@@ -2133,18 +2200,30 @@ def launch_cursor(target: Path, cursor_args: list[str]) -> int:
         environment: dict[str, str] = {
             "CURSOR_CONFIG_DIR": str(target.resolve(strict=False)),
             "HOME": str(child_home.resolve(strict=False)),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PATH": "/usr/bin:/bin",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
-        for name in ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "TMPDIR", "SYSTEMROOT"):
+        for name in ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "TMPDIR"):
             value = os.environ.get(name)
             if value:
                 environment[name] = value
         for name in PROVIDER_SECRET_NAMES:
             environment.pop(name, None)
         executable = managed_agent_path(target)
-    completed = subprocess.run([str(executable), *forwarded], env=environment, check=False)
-    restore_managed_config_after_launch(target)
+    child_error: BaseException | None = None
+    try:
+        completed = run_cursor_child(executable, forwarded, environment)
+    except BaseException as exc:
+        child_error = exc
+        raise
+    finally:
+        try:
+            restore_managed_config_after_launch(target)
+        except BaseException as cleanup_error:
+            if child_error is not None:
+                report_cleanup_failure_after_child_exception(child_error, cleanup_error)
+            else:
+                raise
     if completed.returncode < 0:
         return 128 + abs(completed.returncode)
     return completed.returncode

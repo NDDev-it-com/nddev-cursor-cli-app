@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 CURSOR_RELEASE_ID = "2026.07.23-e383d2b"
@@ -167,6 +170,12 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch must use managed bin/agent")
     if launch.get("isolated_home") != ".nddev-cursor-home":
         errors.append(f"{owner}: runtime_launch isolated_home mismatch")
+    if launch.get("path_policy") != "fixed-minimal-system-path":
+        errors.append(f"{owner}: runtime_launch path_policy mismatch")
+    if launch.get("path_value") != "/usr/bin:/bin":
+        errors.append(f"{owner}: runtime_launch path_value mismatch")
+    if launch.get("launcher_shell") != "/bin/bash":
+        errors.append(f"{owner}: runtime_launch launcher_shell mismatch")
     if launch.get("path_fallback") is not False:
         errors.append(f"{owner}: runtime_launch.path_fallback must be false")
     if launch.get("requires_current_target_owned_software") is not True:
@@ -347,6 +356,194 @@ def validate_builder_projection_parity(errors: list[str]) -> None:
         )
 
 
+def load_manager(errors: list[str]) -> Any | None:
+    sys.dont_write_bytecode = True
+    manager_path = ROOT / "cli-tools" / "nddev_cursor_cli.py"
+    spec = importlib.util.spec_from_file_location("_nddev_cursor_cli_public_smoke", manager_path)
+    if spec is None or spec.loader is None:
+        errors.append("cannot load nddev_cursor_cli.py")
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - validator must report safe public errors.
+        errors.append(f"cannot import nddev_cursor_cli.py: {exc}")
+        return None
+    return module
+
+
+def with_restored_attr(module: Any, name: str, value: Any):
+    class RestoreAttr:
+        def __enter__(self) -> None:
+            self.original = getattr(module, name)
+            setattr(module, name, value)
+
+        def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+            setattr(module, name, self.original)
+
+    return RestoreAttr()
+
+
+def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
+    manager_source = (ROOT / "cli-tools" / "nddev_cursor_cli.py").read_text(encoding="utf-8")
+    if "NDDEV_CURSOR_CLI_TEST_ARTIFACT_URL" in manager_source:
+        errors.append("nddev_cursor_cli.py must not expose a test artifact URL env override")
+    if "INTERNAL_ARTIFACT_ENV" in manager_source:
+        errors.append("nddev_cursor_cli.py must not retain internal artifact env plumbing")
+    if "file://" in manager_source:
+        errors.append("nddev_cursor_cli.py must not accept file:// software artifacts")
+
+    artifact = b"official artifact bytes"
+    asset_path = "linux/x64/agent-cli-package.tar.gz"
+    expected_sha = module.sha256_bytes(artifact)
+    seen_sources: list[str] = []
+
+    def fake_current_platform_asset() -> tuple[str, str, int]:
+        return asset_path, expected_sha, len(artifact)
+
+    def fake_read_artifact(source: str) -> bytes:
+        seen_sources.append(source)
+        return artifact
+
+    runtime = {
+        "files": {"cursor-agent": (b"agent", module.OWNER_EXEC_MODE)},
+        "binary": b"agent",
+        "binary_sha256": module.sha256_bytes(b"agent"),
+        "runtime_tree_sha256": module.sha256_bytes(b"tree"),
+        "runtime_size": 1,
+        "runtime_file_count": 3,
+    }
+    old_env = os.environ.get("NDDEV_CURSOR_CLI_TEST_ARTIFACT_URL")
+    os.environ["NDDEV_CURSOR_CLI_TEST_ARTIFACT_URL"] = "file:///tmp/unpinned.tar.gz"
+    try:
+        with (
+            with_restored_attr(module, "current_platform_asset", fake_current_platform_asset),
+            with_restored_attr(module, "read_artifact", fake_read_artifact),
+            with_restored_attr(module, "extract_cursor_runtime", lambda archive: runtime),
+        ):
+            result = module.prepare_cursor_artifact()
+    finally:
+        if old_env is None:
+            os.environ.pop("NDDEV_CURSOR_CLI_TEST_ARTIFACT_URL", None)
+        else:
+            os.environ["NDDEV_CURSOR_CLI_TEST_ARTIFACT_URL"] = old_env
+    expected_source = module.official_asset_url(asset_path)
+    if seen_sources != [expected_source]:
+        errors.append("prepare_cursor_artifact did not ignore untrusted artifact env override")
+    if result.get("source_url") != expected_source:
+        errors.append("prepare_cursor_artifact returned a non-official artifact source")
+
+    def fake_wrong_read_artifact(source: str) -> bytes:
+        del source
+        return b"wrong artifact bytes"
+
+    with (
+        with_restored_attr(module, "current_platform_asset", fake_current_platform_asset),
+        with_restored_attr(module, "read_artifact", fake_wrong_read_artifact),
+    ):
+        try:
+            module.prepare_cursor_artifact()
+        except module.CursorSetupError as exc:
+            if "digest or size mismatch" not in str(exc):
+                errors.append("wrong artifact failure did not report digest/size mismatch")
+        else:
+            errors.append("prepare_cursor_artifact accepted wrong artifact bytes")
+
+    try:
+        module.read_artifact("file:///tmp/unpinned.tar.gz")
+    except module.CursorSetupError:
+        pass
+    else:
+        errors.append("read_artifact accepted a non-official artifact source")
+
+
+def validate_backup_symlink_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-backup-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        external = root / "external"
+        external.mkdir(mode=0o700)
+        marker = external / "marker"
+        marker.write_text("preserve\n", encoding="utf-8")
+        os.symlink(external, module.backup_pool(target))
+        try:
+            module.mutate_setup(target, "nddev-builder", "safe", "switch")
+        except module.CursorSetupError as exc:
+            if "backup pool" not in str(exc):
+                errors.append("backup symlink smoke failed with unexpected error")
+        else:
+            errors.append("backup symlink smoke unexpectedly allowed switch")
+        if not marker.is_file():
+            errors.append("backup symlink smoke removed external marker")
+
+
+def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-launch-smoke-") as tmp:
+        target = Path(tmp) / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        expected = module.managed_config_view(
+            module.parse_json_object(
+                module.render_profile("full-auto")[1][module.CONFIG_NAME],
+                "profile full-auto config",
+            )
+        )
+        seen_environment: dict[str, str] = {}
+
+        def fake_software_status(path: Path) -> dict[str, Any]:
+            del path
+            return {"installed": True, "current": True, "drift": []}
+
+        def fake_run_cursor_child(
+            executable: Path, forwarded: list[str], environment: dict[str, str]
+        ) -> Any:
+            del executable, forwarded
+            seen_environment.update(environment)
+            config = module.load_target_config(target)
+            assert config is not None
+            config["approvalMode"] = "allowlist"
+            (target / module.CONFIG_NAME).write_bytes(module.canonical_json(config))
+            raise OSError("simulated child failure")
+
+        fake_path = str(Path(tmp) / "fake-bin")
+        old_path = os.environ.get("PATH")
+        os.environ["PATH"] = fake_path
+        try:
+            with (
+                with_restored_attr(module, "software_status", fake_software_status),
+                with_restored_attr(module, "run_cursor_child", fake_run_cursor_child),
+            ):
+                try:
+                    module.launch_cursor(target, ["--", "-p", "noop"])
+                except OSError as exc:
+                    if "simulated child failure" not in str(exc):
+                        errors.append("launch smoke raised unexpected OSError")
+                else:
+                    errors.append("launch smoke did not preserve child OSError")
+        finally:
+            if old_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = old_path
+        restored = module.load_target_config(target)
+        if restored is None or module.managed_config_view(restored) != expected:
+            errors.append("launch smoke did not restore managed config after child exception")
+        if seen_environment.get("PATH") != "/usr/bin:/bin":
+            errors.append("launch smoke inherited ambient PATH")
+        launcher = module.managed_agent_launcher_bytes(target)
+        if not launcher.startswith(b"#!/bin/bash\n"):
+            errors.append("managed launcher must use /bin/bash")
+
+
+def validate_public_manager_smokes(errors: list[str]) -> None:
+    module = load_manager(errors)
+    if module is None:
+        return
+    validate_artifact_source_smokes(module, errors)
+    validate_backup_symlink_smoke(module, errors)
+    validate_launch_exception_restore_smoke(module, errors)
+
+
 def validate_no_forbidden_public_paths(errors: list[str]) -> None:
     unsupported_os = "Win" + "dows"
     forbidden = (
@@ -524,6 +721,7 @@ def main() -> int:
 
     validate_profiles(errors)
     validate_builder_toolkit(version, build_version, errors)
+    validate_public_manager_smokes(errors)
     validate_no_forbidden_public_paths(errors)
 
     if errors:

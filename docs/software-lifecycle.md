@@ -42,8 +42,9 @@ Updates stage a complete version tree under
 rename it into place. On failure, the manager restores the previous version
 tree, `bin/agent`, and `NDDEV-CURSOR-CLI-SOFTWARE.json`. The installed
 `bin/agent` is a target-owned launcher that executes the pinned target-owned
-runtime tree, including its bundled `node`; launch never falls back to a live or
-system Node.js binary.
+runtime tree through `/bin/bash`, including its bundled `node`; launch never
+falls back to a live or system Node.js binary and uses a fixed child `PATH` of
+`/usr/bin:/bin`.
 
 Cursor `--version` and `--help` can write target-local runtime/process state and
 can rewrite managed config defaults even when no login is attempted. After the

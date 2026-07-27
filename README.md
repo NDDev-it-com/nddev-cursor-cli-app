@@ -51,12 +51,13 @@ python3 cli-tools/nddev_cursor_cli.py launch --target /absolute/cursor-config --
 
 `launch` requires a clean managed setup plus current target-owned software,
 executes only the absolute target `bin/agent`, never falls back to `PATH`, and
-rejects Cursor flags or subcommands that would override the managed approval,
-sandbox, worktree, shell-integration, worker, or self-update lifecycle. The
-managed `bin/agent` launcher uses only the pinned target-owned runtime tree,
-including its bundled Node.js binary.
+uses a fixed minimal child `PATH` of `/usr/bin:/bin`. The launcher uses
+`/bin/bash`, rejects Cursor flags or subcommands that would override the managed
+approval, sandbox, worktree, shell-integration, worker, or self-update
+lifecycle, and uses only the pinned target-owned runtime tree, including its
+bundled Node.js binary.
 
-The setup variants also project `nddev-builder` as a local native Cursor plugin
+The setup/profile model also projects `nddev-builder` as a local native Cursor plugin
 under `.nddev-cursor-home/.cursor/plugins/local/nddev-builder` inside the
 selected target. The projection uses Cursor's plugin, rules, skills, custom
 agents, and commands surfaces. It does not activate hooks or MCP servers and
