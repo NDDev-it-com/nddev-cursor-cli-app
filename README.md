@@ -20,11 +20,14 @@ permission profiles. The default profile is `full-auto`; `safe` is available for
 sandboxed allowlisted work. Legacy managed targets can be inspected, migrated,
 restored, or removed, but they are not launchable.
 
-New targets are created owner-private (`0700`). Existing targets used for
-install, switch, migrate, restore, remove, software install/update, or launch
-must already be owned by the current user and mode `0700`; the manager reports
-`target:owner` or `target:mode` drift instead of silently changing existing root
-permissions.
+New targets are created owner-private (`0700`) only under a real parent that is
+current-user-owned and not writable by group/other, or a sticky directory.
+Existing targets used for install, switch, migrate, restore, remove, software
+install/update, or launch must already be owned by the current user and mode
+`0700`; the manager reports `target:owner` or `target:mode` drift instead of
+silently changing existing root permissions. Lifecycle lock and backup state
+lives inside the target under `.nddev-cursor-cli/{lock,backups}`; sibling
+`.nddev-*` lock or backup paths are ignored.
 
 ## Software lifecycle
 

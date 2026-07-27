@@ -470,8 +470,8 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         errors.append("read_artifact accepted a non-official artifact source")
 
 
-def validate_backup_symlink_smoke(module: Any, errors: list[str]) -> None:
-    with tempfile.TemporaryDirectory(prefix="nddev-cursor-backup-smoke-") as tmp:
+def validate_sibling_control_state_ignored_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-sibling-control-smoke-") as tmp:
         root = Path(tmp)
         target = root / "target"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
@@ -479,16 +479,146 @@ def validate_backup_symlink_smoke(module: Any, errors: list[str]) -> None:
         external.mkdir(mode=0o700)
         marker = external / "marker"
         marker.write_text("preserve\n", encoding="utf-8")
-        os.symlink(external, module.backup_pool(target))
+        sibling_lock = target.parent / f".{target.name}.nddev-cursor-cli-lock"
+        sibling_lock.mkdir(mode=0o700)
+        os.symlink(external, target.parent / f".{target.name}.nddev-cursor-cli-backups")
+        result = module.mutate_setup(target, "nddev-builder", "safe", "switch")
+        if result.get("backup_slot") != 0:
+            errors.append("sibling control smoke did not create internal backup slot 0")
+        if not (module.backup_pool(target) / "0" / module.BACKUP_NAME).is_file():
+            errors.append("sibling control smoke did not use target-internal backup pool")
+        if not marker.is_file():
+            errors.append("sibling control smoke removed external marker")
+        if not sibling_lock.is_dir():
+            errors.append("sibling control smoke removed sibling lock")
+
+
+def validate_insecure_internal_control_state_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-internal-control-smoke-") as tmp:
+        root = Path(tmp)
+
+        target = root / "root-symlink"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        external = root / "external-root"
+        external.mkdir(mode=0o700)
+        os.symlink(external, module.control_root(target))
+        try:
+            module.mutate_setup(target, "nddev-builder", "safe", "switch")
+        except module.CursorSetupError as exc:
+            if "control root" not in str(exc):
+                errors.append("internal control root symlink failed with unexpected error")
+        else:
+            errors.append("internal control root symlink was accepted")
+
+        target = root / "lock-symlink"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        control = module.ensure_control_root(target)
+        os.symlink(external, control / module.CONTROL_LOCK_NAME)
+        try:
+            module.mutate_setup(target, "nddev-builder", "safe", "switch")
+        except module.CursorSetupError as exc:
+            if "target lock path is unsafe" not in str(exc):
+                errors.append("internal lock symlink failed with unexpected error")
+        else:
+            errors.append("internal lock symlink was accepted")
+
+        target = root / "backup-symlink"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        control = module.ensure_control_root(target)
+        os.symlink(external, control / module.CONTROL_BACKUPS_NAME)
         try:
             module.mutate_setup(target, "nddev-builder", "safe", "switch")
         except module.CursorSetupError as exc:
             if "backup pool" not in str(exc):
-                errors.append("backup symlink smoke failed with unexpected error")
+                errors.append("internal backup symlink failed with unexpected error")
         else:
-            errors.append("backup symlink smoke unexpectedly allowed switch")
-        if not marker.is_file():
-            errors.append("backup symlink smoke removed external marker")
+            errors.append("internal backup symlink was accepted")
+
+        target = root / "backup-mode"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        control = module.ensure_control_root(target)
+        backups = control / module.CONTROL_BACKUPS_NAME
+        backups.mkdir(mode=0o700)
+        backups.chmod(0o755)
+        try:
+            module.mutate_setup(target, "nddev-builder", "safe", "switch")
+        except module.CursorSetupError as exc:
+            if "backup pool must have mode 0700" not in str(exc):
+                errors.append("internal backup mode failed with unexpected error")
+        else:
+            errors.append("internal backup mode was accepted")
+
+        target = root / "backup-hardlink"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        control = module.ensure_control_root(target)
+        backups = control / module.CONTROL_BACKUPS_NAME
+        module.ensure_backup_pool(backups)
+        slot = backups / "0"
+        slot.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+        slot.chmod(module.OWNER_DIRECTORY_MODE)
+        original = root / "hardlink-source"
+        original.write_bytes(b"{}\n")
+        original.chmod(module.OWNER_FILE_MODE)
+        os.link(original, slot / module.BACKUP_NAME)
+        try:
+            module.restore_slot(target, 0)
+        except module.CursorSetupError as exc:
+            if "hard-link aliases" not in str(exc):
+                errors.append("internal backup hardlink failed with unexpected error")
+        else:
+            errors.append("internal backup hardlink was accepted")
+
+
+def validate_backup_rotation_and_binding_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-backup-rotation-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        slots: list[int] = []
+        profile = "safe"
+        for _ in range(11):
+            result = module.mutate_setup(target, "nddev-builder", profile, "switch")
+            slot = result.get("backup_slot")
+            if not isinstance(slot, int):
+                errors.append("backup rotation smoke did not report an integer backup slot")
+                return
+            slots.append(slot)
+            profile = "full-auto" if profile == "safe" else "safe"
+        pool = module.backup_pool(target)
+        if pool.parent != module.control_root(target):
+            errors.append("backup rotation smoke backup pool is not control-root internal")
+        real_slots = sorted(path.name for path in pool.iterdir() if path.is_dir() and not path.is_symlink())
+        if real_slots != [str(slot) for slot in range(10)]:
+            errors.append(f"backup rotation smoke expected slots 0..9, got {real_slots}")
+        if len(set(slots)) != 10 or len(slots) != 11:
+            errors.append(f"backup rotation smoke did not rotate bounded slots: {slots}")
+        for slot in range(10):
+            try:
+                envelope = module.load_backup(target, slot)
+            except module.CursorSetupError as exc:
+                errors.append(f"backup rotation smoke could not load slot {slot}: {exc}")
+                continue
+            if envelope.get("canonical_target") != str(target.resolve(strict=False)):
+                errors.append(f"backup slot {slot} canonical target mismatch")
+        other = root / "other"
+        module.mutate_setup(other, "nddev-builder", "full-auto", "install")
+        module.ensure_control_root(other)
+        other_pool = module.backup_pool(other)
+        module.ensure_backup_pool(other_pool)
+        other_slot = other_pool / "0"
+        other_slot.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+        other_slot.chmod(module.OWNER_DIRECTORY_MODE)
+        copied = (pool / "0" / module.BACKUP_NAME).read_bytes()
+        copied_path = other_slot / module.BACKUP_NAME
+        copied_path.write_bytes(copied)
+        copied_path.chmod(module.OWNER_FILE_MODE)
+        try:
+            module.load_backup(other, 0)
+        except module.CursorSetupError as exc:
+            if "different canonical target" not in str(exc):
+                errors.append("backup canonical binding failed with unexpected error")
+        else:
+            errors.append("backup canonical binding accepted another target's backup")
 
 
 def install_smoke_current_software(module: Any, target: Path) -> None:
@@ -563,6 +693,26 @@ def validate_target_mode_smokes(module: Any, errors: list[str]) -> None:
                 errors.append(f"unsafe target smoke silently chmodded target {oct(mode)}")
 
 
+def validate_initial_target_parent_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-parent-smoke-") as tmp:
+        root = Path(tmp)
+        parent = root / "unsafe-parent"
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o777)
+        target = parent / "target"
+        try:
+            module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        except module.CursorSetupError as exc:
+            if "target parent" not in str(exc):
+                errors.append("initial target parent smoke failed with unexpected error")
+        else:
+            errors.append("initial target parent smoke accepted unsafe parent")
+        finally:
+            parent.chmod(0o700)
+        if target.exists() or target.is_symlink():
+            errors.append("initial target parent smoke created target after unsafe-parent failure")
+
+
 def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-launch-smoke-") as tmp:
         target = Path(tmp) / "target"
@@ -581,7 +731,7 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
         ) -> Any:
             del executable, forwarded
             seen_environment.update(environment)
-            lock = target.parent / f".{target.name}.nddev-cursor-cli-lock"
+            lock = module.control_root(target) / module.CONTROL_LOCK_NAME
             if not lock.is_dir() or lock.is_symlink():
                 errors.append("launch smoke did not hold target lock during child execution")
             try:
@@ -674,8 +824,11 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
     if module is None:
         return
     validate_artifact_source_smokes(module, errors)
-    validate_backup_symlink_smoke(module, errors)
+    validate_sibling_control_state_ignored_smoke(module, errors)
+    validate_insecure_internal_control_state_smoke(module, errors)
+    validate_backup_rotation_and_binding_smoke(module, errors)
     validate_target_mode_smokes(module, errors)
+    validate_initial_target_parent_smoke(module, errors)
     validate_launch_exception_restore_smoke(module, errors)
     validate_launch_swap_at_exec_smoke(module, errors)
 
@@ -759,15 +912,29 @@ def main() -> int:
             errors.append("build/manifest.json: hooks must not be installed")
         if projection.get("mcp_servers_installed") is not False:
             errors.append("build/manifest.json: MCP servers must not be installed")
+        backup = manifest.get("backup_policy", {})
+        if backup.get("control_root") != ".nddev-cursor-cli":
+            errors.append("build/manifest.json: backup control root mismatch")
+        if backup.get("location") != ".nddev-cursor-cli/backups":
+            errors.append("build/manifest.json: backup location mismatch")
         validate_launch_contract("build/manifest.json", manifest.get("runtime_launch", {}), errors)
         validate_software("build/manifest.json", manifest.get("software_install", {}), errors)
         transaction = manifest.get("transaction_policy", {})
         if transaction.get("new_target_mode") != "0700":
             errors.append("build/manifest.json: new target mode mismatch")
+        if (
+            transaction.get("initial_target_parent")
+            != "current-user non-writable-by-others or sticky"
+        ):
+            errors.append("build/manifest.json: initial target parent policy mismatch")
         if transaction.get("existing_target_required_owner") != "current-user":
             errors.append("build/manifest.json: existing target owner policy mismatch")
         if transaction.get("existing_target_required_mode") != "0700":
             errors.append("build/manifest.json: existing target mode policy mismatch")
+        if transaction.get("control_root") != ".nddev-cursor-cli":
+            errors.append("build/manifest.json: control root mismatch")
+        if transaction.get("lock") != ".nddev-cursor-cli/lock":
+            errors.append("build/manifest.json: lock path mismatch")
         if "preserve_existing_target_mode" in transaction:
             errors.append("build/manifest.json: must not preserve arbitrary target mode")
         commands = manifest.get("command_policy", {}).get("json_supported", [])
@@ -794,10 +961,18 @@ def main() -> int:
         safety = contract.get("safety", {})
         if safety.get("new_target_mode") != "0700":
             errors.append("config/nddev-contract.json: new target mode mismatch")
+        if safety.get("initial_target_parent") != "current-user non-writable-by-others or sticky":
+            errors.append("config/nddev-contract.json: initial target parent policy mismatch")
         if safety.get("existing_target_required_owner") != "current-user":
             errors.append("config/nddev-contract.json: existing target owner policy mismatch")
         if safety.get("existing_target_required_mode") != "0700":
             errors.append("config/nddev-contract.json: existing target mode policy mismatch")
+        if safety.get("control_root") != ".nddev-cursor-cli":
+            errors.append("config/nddev-contract.json: control root mismatch")
+        if safety.get("lock_path") != ".nddev-cursor-cli/lock":
+            errors.append("config/nddev-contract.json: lock path mismatch")
+        if safety.get("backup_path") != ".nddev-cursor-cli/backups":
+            errors.append("config/nddev-contract.json: backup path mismatch")
         if "preserve_existing_target_mode" in safety:
             errors.append("config/nddev-contract.json: must not preserve arbitrary target mode")
         validate_launch_contract("config/nddev-contract.json", contract.get("runtime_launch", {}), errors)

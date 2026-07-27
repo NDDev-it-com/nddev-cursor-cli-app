@@ -21,12 +21,21 @@ caller home, system prefix, npm global prefix, or pip environment.
   approval, sandbox, worktree, shell-integration, worker, or self-update
   lifecycle. Legacy setup stamps must be migrated or removed before launch.
 
-Existing targets used by mutating commands, restore, remove, migrate, or launch
-must already be current-user-owned real directories with mode `0700`. Read-only
-status surfaces report `target:owner` or `target:mode` drift; the manager does
-not silently chmod an existing target root. The sibling target lock is the
-cooperative same-user boundary for manager operations, while target-root `0700`
-is the cross-user boundary.
+Initial target creation is allowed only under a real parent directory that is
+current-user-owned and not writable by group/other, or sticky. Existing targets
+used by mutating commands, restore, remove, migrate, software install/update, or
+launch must already be current-user-owned real directories with mode `0700`.
+Read-only status surfaces report `target:owner` or `target:mode` drift; the
+manager does not silently chmod an existing target root.
+
+Lifecycle control state is target-internal under `.nddev-cursor-cli/`: active
+locks use `.nddev-cursor-cli/lock`, and backups use
+`.nddev-cursor-cli/backups/<slot>/NDDEV-CURSOR-CLI-BACKUP.json`. Those
+directories must be real, current-user-owned, and mode `0700`; backup envelopes
+must be regular current-user-owned `0600` files without hard-link aliases.
+Sibling `.nddev-*` lock or backup paths are ignored. The target-internal lock is
+the cooperative same-user boundary for manager operations, while target-root
+`0700` is the cross-user boundary.
 
 ## Source and integrity
 

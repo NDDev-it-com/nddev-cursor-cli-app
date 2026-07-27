@@ -34,6 +34,9 @@ CONFIG_NAME = "cli-config.json"
 STAMP_NAME = "NDDEV-CURSOR-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-CURSOR-CLI-BACKUP.json"
 SOFTWARE_STAMP_NAME = "NDDEV-CURSOR-CLI-SOFTWARE.json"
+CONTROL_ROOT_NAME = ".nddev-cursor-cli"
+CONTROL_LOCK_NAME = "lock"
+CONTROL_BACKUPS_NAME = "backups"
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 OWNER_EXEC_MODE = 0o700
@@ -573,26 +576,96 @@ def resolve_target(raw_target: str) -> Path:
 
 
 @contextlib.contextmanager
-def target_lock(target: Path) -> Iterator[None]:
-    lock = target.parent / f".{target.name}.nddev-cursor-cli-lock"
+def target_lock(
+    target: Path, *, cleanup_empty_target_on_error: bool = False
+) -> Iterator[None]:
+    root: Path | None = None
+    lock: Path | None = None
+    lock_created = False
+    failed = True
     try:
-        lock.mkdir(mode=OWNER_DIRECTORY_MODE)
-    except FileExistsError:
-        fail("target is already locked")
-    try:
+        require_owner_private_directory(target, "--target")
+        root = ensure_control_root(target)
+        lock = root / CONTROL_LOCK_NAME
+        try:
+            lock.mkdir(mode=OWNER_DIRECTORY_MODE)
+        except FileExistsError:
+            try:
+                info = lock.lstat()
+            except FileNotFoundError:
+                fail("target lock changed concurrently")
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail("target lock path is unsafe")
+            require_owner_private_directory(lock, "target lock")
+            fail("target is already locked")
+        lock_created = True
+        require_owner_private_directory(lock, "target lock")
         yield
+        failed = False
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            lock.rmdir()
+        if lock_created and lock is not None:
+            with contextlib.suppress(FileNotFoundError):
+                lock.rmdir()
+        with contextlib.suppress(OSError):
+            if root is not None:
+                root.rmdir()
+        if failed and cleanup_empty_target_on_error:
+            remove_empty_directory_if_created(target, existed_before=False)
 
 
-def ensure_target_directory(target: Path) -> None:
+def require_private_or_sticky_parent(parent: Path) -> os.stat_result:
+    try:
+        info = parent.lstat()
+    except FileNotFoundError:
+        fail("--target parent must already exist")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail("--target parent must be a real directory")
+    mode = stat.S_IMODE(info.st_mode)
+    uid = current_user_id()
+    current_user_owned = uid is None or info.st_uid == uid
+    owner_non_writable_by_others = current_user_owned and not (mode & 0o022)
+    sticky = bool(info.st_mode & stat.S_ISVTX)
+    if not owner_non_writable_by_others and not sticky:
+        fail("--target parent must be current-user non-writable-by-others or sticky")
+    return info
+
+
+def ensure_target_directory(target: Path, *, create_missing: bool) -> bool:
     if target.exists() or target.is_symlink():
         require_owner_private_directory(target, "--target")
-        return
-    target.mkdir(mode=OWNER_DIRECTORY_MODE)
+        return False
+    if not create_missing:
+        fail("--target is missing")
+    require_private_or_sticky_parent(target.parent)
+    try:
+        target.mkdir(mode=OWNER_DIRECTORY_MODE)
+    except FileExistsError:
+        fail("--target appeared concurrently")
+    except FileNotFoundError:
+        fail("--target parent disappeared")
     target.chmod(OWNER_DIRECTORY_MODE)
     require_owner_private_directory(target, "--target")
+    return True
+
+
+def prepare_lifecycle_target(target: Path, *, create_missing: bool) -> bool:
+    return ensure_target_directory(target, create_missing=create_missing)
+
+
+def control_root(target: Path) -> Path:
+    return target / CONTROL_ROOT_NAME
+
+
+def ensure_control_root(target: Path) -> Path:
+    root = control_root(target)
+    try:
+        root.mkdir(mode=OWNER_DIRECTORY_MODE)
+    except FileExistsError:
+        require_owner_private_directory(root, "control root")
+    else:
+        root.chmod(OWNER_DIRECTORY_MODE)
+        require_owner_private_directory(root, "control root")
+    return root
 
 
 def builder_projection_digest() -> str:
@@ -817,7 +890,7 @@ def require_clean_managed(target: Path) -> dict[str, Any]:
 
 
 def backup_pool(target: Path) -> Path:
-    return target.parent / f".{target.name}.nddev-cursor-cli-backups"
+    return control_root(target) / CONTROL_BACKUPS_NAME
 
 
 def current_user_id() -> int | None:
@@ -869,6 +942,7 @@ def path_exists_no_follow(path: Path) -> bool:
 
 
 def ensure_backup_pool(pool: Path) -> None:
+    require_owner_private_directory(pool.parent, "control root")
     try:
         pool.mkdir(mode=OWNER_DIRECTORY_MODE)
     except FileExistsError:
@@ -1187,46 +1261,51 @@ def mutate_setup(
     target: Path, content_setup_id: str, profile_id: str, command: str
 ) -> dict[str, Any]:
     render_selection(content_setup_id, profile_id)
-    with target_lock(target):
-        ensure_target_directory(target)
-        state = inspect_target(target)
-        if state["state"] == "unmanaged":
-            fail("unmanaged target contains Cursor CLI state; refusing to overwrite")
-        if state["state"] == "managed" and state.get("legacy"):
-            fail("legacy managed target must be migrated before install or switch")
-        if command == "switch" and state["state"] != "managed":
-            fail("switch requires an existing managed target")
-        if state["state"] == "managed" and state["drift"]:
-            fail(f"managed target has drift: {', '.join(state['drift'])}")
-        current_setup = state["content_setup_id"] if state["state"] == "managed" else None
-        current_profile = state["profile_id"] if state["state"] == "managed" else None
-        selected_current = current_setup == content_setup_id and current_profile == profile_id
-        if command == "switch" and selected_current:
-            fail("switch requires a different setup or profile")
-        existing_config = load_target_config(target) if state["state"] == "managed" else None
-        desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
-        before = capture_managed_files(target)
-        changed = [
-            relative for relative, content in desired.items() if before.get(relative) != content
-        ]
-        backup_slot: int | None = None
-        if state["state"] == "managed" and not selected_current:
-            backup_slot = write_backup(target, state)
-        try:
-            if changed:
-                replace_managed_state(target, desired, before)
-            final = inspect_target(target)
-            if (
-                final["state"] != "managed"
-                or final.get("legacy")
-                or final["content_setup_id"] != content_setup_id
-                or final["profile_id"] != profile_id
-                or final["drift"]
-            ):
-                fail("setup mutation postcondition failed")
-        except BaseException:
-            replace_managed_state(target, before, None)
-            raise
+    created_target = prepare_lifecycle_target(target, create_missing=command == "install")
+    try:
+        with target_lock(target):
+            state = inspect_target(target)
+            if state["state"] == "unmanaged":
+                fail("unmanaged target contains Cursor CLI state; refusing to overwrite")
+            if state["state"] == "managed" and state.get("legacy"):
+                fail("legacy managed target must be migrated before install or switch")
+            if command == "switch" and state["state"] != "managed":
+                fail("switch requires an existing managed target")
+            if state["state"] == "managed" and state["drift"]:
+                fail(f"managed target has drift: {', '.join(state['drift'])}")
+            current_setup = state["content_setup_id"] if state["state"] == "managed" else None
+            current_profile = state["profile_id"] if state["state"] == "managed" else None
+            selected_current = current_setup == content_setup_id and current_profile == profile_id
+            if command == "switch" and selected_current:
+                fail("switch requires a different setup or profile")
+            existing_config = load_target_config(target) if state["state"] == "managed" else None
+            desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
+            before = capture_managed_files(target)
+            changed = [
+                relative for relative, content in desired.items() if before.get(relative) != content
+            ]
+            backup_slot: int | None = None
+            if state["state"] == "managed" and not selected_current:
+                backup_slot = write_backup(target, state)
+            try:
+                if changed:
+                    replace_managed_state(target, desired, before)
+                final = inspect_target(target)
+                if (
+                    final["state"] != "managed"
+                    or final.get("legacy")
+                    or final["content_setup_id"] != content_setup_id
+                    or final["profile_id"] != profile_id
+                    or final["drift"]
+                ):
+                    fail("setup mutation postcondition failed")
+            except BaseException:
+                replace_managed_state(target, before, None)
+                raise
+    except BaseException:
+        if created_target:
+            remove_empty_directory_if_created(target, existed_before=False)
+        raise
     return {
         "schema_version": 2,
         "command": command,
@@ -1243,8 +1322,8 @@ def migrate_setup(
     target: Path, content_setup_id: str, requested_profile_id: str | None
 ) -> dict[str, Any]:
     render_content_setup(content_setup_id)
+    prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
-        ensure_target_directory(target)
         state = inspect_target(target)
         if state["state"] != "managed" or not state.get("legacy"):
             fail("migrate requires a legacy managed target")
@@ -1290,8 +1369,8 @@ def migrate_setup(
 
 
 def restore_slot(target: Path, slot: int) -> dict[str, Any]:
+    prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
-        ensure_target_directory(target)
         envelope = load_backup(target, slot)
         state = inspect_target(target)
         if state["state"] == "managed" and state["drift"] and not state.get("legacy"):
@@ -1321,8 +1400,8 @@ def restore_slot(target: Path, slot: int) -> dict[str, Any]:
 
 
 def remove_setup(target: Path) -> dict[str, Any]:
+    prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
-        require_owner_private_directory(target, "--target")
         state = inspect_target(target)
         if state["state"] != "managed":
             fail(f"target is not managed (state={state['state']})")
@@ -1991,8 +2070,8 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
         if not preflight["present"]:
             fail("update-cli requires existing target-owned Cursor CLI software presence")
     before_target_exists = target.exists() or target.is_symlink()
-    with target_lock(target):
-        ensure_target_directory(target)
+    created_target = prepare_lifecycle_target(target, create_missing=command == "install-cli")
+    with target_lock(target, cleanup_empty_target_on_error=created_target):
         status = software_status(target)
         if command == "install-cli" and status["present"]:
             fail(
@@ -2186,8 +2265,8 @@ def restore_managed_config_after_launch_locked(target: Path) -> None:
 
 
 def restore_managed_config_after_launch(target: Path) -> None:
+    prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
-        require_owner_private_directory(target, "--target")
         restore_managed_config_after_launch_locked(target)
 
 
@@ -2245,6 +2324,7 @@ def report_cleanup_failure_after_child_exception(
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
     forwarded = cursor_args[1:] if cursor_args[:1] == ["--"] else cursor_args
     reject_managed_launch_overrides(forwarded)
+    prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
         require_clean_managed(target)
         software = software_status(target)

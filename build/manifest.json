@@ -24,7 +24,8 @@
   "backup_policy": {
     "canonical_target_bound": true,
     "envelope": "NDDEV-CURSOR-CLI-BACKUP.json",
-    "location": "sibling .<target-name>.nddev-cursor-cli-backups",
+    "control_root": ".nddev-cursor-cli",
+    "location": ".nddev-cursor-cli/backups",
     "slots": 10
   },
   "legacy_policy": {
@@ -105,6 +106,7 @@
   "transaction_policy": {
     "managed_file_mode": "0600",
     "new_target_mode": "0700",
+    "initial_target_parent": "current-user non-writable-by-others or sticky",
     "existing_target_required_owner": "current-user",
     "existing_target_required_mode": "0700",
     "preserve_unmanaged_files": true,
@@ -112,6 +114,7 @@
     "reject_symlink_managed_files": true,
     "rollback_on_failure": true,
     "staging": "same-parent temporary directory",
-    "lock": "exclusive sibling directory"
+    "control_root": ".nddev-cursor-cli",
+    "lock": ".nddev-cursor-cli/lock"
   }
 }

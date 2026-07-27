@@ -146,8 +146,12 @@
     "max_backups": 10,
     "missing_target_argument_rejected": true,
     "new_target_mode": "0700",
+    "initial_target_parent": "current-user non-writable-by-others or sticky",
     "existing_target_required_owner": "current-user",
     "existing_target_required_mode": "0700",
+    "control_root": ".nddev-cursor-cli",
+    "lock_path": ".nddev-cursor-cli/lock",
+    "backup_path": ".nddev-cursor-cli/backups",
     "relative_target_rejected": true,
     "rollback_on_failure": true,
     "target_symlinks_rejected": true
