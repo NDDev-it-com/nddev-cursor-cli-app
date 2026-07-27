@@ -56,7 +56,9 @@
     "path_fallback": false,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
-    "target_environment_scope": "child-process-only"
+    "target_environment_scope": "child-process-only",
+    "target_lock_scope": "preflight-through-child-and-managed-config-restore",
+    "exec_handoff_revalidation": "bin/agent inode and digest immediately before subprocess"
   },
   "software_install": {
     "supported": true,
@@ -103,7 +105,8 @@
   "transaction_policy": {
     "managed_file_mode": "0600",
     "new_target_mode": "0700",
-    "preserve_existing_target_mode": true,
+    "existing_target_required_owner": "current-user",
+    "existing_target_required_mode": "0700",
     "preserve_unmanaged_files": true,
     "preserve_unmanaged_config_keys": true,
     "reject_symlink_managed_files": true,

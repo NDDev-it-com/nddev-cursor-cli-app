@@ -22,6 +22,11 @@ private configuration, or backup contents in an issue or pull request.
 - Backup envelopes and installed stamps are bound to the canonical target.
 - Mutations use a sibling lock, bounded backup rotation, postcondition checks,
   and rollback on failure.
+- Existing target roots used for mutation, restore, migrate, remove, software
+  install/update, or launch must be current-user-owned and mode `0700`.
+- Launch keeps the target lock through child execution and managed-config
+  restoration; the lock is the cooperative same-user boundary and target-root
+  `0700` is the cross-user boundary.
 - The builder capability is projected as a local native Cursor plugin with
   rules, skills, and agents. This manager does not provision Cursor team
   marketplace state.

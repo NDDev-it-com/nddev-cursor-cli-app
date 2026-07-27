@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -185,6 +186,13 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch must reject legacy setup stamps")
     if launch.get("managed_override_args_blocked") != BLOCKED_LAUNCH_OVERRIDES:
         errors.append(f"{owner}: runtime_launch managed override block list mismatch")
+    if launch.get("target_lock_scope") != "preflight-through-child-and-managed-config-restore":
+        errors.append(f"{owner}: runtime_launch target lock scope mismatch")
+    if (
+        launch.get("exec_handoff_revalidation")
+        != "bin/agent inode and digest immediately before subprocess"
+    ):
+        errors.append(f"{owner}: runtime_launch exec handoff revalidation mismatch")
 
 
 def validate_software(owner: str, software: dict, errors: list[str]) -> None:
@@ -483,10 +491,83 @@ def validate_backup_symlink_smoke(module: Any, errors: list[str]) -> None:
             errors.append("backup symlink smoke removed external marker")
 
 
+def install_smoke_current_software(module: Any, target: Path) -> None:
+    files = {
+        "cursor-agent": (b"cursor-agent smoke\n", module.OWNER_EXEC_MODE),
+        "node": (b"node smoke\n", module.OWNER_EXEC_MODE),
+        "index.js": (b"index smoke\n", module.OWNER_FILE_MODE),
+    }
+    module.ensure_real_directory_path(module.software_container(target), "smoke software container")
+    module.ensure_real_directory_path(module.software_root(target), "smoke software root")
+    module.ensure_real_directory_path(
+        module.software_root(target) / "versions", "smoke software versions"
+    )
+    module.ensure_real_directory_path(module.software_version_dir(target), "smoke runtime root")
+    module.write_cursor_runtime_tree(module.software_version_dir(target), files)
+    entrypoint = module.managed_agent_launcher_bytes(target)
+    module.atomic_write_executable(module.managed_agent_path(target), entrypoint)
+    asset_path, artifact_sha256, artifact_size = module.current_platform_asset()
+    runtime_sha256, runtime_size, runtime_file_count = module.runtime_tree_digest(files)
+    stamp = module.canonical_json(
+        module.software_stamp(
+            target,
+            asset_path=asset_path,
+            artifact_sha256=artifact_sha256,
+            artifact_size=artifact_size,
+            binary_sha256=module.sha256_bytes(files["cursor-agent"][0]),
+            entrypoint_sha256=module.sha256_bytes(entrypoint),
+            runtime_tree_sha256=runtime_sha256,
+            runtime_size=runtime_size,
+            runtime_file_count=runtime_file_count,
+            source_url=module.official_asset_url(asset_path),
+        )
+    )
+    module.atomic_write(module.software_stamp_path(target), stamp)
+
+
+def validate_target_mode_smokes(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-target-mode-smoke-") as tmp:
+        root = Path(tmp)
+        for mode in (0o755, 0o777):
+            target = root / f"target-{oct(mode)[2:]}"
+            target.mkdir(mode=0o700)
+            target.chmod(mode)
+            state = module.inspect_target(target)
+            if "target:mode" not in state["drift"]:
+                errors.append(f"status smoke did not report target:mode for {oct(mode)}")
+            software = module.software_status(target)
+            if "target:mode" not in software["drift"]:
+                errors.append(f"software-status smoke did not report target:mode for {oct(mode)}")
+            for label, action in (
+                (
+                    "install",
+                    lambda target=target: module.mutate_setup(
+                        target, "nddev-builder", "full-auto", "install"
+                    ),
+                ),
+                ("migrate", lambda target=target: module.migrate_setup(target, "nddev-builder", None)),
+                ("restore", lambda target=target: module.restore_slot(target, 0)),
+                ("remove", lambda target=target: module.remove_setup(target)),
+                ("launch", lambda target=target: module.launch_cursor(target, ["--", "--help"])),
+            ):
+                try:
+                    action()
+                except module.CursorSetupError as exc:
+                    if "mode 0700" not in str(exc):
+                        errors.append(
+                            f"{label} unsafe target smoke failed with unexpected error: {exc}"
+                        )
+                else:
+                    errors.append(f"{label} unsafe target smoke unexpectedly succeeded")
+            if stat.S_IMODE(target.lstat().st_mode) != mode:
+                errors.append(f"unsafe target smoke silently chmodded target {oct(mode)}")
+
+
 def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-launch-smoke-") as tmp:
         target = Path(tmp) / "target"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
         expected = module.managed_config_view(
             module.parse_json_object(
                 module.render_profile("full-auto")[1][module.CONFIG_NAME],
@@ -495,15 +576,21 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
         )
         seen_environment: dict[str, str] = {}
 
-        def fake_software_status(path: Path) -> dict[str, Any]:
-            del path
-            return {"installed": True, "current": True, "drift": []}
-
         def fake_run_cursor_child(
             executable: Path, forwarded: list[str], environment: dict[str, str]
         ) -> Any:
             del executable, forwarded
             seen_environment.update(environment)
+            lock = target.parent / f".{target.name}.nddev-cursor-cli-lock"
+            if not lock.is_dir() or lock.is_symlink():
+                errors.append("launch smoke did not hold target lock during child execution")
+            try:
+                module.mutate_setup(target, "nddev-builder", "safe", "switch")
+            except module.CursorSetupError as exc:
+                if "already locked" not in str(exc):
+                    errors.append("launch lock smoke failed with unexpected nested error")
+            else:
+                errors.append("launch lock smoke allowed nested manager mutation")
             config = module.load_target_config(target)
             assert config is not None
             config["approvalMode"] = "allowlist"
@@ -514,10 +601,7 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
         old_path = os.environ.get("PATH")
         os.environ["PATH"] = fake_path
         try:
-            with (
-                with_restored_attr(module, "software_status", fake_software_status),
-                with_restored_attr(module, "run_cursor_child", fake_run_cursor_child),
-            ):
+            with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
                 try:
                     module.launch_cursor(target, ["--", "-p", "noop"])
                 except OSError as exc:
@@ -540,13 +624,60 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
             errors.append("managed launcher must use /bin/bash")
 
 
+def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-launch-swap-smoke-") as tmp:
+        target = Path(tmp) / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        real_software_status = module.software_status
+        calls = 0
+        child_ran = False
+
+        def swapping_software_status(path: Path) -> dict[str, Any]:
+            nonlocal calls
+            result = real_software_status(path)
+            calls += 1
+            if calls == 1:
+                module.atomic_write_executable(
+                    module.managed_agent_path(target),
+                    b"#!/bin/bash\necho swapped\n",
+                )
+            return result
+
+        def fake_run_cursor_child(
+            executable: Path, forwarded: list[str], environment: dict[str, str]
+        ) -> Any:
+            nonlocal child_ran
+            del executable, forwarded, environment
+            child_ran = True
+            return type("Completed", (), {"returncode": 0})()
+
+        with (
+            with_restored_attr(module, "software_status", swapping_software_status),
+            with_restored_attr(module, "run_cursor_child", fake_run_cursor_child),
+        ):
+            try:
+                module.launch_cursor(target, ["--", "--help"])
+            except module.CursorSetupError as exc:
+                if "exec handoff" not in str(exc):
+                    errors.append(f"swap-at-exec smoke failed with unexpected error: {exc}")
+            else:
+                errors.append("swap-at-exec smoke unexpectedly allowed launch")
+        if calls < 2:
+            errors.append("swap-at-exec smoke did not recheck software status before exec")
+        if child_ran:
+            errors.append("swap-at-exec smoke executed the replaced agent")
+
+
 def validate_public_manager_smokes(errors: list[str]) -> None:
     module = load_manager(errors)
     if module is None:
         return
     validate_artifact_source_smokes(module, errors)
     validate_backup_symlink_smoke(module, errors)
+    validate_target_mode_smokes(module, errors)
     validate_launch_exception_restore_smoke(module, errors)
+    validate_launch_swap_at_exec_smoke(module, errors)
 
 
 def validate_no_forbidden_public_paths(errors: list[str]) -> None:
@@ -630,6 +761,15 @@ def main() -> int:
             errors.append("build/manifest.json: MCP servers must not be installed")
         validate_launch_contract("build/manifest.json", manifest.get("runtime_launch", {}), errors)
         validate_software("build/manifest.json", manifest.get("software_install", {}), errors)
+        transaction = manifest.get("transaction_policy", {})
+        if transaction.get("new_target_mode") != "0700":
+            errors.append("build/manifest.json: new target mode mismatch")
+        if transaction.get("existing_target_required_owner") != "current-user":
+            errors.append("build/manifest.json: existing target owner policy mismatch")
+        if transaction.get("existing_target_required_mode") != "0700":
+            errors.append("build/manifest.json: existing target mode policy mismatch")
+        if "preserve_existing_target_mode" in transaction:
+            errors.append("build/manifest.json: must not preserve arbitrary target mode")
         commands = manifest.get("command_policy", {}).get("json_supported", [])
         if "migrate" not in commands:
             errors.append("build/manifest.json: command_policy must include migrate")
@@ -651,6 +791,15 @@ def main() -> int:
             errors.append("config/nddev-contract.json: content_setup_ids mismatch")
         if setup_system.get("profile_ids") != PROFILE_IDS:
             errors.append("config/nddev-contract.json: profile_ids mismatch")
+        safety = contract.get("safety", {})
+        if safety.get("new_target_mode") != "0700":
+            errors.append("config/nddev-contract.json: new target mode mismatch")
+        if safety.get("existing_target_required_owner") != "current-user":
+            errors.append("config/nddev-contract.json: existing target owner policy mismatch")
+        if safety.get("existing_target_required_mode") != "0700":
+            errors.append("config/nddev-contract.json: existing target mode policy mismatch")
+        if "preserve_existing_target_mode" in safety:
+            errors.append("config/nddev-contract.json: must not preserve arbitrary target mode")
         validate_launch_contract("config/nddev-contract.json", contract.get("runtime_launch", {}), errors)
         software = contract.get("software_install")
         if not isinstance(software, dict):

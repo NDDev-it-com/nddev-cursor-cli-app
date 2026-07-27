@@ -61,7 +61,9 @@
     "path_fallback": false,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
-    "target_environment_scope": "child-process-only"
+    "target_environment_scope": "child-process-only",
+    "target_lock_scope": "preflight-through-child-and-managed-config-restore",
+    "exec_handoff_revalidation": "bin/agent inode and digest immediately before subprocess"
   },
   "software_install": {
     "supported": true,
@@ -144,7 +146,8 @@
     "max_backups": 10,
     "missing_target_argument_rejected": true,
     "new_target_mode": "0700",
-    "preserve_existing_target_mode": true,
+    "existing_target_required_owner": "current-user",
+    "existing_target_required_mode": "0700",
     "relative_target_rejected": true,
     "rollback_on_failure": true,
     "target_symlinks_rejected": true

@@ -587,13 +587,12 @@ def target_lock(target: Path) -> Iterator[None]:
 
 
 def ensure_target_directory(target: Path) -> None:
-    if target.exists():
-        info = target.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            fail("--target must be a real directory")
+    if target.exists() or target.is_symlink():
+        require_owner_private_directory(target, "--target")
         return
     target.mkdir(mode=OWNER_DIRECTORY_MODE)
     target.chmod(OWNER_DIRECTORY_MODE)
+    require_owner_private_directory(target, "--target")
 
 
 def builder_projection_digest() -> str:
@@ -759,6 +758,7 @@ def inspect_target(target: Path) -> dict[str, Any]:
         }
     if target.is_symlink() or not target.is_dir():
         fail("--target must be a real directory")
+    target_safety = target_safety_findings(target)
     stamp = load_stamp(target)
     config_exists = (target / CONFIG_NAME).exists() or (target / CONFIG_NAME).is_symlink()
     if stamp is None:
@@ -769,13 +769,13 @@ def inspect_target(target: Path) -> dict[str, Any]:
             "profile_id": None,
             "legacy_setup_id": None,
             "legacy": False,
-            "drift": [],
+            "drift": target_safety,
             "builder_projection": inspect_builder_projection(target)
             if target.exists()
             else "missing",
             "launchable": False,
         }
-    drift = drift_for_target(target, stamp)
+    drift = [*target_safety, *drift_for_target(target, stamp)]
     if stamp_is_legacy(stamp):
         builder_state = inspect_builder_projection(
             target,
@@ -805,6 +805,7 @@ def inspect_target(target: Path) -> dict[str, Any]:
 
 
 def require_clean_managed(target: Path) -> dict[str, Any]:
+    require_owner_private_directory(target, "--target")
     state = inspect_target(target)
     if state["state"] != "managed":
         fail(f"target is not managed (state={state['state']})")
@@ -824,6 +825,24 @@ def current_user_id() -> int | None:
     if getuid is None:
         return None
     return int(getuid())
+
+
+def target_safety_findings(target: Path) -> list[str]:
+    if not target.exists() and not target.is_symlink():
+        return []
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return []
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail("--target must be a real directory")
+    findings: list[str] = []
+    uid = current_user_id()
+    if uid is not None and info.st_uid != uid:
+        findings.append("target:owner")
+    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+        findings.append("target:mode")
+    return findings
 
 
 def require_owner_private_directory(path: Path, label: str) -> os.stat_result:
@@ -1143,7 +1162,11 @@ def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str
                     if before.get(relative) != content
                 ]
     elif state["state"] in {"missing", "empty"}:
-        changes = [CONFIG_NAME, STAMP_NAME, BUILDER_TARGET_ROOT.as_posix()]
+        changes = (
+            ["blocked-by-drift"]
+            if state["drift"]
+            else [CONFIG_NAME, STAMP_NAME, BUILDER_TARGET_ROOT.as_posix()]
+        )
     else:
         changes = ["blocked-by-unmanaged-target"]
     return {
@@ -1299,6 +1322,7 @@ def restore_slot(target: Path, slot: int) -> dict[str, Any]:
 
 def remove_setup(target: Path) -> dict[str, Any]:
     with target_lock(target):
+        require_owner_private_directory(target, "--target")
         state = inspect_target(target)
         if state["state"] != "managed":
             fail(f"target is not managed (state={state['state']})")
@@ -1834,7 +1858,7 @@ def software_status(target: Path) -> dict[str, Any]:
     binary = managed_agent_path(target)
     version_binary = software_tree_binary(target)
     installed = False
-    drift: list[str] = []
+    drift: list[str] = target_safety_findings(target)
     presence = software_presence(target)
     directory_mode_drift = False
     for directory, label in (
@@ -2134,32 +2158,70 @@ def reject_managed_launch_overrides(cursor_args: list[str]) -> None:
                     fail(f"launch refuses managed Cursor override option: -{flag} ({blocked})")
 
 
+def restore_managed_config_after_launch_locked(target: Path) -> None:
+    stamp = load_stamp(target)
+    if stamp is None:
+        fail("managed target stamp disappeared during Cursor launch")
+    if stamp_is_legacy(stamp):
+        fail("legacy managed target cannot be restored after launch")
+    profile_id = str(stamp["profile_id"])
+    _, _, rendered = render_selection(str(stamp["content_setup_id"]), profile_id)
+    setup_config = parse_json_object(
+        rendered[CONFIG_NAME], f"profile {profile_id}/{CONFIG_NAME}"
+    )
+    config_path = target / CONFIG_NAME
+    if config_path.exists() or config_path.is_symlink():
+        current = parse_json_object(
+            read_regular_file(
+                config_path,
+                f"target {CONFIG_NAME}",
+                max_bytes=METADATA_MAX_BYTES,
+            ),
+            f"target {CONFIG_NAME}",
+        )
+    else:
+        current = {}
+    desired = {CONFIG_NAME: canonical_json(merge_config(current, setup_config))}
+    replace_managed_state(target, desired, names=(CONFIG_NAME,))
+
+
 def restore_managed_config_after_launch(target: Path) -> None:
     with target_lock(target):
-        stamp = load_stamp(target)
-        if stamp is None:
-            fail("managed target stamp disappeared during Cursor launch")
-        if stamp_is_legacy(stamp):
-            fail("legacy managed target cannot be restored after launch")
-        profile_id = str(stamp["profile_id"])
-        _, _, rendered = render_selection(str(stamp["content_setup_id"]), profile_id)
-        setup_config = parse_json_object(
-            rendered[CONFIG_NAME], f"profile {profile_id}/{CONFIG_NAME}"
-        )
-        config_path = target / CONFIG_NAME
-        if config_path.exists() or config_path.is_symlink():
-            current = parse_json_object(
-                read_regular_file(
-                    config_path,
-                    f"target {CONFIG_NAME}",
-                    max_bytes=METADATA_MAX_BYTES,
-                ),
-                f"target {CONFIG_NAME}",
-            )
-        else:
-            current = {}
-        desired = {CONFIG_NAME: canonical_json(merge_config(current, setup_config))}
-        replace_managed_state(target, desired, names=(CONFIG_NAME,))
+        require_owner_private_directory(target, "--target")
+        restore_managed_config_after_launch_locked(target)
+
+
+def revalidate_launch_executable(target: Path) -> dict[str, Any]:
+    status = software_status(target)
+    if not status["installed"] or not status["current"]:
+        fail("launch requires current target-owned Cursor CLI software at exec handoff")
+    stamp = load_software_stamp(target)
+    if stamp is None:
+        fail("Cursor software stamp disappeared before exec handoff")
+    executable = managed_agent_path(target)
+    before = require_regular_file(
+        executable, f"Cursor launch executable {executable}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
+    )
+    if stat.S_IMODE(before.st_mode) != OWNER_EXEC_MODE:
+        fail("Cursor launch executable must have mode 0700")
+    content = read_regular_file(
+        executable,
+        f"Cursor launch executable {executable}",
+        max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+    )
+    after = require_regular_file(
+        executable, f"Cursor launch executable {executable}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
+    )
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        fail("Cursor launch executable changed before exec handoff")
+    digest = sha256_bytes(content)
+    if digest != stamp["entrypoint_sha256"]:
+        fail("Cursor launch executable digest changed before exec handoff")
+    return {
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "sha256": digest,
+    }
 
 
 def run_cursor_child(
@@ -2204,23 +2266,24 @@ def launch_cursor(target: Path, cursor_args: list[str]) -> int:
         for name in PROVIDER_SECRET_NAMES:
             environment.pop(name, None)
         executable = managed_agent_path(target)
-    child_error: BaseException | None = None
-    try:
-        completed = run_cursor_child(executable, forwarded, environment)
-    except BaseException as exc:
-        child_error = exc
-        raise
-    finally:
+        child_error: BaseException | None = None
         try:
-            restore_managed_config_after_launch(target)
-        except BaseException as cleanup_error:
-            if child_error is not None:
-                report_cleanup_failure_after_child_exception(child_error, cleanup_error)
-            else:
-                raise
-    if completed.returncode < 0:
-        return 128 + abs(completed.returncode)
-    return completed.returncode
+            revalidate_launch_executable(target)
+            completed = run_cursor_child(executable, forwarded, environment)
+        except BaseException as exc:
+            child_error = exc
+            raise
+        finally:
+            try:
+                restore_managed_config_after_launch_locked(target)
+            except BaseException as cleanup_error:
+                if child_error is not None:
+                    report_cleanup_failure_after_child_exception(child_error, cleanup_error)
+                else:
+                    raise
+        if completed.returncode < 0:
+            return 128 + abs(completed.returncode)
+        return completed.returncode
 
 
 def add_target(parser: argparse.ArgumentParser) -> None:

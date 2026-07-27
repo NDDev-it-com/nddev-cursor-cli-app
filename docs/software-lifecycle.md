@@ -21,6 +21,13 @@ caller home, system prefix, npm global prefix, or pip environment.
   approval, sandbox, worktree, shell-integration, worker, or self-update
   lifecycle. Legacy setup stamps must be migrated or removed before launch.
 
+Existing targets used by mutating commands, restore, remove, migrate, or launch
+must already be current-user-owned real directories with mode `0700`. Read-only
+status surfaces report `target:owner` or `target:mode` drift; the manager does
+not silently chmod an existing target root. The sibling target lock is the
+cooperative same-user boundary for manager operations, while target-root `0700`
+is the cross-user boundary.
+
 ## Source and integrity
 
 The current official release id is `2026.07.23-e383d2b`, as used by
@@ -47,11 +54,12 @@ falls back to a live or system Node.js binary and uses a fixed child `PATH` of
 `/usr/bin:/bin`.
 
 Cursor `--version` and `--help` can write target-local runtime/process state and
-can rewrite managed config defaults even when no login is attempted. After the
-child exits, manager `launch` reacquires the target lock, restores the selected
-setup's managed config keys while preserving unowned config keys, and treats
-only safe target-owned `.running` runtime state as ephemeral status-neutral
-state.
+can rewrite managed config defaults even when no login is attempted. Manager
+`launch` keeps the target lock from preflight through child execution and
+managed-config restoration, revalidates the exact `bin/agent` inode and digest
+immediately before the subprocess handoff, restores the selected setup's managed
+config keys while preserving unowned config keys, and treats only safe
+target-owned `.running` runtime state as ephemeral status-neutral state.
 
 ## Builder plugin projection
 

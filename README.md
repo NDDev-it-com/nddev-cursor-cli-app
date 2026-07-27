@@ -20,6 +20,12 @@ permission profiles. The default profile is `full-auto`; `safe` is available for
 sandboxed allowlisted work. Legacy managed targets can be inspected, migrated,
 restored, or removed, but they are not launchable.
 
+New targets are created owner-private (`0700`). Existing targets used for
+install, switch, migrate, restore, remove, software install/update, or launch
+must already be owned by the current user and mode `0700`; the manager reports
+`target:owner` or `target:mode` drift instead of silently changing existing root
+permissions.
+
 ## Software lifecycle
 
 The Cursor setup lifecycle and Cursor Agent runtime lifecycle are separate.
@@ -55,7 +61,9 @@ uses a fixed minimal child `PATH` of `/usr/bin:/bin`. The launcher uses
 `/bin/bash`, rejects Cursor flags or subcommands that would override the managed
 approval, sandbox, worktree, shell-integration, worker, or self-update
 lifecycle, and uses only the pinned target-owned runtime tree, including its
-bundled Node.js binary.
+bundled Node.js binary. The manager keeps the target lock through child
+execution and managed-config restoration, then revalidates the `bin/agent`
+inode and digest immediately before the subprocess handoff.
 
 The setup/profile model also projects `nddev-builder` as a local native Cursor plugin
 under `.nddev-cursor-home/.cursor/plugins/local/nddev-builder` inside the
