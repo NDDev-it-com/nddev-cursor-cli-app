@@ -38,6 +38,8 @@ blocked launch overrides, artifact pins, platform handling, and stamp schema.
 
 ## Install provenance
 
-Official release id, artifact URL template, sizes, and digests are owned by
-`references/cursor-cli-baseline.json` and checked by public validators. Do not
-copy them into new prose surfaces.
+Official release id, artifact URL template, sizes, and digests are
+machine-owned by the public manager and checked by public validators. Installed
+toolkit users should use `software-status --target <absolute-target> --json`
+for target-owned runtime state instead of copying volatile ledger values into
+prose surfaces.

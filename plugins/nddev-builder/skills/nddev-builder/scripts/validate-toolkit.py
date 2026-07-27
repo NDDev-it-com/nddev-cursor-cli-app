@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import stat
 import sys
 from pathlib import Path
@@ -33,6 +34,9 @@ REQUIRED_COMMANDS = {
 }
 REQUIRED_COMPONENT_DIRS = {".cursor-plugin", "agents", "commands", "rules", "skills"}
 DISALLOWED_PATH_PARTS = {"evidence", "memories", "private", "waiver", "waivers"}
+PROJECTED_REFERENCE_PATTERN = re.compile(
+    r"(?:^|[`\\s])((?:skills/nddev-builder/)?references/[A-Za-z0-9._/-]+)"
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -98,6 +102,24 @@ def validate_json(path: Path, errors: list[str]) -> dict:
     return value
 
 
+def validate_projected_reference_paths(plugin_root: Path, errors: list[str]) -> None:
+    skill_root = plugin_root / "skills" / "nddev-builder"
+    for path in plugin_root.rglob("*.md"):
+        text = read_text(path, errors)
+        if "references/cursor-cli-baseline.json" in text:
+            errors.append(f"{path}: must not route to non-projected baseline JSON")
+        for match in PROJECTED_REFERENCE_PATTERN.finditer(text):
+            reference = match.group(1).rstrip(".,);:")
+            if reference == "references/":
+                candidate = skill_root / "references"
+            elif reference.startswith("references/"):
+                candidate = skill_root / reference
+            else:
+                candidate = plugin_root / reference
+            if not candidate.exists() or candidate.is_symlink():
+                errors.append(f"{path}: unresolved projected reference path: {reference}")
+
+
 def validate_tree(module_root: Path, errors: list[str]) -> None:
     plugin_root = module_root / "plugins" / "nddev-builder"
     skill_root = plugin_root / "skills" / "nddev-builder"
@@ -149,6 +171,7 @@ def validate_tree(module_root: Path, errors: list[str]) -> None:
     ):
         if forbidden.exists() or forbidden.is_symlink():
             errors.append(f"unsupported public profile/setup path exists: {forbidden}")
+    validate_projected_reference_paths(plugin_root, errors)
 
 
 def main(argv: list[str] | None = None) -> int:
