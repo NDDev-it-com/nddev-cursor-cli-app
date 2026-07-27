@@ -1,6 +1,6 @@
 # Cursor Agent software lifecycle
 
-`nddev-cursor-cli-app` can manage the Cursor Agent executable inside the same
+`nddev-cursor-cli-app` can manage the Cursor Agent runtime inside the same
 explicit target used for Cursor CLI configuration. It does not install into the
 caller home, system prefix, npm global prefix, or pip environment.
 
@@ -31,12 +31,16 @@ are pinned in `references/cursor-cli-baseline.json`.
 
 ## Archive safety and rollback
 
-The archive reader never extracts an artifact wholesale. It reads exactly one
-regular `cursor-agent` member from the tar stream and rejects absolute paths,
+The archive reader never extracts an artifact wholesale. It streams only the
+official `dist-package/` runtime tree, requires `cursor-agent`, `node`, and
+`index.js`, normalizes target-owned file modes, and rejects absolute paths,
 parent traversal, Windows-drive paths, NUL paths, symlink, hardlink, device,
-duplicate, and oversize candidates.
+duplicate, group/world-writable, special-mode, and oversize members.
 
 Updates stage a complete version tree under
 `.nddev-software/cursor-cli/versions/2026.07.23-e383d2b/` and then atomically
 rename it into place. On failure, the manager restores the previous version
-tree, `bin/agent`, and `NDDEV-CURSOR-CLI-SOFTWARE.json`.
+tree, `bin/agent`, and `NDDEV-CURSOR-CLI-SOFTWARE.json`. The installed
+`bin/agent` is a target-owned launcher that executes the pinned target-owned
+runtime tree, including its bundled `node`; launch never falls back to a live or
+system Node.js binary.

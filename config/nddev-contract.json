@@ -63,7 +63,7 @@
     "update_current_behavior": "idempotent no-op without downloading",
     "stage_and_atomic_swap": true,
     "rollback_on_failure": true,
-    "artifact_reader": "bounded single-member extraction; rejects traversal, symlink, hardlink, device, duplicate, and oversize candidates",
+    "artifact_reader": "bounded dist-package runtime-tree extraction; requires cursor-agent, node, and index.js; rejects traversal, symlink, hardlink, device, duplicate, unsafe mode, and oversize members",
     "npm": null,
     "pip": null
   },

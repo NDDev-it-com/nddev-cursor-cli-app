@@ -16,9 +16,10 @@ python3 cli-tools/nddev_cursor_cli.py remove --target /absolute/cursor-config
 
 ## Software lifecycle
 
-The Cursor setup lifecycle and Cursor Agent binary lifecycle are separate.
+The Cursor setup lifecycle and Cursor Agent runtime lifecycle are separate.
 `software-status`, `install-cli`, and `update-cli` manage a target-owned copy
-of the current Cursor Agent binary from the official Cursor artifact URL:
+of the current Cursor Agent runtime package from the official Cursor artifact
+URL:
 
 ```bash
 python3 cli-tools/nddev_cursor_cli.py software-status --target /absolute/cursor-config --json
@@ -44,7 +45,9 @@ python3 cli-tools/nddev_cursor_cli.py launch --target /absolute/cursor-config --
 `launch` requires a clean managed setup plus current target-owned software,
 executes only the absolute target `bin/agent`, never falls back to `PATH`, and
 rejects Cursor flags or subcommands that would override the managed approval,
-sandbox, worktree, shell-integration, worker, or self-update lifecycle.
+sandbox, worktree, shell-integration, worker, or self-update lifecycle. The
+managed `bin/agent` launcher uses only the pinned target-owned runtime tree,
+including its bundled Node.js binary.
 
 The setup variants also project `nddev-builder` as a local native Cursor plugin
 under the selected target. The projection uses Cursor's plugin, rules, skills,

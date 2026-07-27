@@ -41,6 +41,11 @@ MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
 SOFTWARE_ARTIFACT_MAX_BYTES = 300 * 1024 * 1024
 CURSOR_VERSION = "2026.07.23-e383d2b"
 CURSOR_RELEASE_BASE_URL = f"https://downloads.cursor.com/lab/{CURSOR_VERSION}"
+CURSOR_RUNTIME_ROOT = Path("dist-package")
+CURSOR_RUNTIME_ENTRYPOINT = Path("cursor-agent")
+CURSOR_RUNTIME_REQUIRED_FILES = frozenset(
+    {CURSOR_RUNTIME_ENTRYPOINT, Path("node"), Path("index.js")}
+)
 CURSOR_OFFICIAL_ASSETS = {
     ("darwin", "arm64"): (
         "darwin/arm64/agent-cli-package.tar.gz",
@@ -975,36 +980,120 @@ def read_artifact(source: str) -> bytes:
     return content
 
 
-def extract_cursor_agent(archive: bytes) -> bytes:
-    candidates: list[bytes] = []
+def normalize_runtime_path(path: Path) -> Path | None:
+    if path == CURSOR_RUNTIME_ROOT:
+        return None
+    if not path.parts or path.parts[0] != CURSOR_RUNTIME_ROOT.as_posix():
+        fail("Cursor artifact contains a member outside dist-package")
+    relative = Path(*path.parts[1:])
+    if not relative.parts:
+        return None
+    return relative
+
+
+def runtime_file_mode(member_mode: int) -> int:
+    if member_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+        fail("Cursor artifact contains a runtime member with special mode bits")
+    if member_mode & 0o022:
+        fail("Cursor artifact contains a group/world-writable runtime member")
+    return OWNER_EXEC_MODE if member_mode & 0o111 else OWNER_FILE_MODE
+
+
+def runtime_tree_digest(files: dict[str, tuple[bytes, int]]) -> tuple[str, int, int]:
+    digest = hashlib.sha256()
+    total_size = 0
+    for name in sorted(files):
+        content, mode = files[name]
+        total_size += len(content)
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(oct(mode).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(len(content)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(sha256_bytes(content).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest(), total_size, len(files)
+
+
+def extract_cursor_runtime(archive: bytes) -> dict[str, Any]:
+    files: dict[str, tuple[bytes, int]] = {}
+    total_size = 0
     with tarfile.open(fileobj=BytesIO(archive), mode="r:gz") as tar:
         for member in tar:
             path = validate_archive_path(member.name)
-            is_candidate = path.name == "cursor-agent"
             if member.issym() or member.islnk() or member.isdev() or member.isdir():
-                if is_candidate:
-                    fail("Cursor artifact CLI candidate must be a regular tar file")
+                if member.issym() or member.islnk() or member.isdev():
+                    fail("Cursor artifact runtime must not contain links or device files")
+                normalize_runtime_path(path)
                 continue
             if not member.isfile():
-                if is_candidate:
-                    fail("Cursor artifact CLI candidate must be a regular tar file")
-                continue
+                fail("Cursor artifact runtime member must be a regular tar file")
+            relative = normalize_runtime_path(path)
+            if relative is None:
+                fail("Cursor artifact runtime file path is empty")
+            relative_name = relative.as_posix()
+            if relative_name in files:
+                fail("Cursor artifact contains duplicate runtime file paths")
             if member.size > SOFTWARE_ARTIFACT_MAX_BYTES:
-                fail("Cursor artifact CLI binary exceeds the decompressed size limit")
-            if not is_candidate:
-                continue
+                fail("Cursor artifact runtime file exceeds the decompressed size limit")
+            mode = runtime_file_mode(member.mode)
             handle = tar.extractfile(member)
             if handle is None:
-                fail("Cursor artifact CLI binary could not be read")
+                fail("Cursor artifact runtime file could not be read")
             content = handle.read(SOFTWARE_ARTIFACT_MAX_BYTES + 1)
             if len(content) > SOFTWARE_ARTIFACT_MAX_BYTES or len(content) != member.size:
-                fail("Cursor artifact CLI binary size changed while reading")
-            candidates.append(content)
-            if len(candidates) > 1:
-                fail("Cursor artifact contains duplicate CLI binary candidates")
-    if len(candidates) != 1:
-        fail("Cursor artifact must contain exactly one cursor-agent binary")
-    return candidates[0]
+                fail("Cursor artifact runtime file size changed while reading")
+            total_size += len(content)
+            if total_size > SOFTWARE_ARTIFACT_MAX_BYTES:
+                fail("Cursor artifact runtime tree exceeds the decompressed size limit")
+            files[relative_name] = (content, mode)
+    missing = sorted(path.as_posix() for path in CURSOR_RUNTIME_REQUIRED_FILES - {Path(name) for name in files})
+    if missing:
+        fail(f"Cursor artifact runtime tree is missing required files: {missing}")
+    runtime_sha256, runtime_size, runtime_file_count = runtime_tree_digest(files)
+    entrypoint = files[CURSOR_RUNTIME_ENTRYPOINT.as_posix()][0]
+    return {
+        "files": files,
+        "binary": entrypoint,
+        "binary_sha256": sha256_bytes(entrypoint),
+        "runtime_tree_sha256": runtime_sha256,
+        "runtime_size": runtime_size,
+        "runtime_file_count": runtime_file_count,
+    }
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def managed_agent_launcher_bytes(target: Path) -> bytes:
+    version_dir = software_version_dir(target).resolve(strict=False)
+    script_dir = shell_quote(str(version_dir))
+    return (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "export CURSOR_INVOKED_AS=\"${0##*/}\"\n"
+        f"SCRIPT_DIR={script_dir}\n"
+        "NODE_BIN=\"$SCRIPT_DIR/node\"\n"
+        "if [ -z \"${NODE_COMPILE_CACHE:-}\" ]; then\n"
+        "  if [[ \"${OSTYPE:-}\" == darwin* ]]; then\n"
+        "    export NODE_COMPILE_CACHE=\"$HOME/Library/Caches/cursor-compile-cache\"\n"
+        "  else\n"
+        "    export NODE_COMPILE_CACHE=\"${XDG_CACHE_HOME:-$HOME/.cache}/cursor-compile-cache\"\n"
+        "  fi\n"
+        "fi\n"
+        "should_skip_system_ca() {\n"
+        "  case \"${AGENT_CLI_CREDENTIAL_STORE:-}\" in\n"
+        "    file) return 0 ;;\n"
+        "  esac\n"
+        "  return 1\n"
+        "}\n"
+        "if ! should_skip_system_ca && \"$NODE_BIN\" --use-system-ca --version >/dev/null 2>&1; then\n"
+        "  exec -a \"$0\" \"$NODE_BIN\" --use-system-ca \"$SCRIPT_DIR/index.js\" \"$@\"\n"
+        "fi\n"
+        "exec -a \"$0\" \"$NODE_BIN\" \"$SCRIPT_DIR/index.js\" \"$@\"\n"
+    ).encode("utf-8")
 
 
 def atomic_write_with_mode(path: Path, content: bytes, mode: int) -> None:
@@ -1042,6 +1131,35 @@ def ensure_real_directory_path(path: Path, label: str) -> None:
     path.chmod(OWNER_DIRECTORY_MODE)
 
 
+def ensure_private_directory_chain(root: Path, relative_parent: Path) -> None:
+    current = root
+    if relative_parent == Path("."):
+        return
+    for part in relative_parent.parts:
+        current = current / part
+        if current.exists() or current.is_symlink():
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail(f"Cursor runtime directory path is unsafe: {current}")
+            if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+                fail(f"Cursor runtime directory must have mode 0700: {current}")
+            continue
+        current.mkdir(mode=OWNER_DIRECTORY_MODE)
+        current.chmod(OWNER_DIRECTORY_MODE)
+
+
+def write_cursor_runtime_tree(root: Path, files: dict[str, tuple[bytes, int]]) -> None:
+    for relative_name in sorted(files):
+        relative = Path(relative_name)
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            fail(f"Cursor runtime path is unsafe: {relative_name}")
+        content, mode = files[relative_name]
+        if mode not in {OWNER_FILE_MODE, OWNER_EXEC_MODE}:
+            fail("Cursor runtime file mode must be normalized to 0600 or 0700")
+        ensure_private_directory_chain(root, relative.parent)
+        atomic_write_with_mode(root / relative, content, mode)
+
+
 def software_directory_mode_drift(path: Path, label: str) -> str | None:
     if not path.exists() and not path.is_symlink():
         return None
@@ -1060,6 +1178,10 @@ def software_stamp(
     artifact_sha256: str,
     artifact_size: int,
     binary_sha256: str,
+    entrypoint_sha256: str,
+    runtime_tree_sha256: str,
+    runtime_size: int,
+    runtime_file_count: int,
     source_url: str,
 ) -> dict[str, Any]:
     return {
@@ -1074,6 +1196,10 @@ def software_stamp(
         "artifact_sha256": artifact_sha256,
         "artifact_size": artifact_size,
         "binary_sha256": binary_sha256,
+        "entrypoint_sha256": entrypoint_sha256,
+        "runtime_tree_sha256": runtime_tree_sha256,
+        "runtime_size": runtime_size,
+        "runtime_file_count": runtime_file_count,
         "installed_at": int(time.time()),
     }
 
@@ -1103,6 +1229,10 @@ def load_software_stamp(
             "artifact_sha256",
             "artifact_size",
             "binary_sha256",
+            "entrypoint_sha256",
+            "runtime_tree_sha256",
+            "runtime_size",
+            "runtime_file_count",
             "installed_at",
         }
         require_exact_keys(stamp, required, "Cursor software stamp")
@@ -1113,11 +1243,15 @@ def load_software_stamp(
             or stamp["command"] != CURSOR_COMMAND
         ):
             fail("Cursor software stamp identity is invalid")
-        for key in ("artifact_sha256", "binary_sha256"):
+        for key in ("artifact_sha256", "binary_sha256", "entrypoint_sha256", "runtime_tree_sha256"):
             if not isinstance(stamp[key], str) or not re.fullmatch(r"[0-9a-f]{64}", stamp[key]):
                 fail(f"Cursor software stamp {key} must be a lowercase SHA-256 digest")
         if not isinstance(stamp["artifact_size"], int) or stamp["artifact_size"] <= 0:
             fail("Cursor software stamp artifact_size must be a positive integer")
+        if not isinstance(stamp["runtime_size"], int) or stamp["runtime_size"] <= 0:
+            fail("Cursor software stamp runtime_size must be a positive integer")
+        if not isinstance(stamp["runtime_file_count"], int) or stamp["runtime_file_count"] <= 0:
+            fail("Cursor software stamp runtime_file_count must be a positive integer")
         if not isinstance(stamp["installed_at"], int):
             fail("Cursor software stamp installed_at must be an integer")
     except CursorSetupError:
@@ -1139,6 +1273,55 @@ def snapshot_optional_software_file(path: Path, label: str) -> tuple[bytes | Non
     content = read_regular_file(path, label, max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES)
     info = require_regular_file(path, label, max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES)
     return content, stat.S_IMODE(info.st_mode)
+
+
+def runtime_tree_identity_from_disk(root: Path) -> dict[str, Any] | None:
+    if not root.exists() and not root.is_symlink():
+        return None
+    info = root.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail("Cursor runtime tree must be a real directory")
+    files: dict[str, tuple[bytes, int]] = {}
+    mode_drift = stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        entry_info = path.lstat()
+        if stat.S_ISLNK(entry_info.st_mode):
+            fail(f"Cursor runtime tree must not contain symlinks: {relative.as_posix()}")
+        if stat.S_ISDIR(entry_info.st_mode):
+            if stat.S_IMODE(entry_info.st_mode) != OWNER_DIRECTORY_MODE:
+                mode_drift = True
+            continue
+        if not stat.S_ISREG(entry_info.st_mode):
+            fail(f"Cursor runtime tree must contain only regular files: {relative.as_posix()}")
+        if entry_info.st_nlink != 1:
+            fail(f"Cursor runtime file must not have hard-link aliases: {relative.as_posix()}")
+        mode = stat.S_IMODE(entry_info.st_mode)
+        if mode not in {OWNER_FILE_MODE, OWNER_EXEC_MODE}:
+            mode_drift = True
+        content = read_regular_file(
+            path,
+            f"Cursor runtime file {relative.as_posix()}",
+            max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+        )
+        files[relative.as_posix()] = (content, mode)
+    missing = sorted(path.as_posix() for path in CURSOR_RUNTIME_REQUIRED_FILES - {Path(name) for name in files})
+    if missing:
+        return {
+            "sha256": None,
+            "size": None,
+            "file_count": len(files),
+            "mode_drift": mode_drift,
+            "missing": missing,
+        }
+    digest, size, file_count = runtime_tree_digest(files)
+    return {
+        "sha256": digest,
+        "size": size,
+        "file_count": file_count,
+        "mode_drift": mode_drift,
+        "missing": [],
+    }
 
 
 def software_file_mode_is(path: Path, mode: int) -> bool:
@@ -1210,15 +1393,24 @@ def software_status(target: Path) -> dict[str, Any]:
         if presence:
             drift.append("software-stamp")
     else:
-        binary_content = read_optional_software_file(binary, f"Cursor managed binary {binary}")
+        binary_content = read_optional_software_file(binary, f"Cursor managed launcher {binary}")
         version_content = read_optional_software_file(
             version_binary, f"Cursor managed version binary {version_binary}"
         )
+        runtime_identity = runtime_tree_identity_from_disk(software_version_dir(target))
         binary_digest_ok = (
-            binary_content is not None and sha256_bytes(binary_content) == stamp["binary_sha256"]
+            binary_content is not None
+            and sha256_bytes(binary_content) == stamp["entrypoint_sha256"]
         )
         version_digest_ok = (
             version_content is not None and sha256_bytes(version_content) == stamp["binary_sha256"]
+        )
+        runtime_digest_ok = (
+            runtime_identity is not None
+            and runtime_identity["sha256"] == stamp["runtime_tree_sha256"]
+            and runtime_identity["size"] == stamp["runtime_size"]
+            and runtime_identity["file_count"] == stamp["runtime_file_count"]
+            and not runtime_identity["missing"]
         )
         binary_mode_ok = binary_content is not None and software_file_mode_is(
             binary, OWNER_EXEC_MODE
@@ -1234,9 +1426,14 @@ def software_status(target: Path) -> dict[str, Any]:
             drift.append(".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/cursor-agent")
         elif not version_mode_ok:
             drift.append(".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/cursor-agent:mode")
+        if not runtime_digest_ok:
+            drift.append(".nddev-software/cursor-cli/versions/2026.07.23-e383d2b:runtime")
+        elif runtime_identity is not None and runtime_identity["mode_drift"]:
+            drift.append(".nddev-software/cursor-cli/versions/2026.07.23-e383d2b:mode")
         installed = (
             binary_digest_ok
             and version_digest_ok
+            and runtime_digest_ok
             and binary_mode_ok
             and version_mode_ok
             and not directory_mode_drift
@@ -1276,13 +1473,12 @@ def prepare_cursor_artifact() -> dict[str, Any]:
     if os.environ.get(INTERNAL_ARTIFACT_ENV) is None:
         if artifact_sha != expected_sha or len(archive) != expected_size:
             fail("official Cursor artifact digest or size mismatch")
-    binary = extract_cursor_agent(archive)
+    runtime = extract_cursor_runtime(archive)
     return {
         "asset_path": asset_path,
         "artifact_sha256": artifact_sha,
         "artifact_size": len(archive),
-        "binary": binary,
-        "binary_sha256": sha256_bytes(binary),
+        **runtime,
         "source_url": source_url,
     }
 
@@ -1333,6 +1529,7 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
         before_stamp, before_stamp_mode = snapshot_optional_software_file(
             stamp_path, f"Cursor software stamp {stamp_path}"
         )
+        entrypoint = managed_agent_launcher_bytes(target)
         stamp_bytes = canonical_json(
             software_stamp(
                 target,
@@ -1340,12 +1537,16 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
                 artifact_sha256=artifact["artifact_sha256"],
                 artifact_size=artifact["artifact_size"],
                 binary_sha256=artifact["binary_sha256"],
+                entrypoint_sha256=sha256_bytes(entrypoint),
+                runtime_tree_sha256=artifact["runtime_tree_sha256"],
+                runtime_size=artifact["runtime_size"],
+                runtime_file_count=artifact["runtime_file_count"],
                 source_url=artifact["source_url"],
             )
         )
         changed = [
             "bin/agent",
-            ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/cursor-agent",
+            ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
         ]
         if before_stamp != stamp_bytes:
             changed.append(f".nddev-software/cursor-cli/{SOFTWARE_STAMP_NAME}")
@@ -1363,15 +1564,17 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
                 if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
                     fail("Cursor software version directory must have mode 0700")
             staging = Path(tempfile.mkdtemp(prefix=".stage-", dir=str(versions)))
+            staging.chmod(OWNER_DIRECTORY_MODE)
             rollback_parent = Path(tempfile.mkdtemp(prefix=".rollback-", dir=str(versions)))
+            rollback_parent.chmod(OWNER_DIRECTORY_MODE)
             rollback = rollback_parent / CURSOR_VERSION
-            atomic_write_executable(staging / "cursor-agent", artifact["binary"])
+            write_cursor_runtime_tree(staging, artifact["files"])
             if before_version_exists:
                 version_dir.rename(rollback)
             staging.rename(version_dir)
             if os.environ.get(INTERNAL_FAIL_AFTER_VERSION_SWAP_ENV) == "1":
                 fail("injected failure after Cursor version swap")
-            atomic_write_executable(binary_path, artifact["binary"])
+            atomic_write_executable(binary_path, entrypoint)
             if os.environ.get(INTERNAL_FAIL_AFTER_BINARY_SWAP_ENV) == "1":
                 fail("injected failure after Cursor binary swap")
             atomic_write(stamp_path, stamp_bytes)
@@ -1442,6 +1645,10 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
             "asset_path": artifact["asset_path"],
             "artifact_sha256": artifact["artifact_sha256"],
             "binary_sha256": artifact["binary_sha256"],
+            "entrypoint_sha256": sha256_bytes(entrypoint),
+            "runtime_tree_sha256": artifact["runtime_tree_sha256"],
+            "runtime_file_count": artifact["runtime_file_count"],
+            "runtime_size": artifact["runtime_size"],
             "managed_command": str(binary_path.resolve(strict=False)),
         }
 

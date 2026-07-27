@@ -57,7 +57,7 @@
     "update_current_behavior": "idempotent no-op without downloading",
     "stage_and_atomic_swap": true,
     "managed_command": "bin/agent",
-    "layout": ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/",
+    "layout": ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/ full dist-package runtime tree plus bin/agent launcher",
     "npm": null,
     "pip": null
   },
