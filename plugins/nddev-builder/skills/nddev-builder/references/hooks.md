@@ -23,9 +23,10 @@ adding event-specific input or output handling.
 
 ## Public module boundary
 
-This module's 0.2.0 builder plugin does not install or activate hooks. Hook work
-must remain a deterministic plan, checker, or design artifact unless a later
-setup explicitly owns:
+The current managed builder projection does not install or activate hooks; the
+machine-readable projection contract is owned by `config/nddev-contract.json`
+and `build/manifest.json`. Hook work must remain a deterministic plan, checker,
+or design artifact unless a later setup explicitly owns:
 
 - the hook JSON path
 - the handler script path

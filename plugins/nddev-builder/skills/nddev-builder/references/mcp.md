@@ -19,9 +19,11 @@ future lifecycle rather than committing secret values or shell-expanded tokens.
 
 ## Public module boundary
 
-This module's 0.2.0 builder plugin does not install MCP servers, approve MCPs,
-or start MCP processes. MCP work must remain a deterministic plan, checker, or
-design artifact unless a later setup explicitly owns:
+The current managed builder projection does not install MCP servers, approve
+MCPs, or start MCP processes; the machine-readable projection contract is owned
+by `config/nddev-contract.json` and `build/manifest.json`. MCP work must remain
+a deterministic plan, checker, or design artifact unless a later setup
+explicitly owns:
 
 - `mcp.json` location
 - server transport and command provenance

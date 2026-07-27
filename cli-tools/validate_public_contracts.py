@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BUILD_VERSION = "0.2.0"
 CURSOR_RELEASE_ID = "2026.07.23-e383d2b"
 CONTENT_SETUP_IDS = ["nddev-builder"]
 PROFILE_IDS = ["full-auto", "safe"]
@@ -145,6 +144,18 @@ def load_json(relative: str, errors: list[str]) -> dict | None:
     return value
 
 
+def load_build_version(errors: list[str]) -> str:
+    path = ROOT / "VERSION"
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        errors.append(f"VERSION: unreadable: {exc}")
+        return ""
+    if not value:
+        errors.append("VERSION: must not be empty")
+    return value
+
+
 def real_dirs(root: Path) -> list[str]:
     if not root.is_dir() or root.is_symlink():
         return []
@@ -240,15 +251,22 @@ def validate_profiles(errors: list[str]) -> None:
                 errors.append(f"profiles/{profile_id}/cli-config.json: unsupported approvalMode")
 
 
-def validate_builder_toolkit(version: dict | None, errors: list[str]) -> None:
+def validate_builder_toolkit(
+    version: dict | None, build_version: str, errors: list[str]
+) -> None:
     plugin = load_json("plugins/nddev-builder/.cursor-plugin/plugin.json", errors)
     if plugin is not None:
         if plugin.get("name") != "nddev-builder":
             errors.append("plugins/nddev-builder: plugin name must be nddev-builder")
+        if plugin.get("version") != build_version:
+            errors.append("plugins/nddev-builder: version disagrees with VERSION")
         if version is not None and plugin.get("version") != version.get(
             "nddev_builder_plugin_version"
         ):
-            errors.append("plugins/nddev-builder: version disagrees with build/version.json")
+            errors.append(
+                "plugins/nddev-builder: version disagrees with "
+                "build/version.json:nddev_builder_plugin_version"
+            )
         for key in ("rules", "skills", "agents", "commands"):
             if key not in plugin:
                 errors.append(f"plugins/nddev-builder: missing component key {key}")
@@ -358,21 +376,21 @@ def validate_no_forbidden_public_paths(errors: list[str]) -> None:
 
 def main() -> int:
     errors: list[str] = []
+    build_version = load_build_version(errors)
     version = load_json("build/version.json", errors)
     manifest = load_json("build/manifest.json", errors)
     contract = load_json("config/nddev-contract.json", errors)
     baseline = load_json("references/cursor-cli-baseline.json", errors)
     docs = ROOT / "docs" / "software-lifecycle.md"
 
-    version_text = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version is not None:
         missing = REQUIRED_VERSION_KEYS - set(version)
         if missing:
             errors.append(f"build/version.json: missing required keys {sorted(missing)}")
         if version.get("schema_version") != 3:
             errors.append("build/version.json: schema_version must be 3")
-        if version.get("build_version") != BUILD_VERSION or version_text != BUILD_VERSION:
-            errors.append("VERSION and build/version.json:build_version must be 0.2.0")
+        if version.get("build_version") != build_version:
+            errors.append("build/version.json:build_version must match VERSION")
         if version.get("cursor_cli_identity") != "agent":
             errors.append("build/version.json: cursor_cli_identity must be agent")
         if version.get("cursor_cli_tested") != CURSOR_RELEASE_ID:
@@ -381,12 +399,16 @@ def main() -> int:
             errors.append("build/version.json: cursor_config_schema must be 1")
         if version.get("setup_contract_schema") != 2:
             errors.append("build/version.json: setup_contract_schema must be 2")
-        if version.get("nddev_builder_plugin_version") != BUILD_VERSION:
-            errors.append("build/version.json: builder plugin version mismatch")
+        if version.get("nddev_builder_plugin_version") != build_version:
+            errors.append(
+                "build/version.json: nddev_builder_plugin_version must match VERSION"
+            )
 
     if manifest is not None and version is not None:
         if manifest.get("schema_version") != 3:
             errors.append("build/manifest.json: schema_version must be 3")
+        if manifest.get("build_version") != build_version:
+            errors.append("build/manifest.json:build_version must match VERSION")
         if manifest.get("build_version") != version.get("build_version"):
             errors.append("build/manifest.json:build_version disagrees with build/version.json")
         if manifest.get("content_setup_ids") != CONTENT_SETUP_IDS:
@@ -394,7 +416,7 @@ def main() -> int:
         if manifest.get("profile_ids") != PROFILE_IDS:
             errors.append("build/manifest.json: unexpected profile_ids")
         if "setup_ids" in manifest:
-            errors.append("build/manifest.json: setup_ids must not be used by 0.2.0")
+            errors.append("build/manifest.json: setup_ids must not be used by current contract")
         projection = manifest.get("builder_projection", {})
         if projection.get("target_plugin_path") != BUILDER_TARGET_PATH:
             errors.append("build/manifest.json: builder target path mismatch")
@@ -501,7 +523,7 @@ def main() -> int:
                 errors.append(f"docs/software-lifecycle.md: missing {needle}")
 
     validate_profiles(errors)
-    validate_builder_toolkit(version, errors)
+    validate_builder_toolkit(version, build_version, errors)
     validate_no_forbidden_public_paths(errors)
 
     if errors:
