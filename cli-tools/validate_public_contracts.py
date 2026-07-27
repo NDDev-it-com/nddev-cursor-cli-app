@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -11,6 +12,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -230,6 +233,13 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
     if launch.get("target_lock_scope") != "preflight-through-child-and-managed-config-restore":
         errors.append(f"{owner}: runtime_launch target lock scope mismatch")
     if (
+        launch.get("bootstrap_lock_scope")
+        != "external product-and-canonical-target flock before target creation or inspection through full operation and child cleanup"
+    ):
+        errors.append(f"{owner}: runtime_launch bootstrap lock scope mismatch")
+    if launch.get("bootstrap_lock_exposed_to_child") is not False:
+        errors.append(f"{owner}: runtime_launch bootstrap lock must not be exposed to child")
+    if (
         launch.get("lock_mechanism")
         != "persistent 0600 file opened with O_NOFOLLOW and held by nonblocking fcntl.flock"
     ):
@@ -238,7 +248,7 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch lock parent mode mismatch")
     if (
         launch.get("protected_directory_scope")
-        != "dedicated lock parent and ephemeral verified launch image only; target root, isolated HOME, TMPDIR, config/session paths, and installed runtime tree remain writable"
+        != "dedicated lock parent and ephemeral verified launch image only; control root, backup pool, target root, isolated HOME, TMPDIR, config/session paths, and installed runtime tree remain writable"
     ):
         errors.append(f"{owner}: runtime_launch protected directory scope mismatch")
     if launch.get("launch_image") != ".nddev-software/cursor-cli/launch-images/<ephemeral>":
@@ -492,38 +502,334 @@ def with_restored_attr(module: Any, name: str, value: Any):
     return RestoreAttr()
 
 
-def run_concurrent_switch(target: Path, profile: str = "safe") -> subprocess.CompletedProcess[str]:
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    return subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "cli-tools" / "nddev_cursor_cli.py"),
-            "switch",
-            "--setup",
-            "nddev-builder",
-            "--profile",
-            profile,
-            "--target",
-            str(target),
-            "--json",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
+def real_bootstrap_artifact_snapshot(module: Any, errors: list[str]) -> tuple[tuple, ...]:
+    try:
+        system_root = module.bootstrap_lock_system_root()
+    except Exception as exc:  # noqa: BLE001 - validator must report safe public errors.
+        errors.append(f"cannot resolve production bootstrap system root: {exc}")
+        return tuple()
+    product_root = system_root / f"{module.BOOTSTRAP_LOCK_ROOT_PREFIX}-{os.getuid()}"
+    try:
+        root_info = product_root.lstat()
+    except FileNotFoundError:
+        return tuple()
+    except OSError as exc:
+        errors.append(f"cannot inspect production bootstrap root: {exc}")
+        return tuple()
+    records: list[tuple] = [
+        (
+            "root",
+            product_root.name,
+            root_info.st_dev,
+            root_info.st_ino,
+            root_info.st_uid,
+            stat.S_IMODE(root_info.st_mode),
+            root_info.st_size,
+        )
+    ]
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        return tuple(records)
+    try:
+        children = sorted(product_root.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        errors.append(f"cannot list production bootstrap root: {exc}")
+        return tuple(records)
+    for child in children:
+        try:
+            child_info = child.lstat()
+        except OSError as exc:
+            records.append(("unreadable", child.name, str(exc)))
+            continue
+        records.append(
+            (
+                "entry",
+                child.name,
+                child_info.st_dev,
+                child_info.st_ino,
+                child_info.st_uid,
+                stat.S_IMODE(child_info.st_mode),
+                child_info.st_size,
+            )
+        )
+    return tuple(records)
+
+
+def run_manager_smoke(name: str, action: Any, errors: list[str]) -> None:
+    try:
+        action()
+    except Exception as exc:  # noqa: BLE001 - public validator reports instead of traceback.
+        errors.append(f"{name} smoke raised unexpectedly: {exc}")
+
+
+def run_forked_action(action: Any) -> subprocess.CompletedProcess[str]:
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            action()
+        except BaseException as exc:  # noqa: BLE001 - serialize public smoke failure.
+            payload = {"returncode": 1, "stdout": "", "stderr": str(exc)}
+        else:
+            payload = {"returncode": 0, "stdout": "ok", "stderr": ""}
+        os.write(write_fd, (json.dumps(payload) + "\n").encode("utf-8"))
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(read_fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(read_fd)
+    _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+        return subprocess.CompletedProcess(
+            args=["forked-action"],
+            returncode=int(payload["returncode"]),
+            stdout=str(payload["stdout"]),
+            stderr=str(payload["stderr"]),
+        )
+    return subprocess.CompletedProcess(
+        args=["forked-action"],
+        returncode=1,
+        stdout="",
+        stderr=f"forked action exited abnormally: {status}",
     )
 
 
-def assert_concurrent_switch_denied(target: Path, errors: list[str], label: str) -> None:
-    result = run_concurrent_switch(target)
+def start_deferred_forked_action(
+    action: Any, ready: Path, trigger: Path, result: Path, error: Path
+) -> int:
+    pid = os.fork()
+    if pid == 0:
+        try:
+            ready.write_text("ready\n", encoding="utf-8")
+            deadline = time.time() + 10
+            while not trigger.exists():
+                if time.time() > deadline:
+                    raise TimeoutError("deferred action trigger timeout")
+                time.sleep(0.02)
+            try:
+                action()
+            except BaseException as exc:  # noqa: BLE001 - serialize public smoke failure.
+                payload = {"returncode": 1, "stdout": "", "stderr": str(exc)}
+            else:
+                payload = {"returncode": 0, "stdout": "ok", "stderr": ""}
+            result.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        except BaseException as exc:  # noqa: BLE001 - serialize public smoke failure.
+            error.write_text(str(exc), encoding="utf-8")
+            os._exit(1)
+        os._exit(0)
+    return pid
+
+
+def wait_for_process_ready(
+    pid: int, ready: Path, error: Path, errors: list[str], label: str
+) -> bool:
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if ready.exists():
+            return True
+        exited, status = os.waitpid(pid, os.WNOHANG)
+        if exited:
+            message = error.read_text(encoding="utf-8") if error.exists() else str(status)
+            errors.append(f"{label} exited before ready: {message}")
+            return False
+        time.sleep(0.02)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    errors.append(f"{label} did not become ready")
+    return False
+
+
+def trigger_deferred_action(
+    pid: int, trigger: Path, result: Path, error: Path, errors: list[str], label: str
+) -> subprocess.CompletedProcess[str]:
+    trigger.write_text("go\n", encoding="utf-8")
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        exited, status = os.waitpid(pid, os.WNOHANG)
+        if not exited:
+            time.sleep(0.02)
+            continue
+        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+            try:
+                payload = json.loads(result.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                return subprocess.CompletedProcess(
+                    args=[label],
+                    returncode=1,
+                    stdout="",
+                    stderr=f"deferred action result unreadable: {exc}",
+                )
+            return subprocess.CompletedProcess(
+                args=[label],
+                returncode=int(payload["returncode"]),
+                stdout=str(payload["stdout"]),
+                stderr=str(payload["stderr"]),
+            )
+        message = error.read_text(encoding="utf-8") if error.exists() else str(status)
+        return subprocess.CompletedProcess(
+            args=[label],
+            returncode=1,
+            stdout="",
+            stderr=f"deferred action exited abnormally: {message}",
+        )
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    errors.append(f"{label} did not finish after trigger")
+    return subprocess.CompletedProcess(args=[label], returncode=1, stdout="", stderr="timeout")
+
+
+def prepare_deferred_action(
+    action: Any, root: Path, name: str, errors: list[str]
+) -> tuple[int, Path, Path, Path]:
+    ready = root / f"{name}.ready"
+    trigger = root / f"{name}.trigger"
+    result = root / f"{name}.json"
+    error = root / f"{name}.error"
+    pid = start_deferred_forked_action(action, ready, trigger, result, error)
+    if not wait_for_process_ready(pid, ready, error, errors, name):
+        pid = 0
+    return pid, trigger, result, error
+
+
+def assert_deferred_action_denied(
+    deferred: tuple[int, Path, Path, Path],
+    errors: list[str],
+    label: str,
+    command: str,
+) -> None:
+    pid, trigger, result, error = deferred
+    if pid <= 0:
+        return
+    completed = trigger_deferred_action(pid, trigger, result, error, errors, label)
+    output = f"{completed.stdout}\n{completed.stderr}"
+    if completed.returncode == 0:
+        errors.append(f"{label} allowed concurrent lifecycle {command}")
+    elif "already locked" not in output:
+        errors.append(f"{label} concurrent {command} failed with unexpected output: {output}")
+
+
+def run_concurrent_switch(
+    module: Any, target: Path, profile: str = "safe"
+) -> subprocess.CompletedProcess[str]:
+    return run_forked_action(
+        lambda: module.mutate_setup(target, "nddev-builder", profile, "switch")
+    )
+
+
+def run_concurrent_install(
+    module: Any, target: Path, profile: str = "safe"
+) -> subprocess.CompletedProcess[str]:
+    return run_forked_action(
+        lambda: module.mutate_setup(target, "nddev-builder", profile, "install")
+    )
+
+
+def run_concurrent_remove(module: Any, target: Path) -> subprocess.CompletedProcess[str]:
+    return run_forked_action(lambda: module.remove_setup(target))
+
+
+def run_concurrent_status(module: Any, target: Path) -> subprocess.CompletedProcess[str]:
+    return run_forked_action(lambda: module.inspect_target(target))
+
+
+def assert_concurrent_switch_denied(
+    module: Any, target: Path, errors: list[str], label: str
+) -> None:
+    result = run_concurrent_switch(module, target)
     output = f"{result.stdout}\n{result.stderr}"
     if result.returncode == 0:
         errors.append(f"{label} allowed concurrent lifecycle switch")
     elif "already locked" not in output:
         errors.append(f"{label} concurrent switch failed with unexpected output: {output}")
+
+
+def assert_concurrent_command_denied(
+    action: Any, errors: list[str], label: str, command: str
+) -> None:
+    result = action()
+    output = f"{result.stdout}\n{result.stderr}"
+    if result.returncode == 0:
+        errors.append(f"{label} allowed concurrent lifecycle {command}")
+    elif "already locked" not in output:
+        errors.append(f"{label} concurrent {command} failed with unexpected output: {output}")
+
+
+def wait_for_holder_ready(
+    pid: int, ready: Path, error: Path, errors: list[str], label: str
+) -> bool:
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if ready.exists():
+            return True
+        exited, status = os.waitpid(pid, os.WNOHANG)
+        if exited:
+            message = error.read_text(encoding="utf-8") if error.exists() else str(status)
+            errors.append(f"{label} holder exited early: {message}")
+            return False
+        time.sleep(0.02)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    errors.append(f"{label} holder did not become ready")
+    return False
+
+
+def wait_for_holder_exit(
+    pid: int, error: Path, errors: list[str], label: str
+) -> bool:
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        exited, status = os.waitpid(pid, os.WNOHANG)
+        if not exited:
+            time.sleep(0.02)
+            continue
+        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+            return True
+        message = error.read_text(encoding="utf-8") if error.exists() else str(status)
+        errors.append(f"{label} failed: {message}")
+        return False
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    errors.append(f"{label} did not exit after release")
+    return False
+
+
+def start_bootstrap_lock_holder(
+    module: Any, target: Path, ready: Path, release: Path, result: Path, error: Path
+) -> int:
+    pid = os.fork()
+    if pid == 0:
+        try:
+            with module.bootstrap_lifecycle_lock(target):
+                path, canonical, digest = module.bootstrap_lock_path(target)
+                info = path.lstat()
+                result.write_text(
+                    json.dumps(
+                        {
+                            "path": str(path),
+                            "canonical": canonical,
+                            "digest": digest,
+                            "device": info.st_dev,
+                            "inode": info.st_ino,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                ready.write_text("ready\n", encoding="utf-8")
+                while not release.exists():
+                    time.sleep(0.02)
+        except BaseException as exc:  # noqa: BLE001 - serialize public smoke failure.
+            error.write_text(str(exc), encoding="utf-8")
+            os._exit(1)
+        os._exit(0)
+    return pid
 
 
 def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
@@ -541,6 +847,29 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
     for needle in ("fcntl.flock", "fcntl.LOCK_EX | fcntl.LOCK_NB", "O_NOFOLLOW"):
         if needle not in manager_source:
             errors.append(f"nddev_cursor_cli.py must keep verified lock fd evidence: {needle}")
+    for needle in (
+        "bootstrap_lifecycle_lock",
+        "BOOTSTRAP_LOCK_ROOT_PREFIX",
+        "CONTROL_LOCKS_NAME",
+        "control_lock_root",
+        "open_control_lock_root_fd",
+        "set_owner_directory_fd_mode",
+        "validate_or_write_bootstrap_binding",
+        "read_valid_bootstrap_binding",
+        "require_lock_file_matches_fd(path, descriptor, \"bootstrap lock\")",
+        "require_directory_matches_fd",
+        "threading.get_ident()",
+        "PRODUCT_NAME.encode(\"utf-8\") + b\"\\0\" + canonical.encode(\"utf-8\")",
+        "Path(\"/tmp\").resolve(strict=True)",
+        "stat.S_ISVTX",
+        "f\"{PRODUCT_NAME}-{digest}.lock\"",
+    ):
+        if needle not in manager_source:
+            errors.append(f"nddev_cursor_cli.py must keep bootstrap lock evidence: {needle}")
+    if re.search(r"bootstrap.*unlink|unlink.*bootstrap", manager_source, re.IGNORECASE):
+        errors.append("nddev_cursor_cli.py must not unlink bootstrap lock files")
+    if re.search(r"os\.environ[^\n]*BOOTSTRAP|BOOTSTRAP[^\n]*os\.environ", manager_source):
+        errors.append("nddev_cursor_cli.py must not expose a bootstrap lock env override")
 
     artifact = b"official artifact bytes"
     asset_path = "linux/x64/agent-cli-package.tar.gz"
@@ -638,7 +967,9 @@ def validate_insecure_internal_control_state_smoke(module: Any, errors: list[str
         external = root / "external-root"
         external.mkdir(mode=0o700)
         control = module.control_root(target)
-        (control / module.CONTROL_LOCK_NAME).unlink()
+        lock_root = module.control_lock_root(target)
+        module.target_lock_path(target).unlink()
+        lock_root.rmdir()
         control.rmdir()
         os.symlink(external, module.control_root(target))
         try:
@@ -649,11 +980,28 @@ def validate_insecure_internal_control_state_smoke(module: Any, errors: list[str
         else:
             errors.append("internal control root symlink was accepted")
 
+        target = root / "lock-root-symlink"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        lock_root = module.control_lock_root(target)
+        module.target_lock_path(target).unlink()
+        lock_root.rmdir()
+        os.symlink(external, lock_root)
+        state = module.inspect_target(target)
+        if ".nddev-cursor-cli/locks:unsafe" not in state["drift"] or state["launchable"]:
+            errors.append("internal lock directory symlink did not block launchable status")
+        try:
+            module.mutate_setup(target, "nddev-builder", "safe", "switch")
+        except module.CursorSetupError as exc:
+            if "target lock directory" not in str(exc):
+                errors.append("internal lock directory symlink failed with unexpected error")
+        else:
+            errors.append("internal lock directory symlink was accepted")
+
         target = root / "lock-symlink"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
-        control = module.ensure_control_root(target)
-        (control / module.CONTROL_LOCK_NAME).unlink()
-        os.symlink(external, control / module.CONTROL_LOCK_NAME)
+        lock = module.target_lock_path(target)
+        lock.unlink()
+        os.symlink(external, lock)
         try:
             module.mutate_setup(target, "nddev-builder", "safe", "switch")
         except module.CursorSetupError as exc:
@@ -661,6 +1009,21 @@ def validate_insecure_internal_control_state_smoke(module: Any, errors: list[str
                 errors.append("internal lock symlink failed with unexpected error")
         else:
             errors.append("internal lock symlink was accepted")
+
+        target = root / "lock-root-mode"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        lock_root = module.control_lock_root(target)
+        lock_root.chmod(0o755)
+        state = module.inspect_target(target)
+        if ".nddev-cursor-cli/locks:mode" not in state["drift"] or state["launchable"]:
+            errors.append("internal lock directory mode did not block launchable status")
+        try:
+            module.mutate_setup(target, "nddev-builder", "safe", "switch")
+        except module.CursorSetupError as exc:
+            if "target lock directory must have mode 0500 or 0700" not in str(exc):
+                errors.append("internal lock directory mode failed with unexpected error")
+        else:
+            errors.append("internal lock directory mode was accepted")
 
         target = root / "backup-symlink"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
@@ -818,7 +1181,7 @@ def validate_target_mode_smokes(module: Any, errors: list[str]) -> None:
                 ("migrate", lambda target=target: module.migrate_setup(target, "nddev-builder", None)),
                 ("restore", lambda target=target: module.restore_slot(target, 0)),
                 ("remove", lambda target=target: module.remove_setup(target)),
-                ("launch", lambda target=target: module.launch_cursor(target, ["--", "--help"])),
+                ("launch", lambda target=target: module.launch_cursor(target, ["--help"])),
             ):
                 try:
                     action()
@@ -865,6 +1228,12 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
             )
         )
         seen_environment: dict[str, str] = {}
+        deferred_switch = prepare_deferred_action(
+            lambda: module.mutate_setup(target, "nddev-builder", "safe", "switch"),
+            Path(tmp),
+            "launch-lock-switch",
+            errors,
+        )
 
         def fake_run_cursor_child(
             executable: Path, forwarded: list[str], environment: dict[str, str]
@@ -872,7 +1241,8 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
             del executable, forwarded
             seen_environment.update(environment)
             control = module.control_root(target)
-            lock = module.control_root(target) / module.CONTROL_LOCK_NAME
+            lock_root = module.control_lock_root(target)
+            lock = module.target_lock_path(target)
             if not lock.is_file() or lock.is_symlink():
                 errors.append("launch smoke did not expose a persistent lock file")
             else:
@@ -880,9 +1250,14 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
                 if mode != module.OWNER_FILE_MODE:
                     errors.append(f"launch smoke lock file mode mismatch: {oct(mode)}")
             control_mode = stat.S_IMODE(control.lstat().st_mode)
-            if control_mode != module.LOCK_HELD_DIRECTORY_MODE:
-                errors.append(f"launch smoke control root was writable: {oct(control_mode)}")
-            assert_concurrent_switch_denied(target, errors, "launch lock smoke")
+            if control_mode != module.OWNER_DIRECTORY_MODE:
+                errors.append(f"launch smoke control root mode drifted: {oct(control_mode)}")
+            lock_root_mode = stat.S_IMODE(lock_root.lstat().st_mode)
+            if lock_root_mode != module.LOCK_HELD_DIRECTORY_MODE:
+                errors.append(f"launch smoke lock directory was writable: {oct(lock_root_mode)}")
+            assert_deferred_action_denied(
+                deferred_switch, errors, "launch lock smoke", "switch"
+            )
             config = module.load_target_config(target)
             assert config is not None
             config["approvalMode"] = "allowlist"
@@ -895,7 +1270,7 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
         try:
             with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
                 try:
-                    module.launch_cursor(target, ["--", "-p", "noop"])
+                    module.launch_cursor(target, ["-p", "noop"])
                 except OSError as exc:
                     if "simulated child failure" not in str(exc):
                         errors.append("launch smoke raised unexpected OSError")
@@ -945,7 +1320,7 @@ def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
             with_restored_attr(module, "run_cursor_child", fake_run_cursor_child),
         ):
             try:
-                module.launch_cursor(target, ["--", "--help"])
+                module.launch_cursor(target, ["--help"])
             except module.CursorSetupError as exc:
                 if "exec handoff" not in str(exc):
                     errors.append(f"swap-at-exec smoke failed with unexpected error: {exc}")
@@ -989,6 +1364,12 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
             "image": None,
         }
         seen_image_root: Path | None = None
+        deferred_switch = prepare_deferred_action(
+            lambda: module.mutate_setup(target, "nddev-builder", "safe", "switch"),
+            root,
+            "launch-protection-switch",
+            errors,
+        )
 
         def fake_run_cursor_child(
             executable: Path, forwarded: list[str], environment: dict[str, str]
@@ -996,16 +1377,20 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
             nonlocal seen_image_root
             del forwarded
             control = module.control_root(target)
-            lock = control / module.CONTROL_LOCK_NAME
+            lock_root = module.control_lock_root(target)
+            lock = module.target_lock_path(target)
             seen_image_root = executable.parent
             if not lock.is_file() or lock.is_symlink():
                 errors.append("launch protection smoke did not expose lock as regular file")
-            if stat.S_IMODE(control.lstat().st_mode) != module.LOCK_HELD_DIRECTORY_MODE:
-                errors.append("launch protection smoke did not protect control root")
+            if stat.S_IMODE(control.lstat().st_mode) != module.OWNER_DIRECTORY_MODE:
+                errors.append("launch protection smoke changed control root mode")
+            if stat.S_IMODE(lock_root.lstat().st_mode) != module.LOCK_HELD_DIRECTORY_MODE:
+                errors.append("launch protection smoke did not protect lock directory")
             if stat.S_IMODE(executable.parent.lstat().st_mode) != module.LOCK_HELD_DIRECTORY_MODE:
                 errors.append("launch protection smoke did not protect launch image")
             for path, label in (
                 (target, "target root"),
+                (control, "control root"),
                 (Path(environment["CURSOR_CONFIG_DIR"]), "CURSOR_CONFIG_DIR"),
                 (Path(environment["HOME"]), "isolated HOME"),
                 (Path(environment["TMPDIR"]), "TMPDIR"),
@@ -1050,14 +1435,16 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
             if replacement.exists():
                 replacement.unlink()
 
-            assert_concurrent_switch_denied(target, errors, "launch protection smoke")
+            assert_deferred_action_denied(
+                deferred_switch, errors, "launch protection smoke", "switch"
+            )
             return type("Completed", (), {"returncode": 0})()
 
         old_tmp = os.environ.get("TMPDIR")
         os.environ["TMPDIR"] = str(ambient_tmp)
         try:
             with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
-                result = module.launch_cursor(target, ["--", "-p", "noop"])
+                result = module.launch_cursor(target, ["-p", "noop"])
         finally:
             if old_tmp is None:
                 os.environ.pop("TMPDIR", None)
@@ -1067,6 +1454,11 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
             errors.append(f"launch protection smoke returned {result}")
         if stat.S_IMODE(module.control_root(target).lstat().st_mode) != module.OWNER_DIRECTORY_MODE:
             errors.append("launch protection smoke did not restore control root mode")
+        if (
+            stat.S_IMODE(module.control_lock_root(target).lstat().st_mode)
+            != module.OWNER_DIRECTORY_MODE
+        ):
+            errors.append("launch protection smoke did not restore lock directory mode")
         if seen_image_root is None:
             errors.append("launch protection smoke never observed a launch image")
         elif seen_image_root.exists() or seen_image_root.is_symlink():
@@ -1081,6 +1473,243 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
         status = module.software_status(target)
         if not status["current"]:
             errors.append(f"launch protection smoke left software drift: {status['drift']}")
+
+
+def validate_external_bootstrap_lock_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-lock-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        moved = target / ".renamed-nddev-cursor-cli"
+        deferred_switch = prepare_deferred_action(
+            lambda: module.mutate_setup(target, "nddev-builder", "safe", "switch"),
+            root,
+            "bootstrap-switch",
+            errors,
+        )
+        deferred_remove = prepare_deferred_action(
+            lambda: module.remove_setup(target),
+            root,
+            "bootstrap-remove",
+            errors,
+        )
+        deferred_install = prepare_deferred_action(
+            lambda: module.mutate_setup(target, "nddev-builder", "safe", "install"),
+            root,
+            "bootstrap-install",
+            errors,
+        )
+
+        def fake_run_cursor_child(
+            executable: Path, forwarded: list[str], environment: dict[str, str]
+        ) -> Any:
+            del executable, forwarded
+            if any(module.BOOTSTRAP_LOCK_ROOT_PREFIX in value for value in environment.values()):
+                errors.append("bootstrap lock path leaked into child environment")
+            control = module.control_root(target)
+            control.rename(moved)
+            try:
+                assert_deferred_action_denied(
+                    deferred_switch, errors, "external bootstrap lock smoke", "switch"
+                )
+                assert_deferred_action_denied(
+                    deferred_remove, errors, "external bootstrap lock smoke", "remove"
+                )
+                assert_deferred_action_denied(
+                    deferred_install, errors, "external bootstrap lock smoke", "install"
+                )
+            finally:
+                moved.rename(control)
+            return type("Completed", (), {"returncode": 0})()
+
+        with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
+            result = module.launch_cursor(target, ["-p", "noop"])
+        if result != 0:
+            errors.append(f"external bootstrap lock smoke returned {result}")
+        control = module.control_root(target)
+        if moved.exists():
+            errors.append("external bootstrap lock smoke left renamed control root")
+        if not control.exists():
+            errors.append("external bootstrap lock smoke lost the control root")
+        state = module.inspect_target(target)
+        if state["drift"]:
+            errors.append(f"external bootstrap lock smoke left setup drift: {state['drift']}")
+
+
+def validate_launch_separator_argv_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-launch-argv-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        parsed = module.parse_args(
+            [
+                "launch",
+                "--target",
+                str(target),
+                "--",
+                "--",
+                "-p",
+                "literal",
+            ]
+        )
+        if list(parsed.cursor_args) != ["--", "--", "-p", "literal"]:
+            errors.append(f"launch argv smoke parsed unexpected args: {parsed.cursor_args}")
+        seen: list[str] = []
+
+        def fake_run_cursor_child(
+            executable: Path, forwarded: list[str], environment: dict[str, str]
+        ) -> Any:
+            del executable, environment
+            seen.extend(forwarded)
+            return type("Completed", (), {"returncode": 0})()
+
+        with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
+            result = module.run(parsed)
+        if result != 0:
+            errors.append(f"launch argv smoke returned {result}")
+        if seen != ["--", "-p", "literal"]:
+            errors.append(f"launch argv smoke forwarded unexpected args: {seen}")
+
+
+def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-handover-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+
+        def read_result(path: Path) -> dict[str, Any]:
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        ready_a = root / "ready-a"
+        release_a = root / "release-a"
+        result_a = root / "result-a.json"
+        error_a = root / "error-a.txt"
+        holder_a = start_bootstrap_lock_holder(
+            module, target, ready_a, release_a, result_a, error_a
+        )
+        if not wait_for_holder_ready(
+            holder_a, ready_a, error_a, errors, "bootstrap handover A"
+        ):
+            return
+        first = read_result(result_a)
+        lock_path = Path(first["path"])
+        system_tmp = module.bootstrap_lock_system_root()
+        try:
+            lock_path.relative_to(system_tmp)
+        except ValueError:
+            errors.append(f"bootstrap handover lock path is outside system temp: {lock_path}")
+        with contextlib.suppress(ValueError):
+            lock_path.relative_to(target)
+            errors.append("bootstrap handover lock path is inside target")
+        with contextlib.suppress(ValueError):
+            lock_path.relative_to(target.parent)
+            errors.append("bootstrap handover lock path is inside target parent")
+        if not lock_path.name.startswith(f"{module.PRODUCT_NAME}-"):
+            errors.append("bootstrap handover lock filename lacks product namespace")
+        expected_digest = module.sha256_bytes(
+            module.PRODUCT_NAME.encode("utf-8")
+            + b"\0"
+            + first["canonical"].encode("utf-8")
+        )
+        if first["digest"] != expected_digest:
+            errors.append("bootstrap handover digest did not bind product and target")
+        if lock_path.name != f"{module.PRODUCT_NAME}-{expected_digest}.lock":
+            errors.append("bootstrap handover lock filename digest mismatch")
+        release_a.write_text("release\n", encoding="utf-8")
+        if not wait_for_holder_exit(
+            holder_a, error_a, errors, "bootstrap handover A"
+        ):
+            return
+
+        ready_b = root / "ready-b"
+        release_b = root / "release-b"
+        result_b = root / "result-b.json"
+        error_b = root / "error-b.txt"
+        holder_b = start_bootstrap_lock_holder(
+            module, target, ready_b, release_b, result_b, error_b
+        )
+        if not wait_for_holder_ready(
+            holder_b, ready_b, error_b, errors, "bootstrap handover B"
+        ):
+            return
+        second = read_result(result_b)
+        if (first["device"], first["inode"]) != (second["device"], second["inode"]):
+            errors.append("bootstrap handover did not reuse the persistent lock inode")
+        assert_concurrent_command_denied(
+            lambda: run_concurrent_status(module, target),
+            errors,
+            "bootstrap handover smoke",
+            "status",
+        )
+        release_b.write_text("release\n", encoding="utf-8")
+        if not wait_for_holder_exit(
+            holder_b, error_b, errors, "bootstrap handover B"
+        ):
+            return
+        result = run_concurrent_status(module, target)
+        if result.returncode != 0:
+            errors.append(
+                "bootstrap handover status after release failed: "
+                f"stdout={result.stdout} stderr={result.stderr}"
+            )
+        final_info = lock_path.lstat()
+        if (final_info.st_dev, final_info.st_ino) != (first["device"], first["inode"]):
+            errors.append("bootstrap handover changed the persistent lock inode after release")
+        if stat.S_IMODE(final_info.st_mode) != module.OWNER_FILE_MODE:
+            errors.append("bootstrap handover lock mode drifted")
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "product_name": module.PRODUCT_NAME,
+                    "canonical_target": first["canonical"],
+                    "target_sha256": "0" * 64,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = run_concurrent_status(module, target)
+        if result.returncode == 0:
+            errors.append("bootstrap handover accepted mismatched persistent binding")
+        elif "bootstrap lock target binding mismatch" not in (
+            f"{result.stdout}\n{result.stderr}"
+        ):
+            errors.append(
+                "bootstrap handover binding mismatch failed with unexpected output: "
+                f"stdout={result.stdout} stderr={result.stderr}"
+            )
+
+
+def validate_same_process_thread_bootstrap_denial_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-thread-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        outcomes: list[str] = []
+
+        def contender() -> None:
+            try:
+                with module.bootstrap_lifecycle_lock(target):
+                    outcomes.append("accepted")
+            except module.CursorSetupError as exc:
+                outcomes.append(str(exc))
+            except BaseException as exc:  # noqa: BLE001 - serialize public smoke failure.
+                outcomes.append(f"unexpected: {exc}")
+
+        with module.bootstrap_lifecycle_lock(target):
+            thread = threading.Thread(target=contender)
+            thread.start()
+            thread.join(timeout=5)
+            if thread.is_alive():
+                errors.append("bootstrap thread smoke did not finish")
+                return
+        if outcomes != ["target is already locked"]:
+            errors.append(f"bootstrap thread smoke had unexpected outcome: {outcomes}")
+        with module.bootstrap_lifecycle_lock(target):
+            pass
 
 
 def expect_launch_blocked_without_child(
@@ -1102,7 +1731,7 @@ def expect_launch_blocked_without_child(
 
     with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
         try:
-            module.launch_cursor(target, ["--", "--help"])
+            module.launch_cursor(target, ["--help"])
         except module.CursorSetupError as exc:
             if expected_fragment not in str(exc):
                 errors.append(f"{label} launch failed with unexpected error: {exc}")
@@ -1199,16 +1828,85 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
     module = load_manager(errors)
     if module is None:
         return
-    validate_artifact_source_smokes(module, errors)
-    validate_sibling_control_state_ignored_smoke(module, errors)
-    validate_insecure_internal_control_state_smoke(module, errors)
-    validate_backup_rotation_and_binding_smoke(module, errors)
-    validate_target_mode_smokes(module, errors)
-    validate_initial_target_parent_smoke(module, errors)
-    validate_launch_exception_restore_smoke(module, errors)
-    validate_launch_swap_at_exec_smoke(module, errors)
-    validate_launch_lock_file_and_write_protection_smoke(module, errors)
-    validate_target_local_parent_symlink_smokes(module, errors)
+    production_bootstrap_before = real_bootstrap_artifact_snapshot(module, errors)
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-system-root-") as tmp:
+        injected_system_root = Path(tmp) / "system-tmp"
+        injected_system_root.mkdir(mode=0o700)
+        injected_system_root.chmod(0o1777)
+
+        def injected_bootstrap_system_root() -> Path:
+            return injected_system_root.resolve(strict=True)
+
+        with with_restored_attr(
+            module, "bootstrap_lock_system_root", injected_bootstrap_system_root
+        ):
+            smokes: list[tuple[str, Any]] = [
+                (
+                    "artifact source",
+                    lambda: validate_artifact_source_smokes(module, errors),
+                ),
+                (
+                    "sibling control state ignored",
+                    lambda: validate_sibling_control_state_ignored_smoke(module, errors),
+                ),
+                (
+                    "insecure internal control state",
+                    lambda: validate_insecure_internal_control_state_smoke(module, errors),
+                ),
+                (
+                    "backup rotation and binding",
+                    lambda: validate_backup_rotation_and_binding_smoke(module, errors),
+                ),
+                ("target mode", lambda: validate_target_mode_smokes(module, errors)),
+                (
+                    "initial target parent",
+                    lambda: validate_initial_target_parent_smoke(module, errors),
+                ),
+                (
+                    "launch exception restore",
+                    lambda: validate_launch_exception_restore_smoke(module, errors),
+                ),
+                (
+                    "launch swap at exec",
+                    lambda: validate_launch_swap_at_exec_smoke(module, errors),
+                ),
+                (
+                    "launch lock file and write protection",
+                    lambda: validate_launch_lock_file_and_write_protection_smoke(
+                        module, errors
+                    ),
+                ),
+                (
+                    "external bootstrap lock",
+                    lambda: validate_external_bootstrap_lock_smoke(module, errors),
+                ),
+                (
+                    "launch separator argv",
+                    lambda: validate_launch_separator_argv_smoke(module, errors),
+                ),
+                (
+                    "bootstrap lock handover",
+                    lambda: validate_bootstrap_lock_handover_smoke(module, errors),
+                ),
+                (
+                    "same-process bootstrap thread denial",
+                    lambda: validate_same_process_thread_bootstrap_denial_smoke(
+                        module, errors
+                    ),
+                ),
+                (
+                    "target local parent symlink",
+                    lambda: validate_target_local_parent_symlink_smokes(module, errors),
+                ),
+            ]
+            for name, action in smokes:
+                run_manager_smoke(name, action, errors)
+    production_bootstrap_after = real_bootstrap_artifact_snapshot(module, errors)
+    if production_bootstrap_after != production_bootstrap_before:
+        errors.append(
+            "public manager smokes created or changed production system bootstrap "
+            "artifacts"
+        )
 
 
 def validate_no_forbidden_public_paths(errors: list[str]) -> None:
@@ -1233,7 +1931,14 @@ def validate_no_forbidden_public_paths(errors: list[str]) -> None:
         paths = [path] if path.is_file() else sorted(path.rglob("*"))
         for candidate in paths:
             if candidate.is_file() and not candidate.is_symlink():
-                text = candidate.read_text(encoding="utf-8")
+                if "__pycache__" in candidate.parts or candidate.suffix == ".pyc":
+                    errors.append(f"{candidate.relative_to(ROOT)}: cache file must not exist")
+                    continue
+                try:
+                    text = candidate.read_text(encoding="utf-8")
+                except UnicodeDecodeError as exc:
+                    errors.append(f"{candidate.relative_to(ROOT)}: non-UTF-8 public text: {exc}")
+                    continue
                 if unsupported_os in text:
                     errors.append(f"{candidate.relative_to(ROOT)}: unsupported OS contract text")
 
@@ -1311,14 +2016,30 @@ def main() -> int:
             errors.append("build/manifest.json: existing target mode policy mismatch")
         if transaction.get("control_root") != ".nddev-cursor-cli":
             errors.append("build/manifest.json: control root mismatch")
-        if transaction.get("lock") != ".nddev-cursor-cli/lock":
+        if transaction.get("lock_parent") != ".nddev-cursor-cli/locks":
+            errors.append("build/manifest.json: lock parent mismatch")
+        if transaction.get("lock") != ".nddev-cursor-cli/locks/target.lock":
             errors.append("build/manifest.json: lock path mismatch")
         if transaction.get("lock_type") != "persistent flock file":
             errors.append("build/manifest.json: lock type mismatch")
         if transaction.get("lock_file_mode") != "0600":
             errors.append("build/manifest.json: lock file mode mismatch")
-        if transaction.get("lock_parent_mode_while_launching") != "0500":
-            errors.append("build/manifest.json: lock parent launch mode mismatch")
+        if transaction.get("lock_parent_mode_while_locked") != "0500":
+            errors.append("build/manifest.json: lock parent locked mode mismatch")
+        if "lock_parent_mode_while_launching" in transaction:
+            errors.append("build/manifest.json: transaction lock mode must not be launch-only")
+        if (
+            transaction.get("bootstrap_lock")
+            != "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target)>.lock"
+        ):
+            errors.append("build/manifest.json: bootstrap lock path mismatch")
+        if transaction.get("bootstrap_lock_file_mode") != "0600":
+            errors.append("build/manifest.json: bootstrap lock mode mismatch")
+        if (
+            transaction.get("bootstrap_lock_binding")
+            != "schema/product/canonical-target/product-target-sha256 JSON"
+        ):
+            errors.append("build/manifest.json: bootstrap lock binding mismatch")
         if transaction.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
             errors.append("build/manifest.json: mutable runtime TMPDIR mismatch")
         if (
@@ -1360,14 +2081,30 @@ def main() -> int:
             errors.append("config/nddev-contract.json: existing target mode policy mismatch")
         if safety.get("control_root") != ".nddev-cursor-cli":
             errors.append("config/nddev-contract.json: control root mismatch")
-        if safety.get("lock_path") != ".nddev-cursor-cli/lock":
+        if safety.get("lock_parent") != ".nddev-cursor-cli/locks":
+            errors.append("config/nddev-contract.json: lock parent mismatch")
+        if safety.get("lock_path") != ".nddev-cursor-cli/locks/target.lock":
             errors.append("config/nddev-contract.json: lock path mismatch")
         if safety.get("lock_type") != "persistent flock file":
             errors.append("config/nddev-contract.json: lock type mismatch")
         if safety.get("lock_file_mode") != "0600":
             errors.append("config/nddev-contract.json: lock file mode mismatch")
-        if safety.get("lock_parent_mode_while_launching") != "0500":
-            errors.append("config/nddev-contract.json: lock parent launch mode mismatch")
+        if safety.get("lock_parent_mode_while_locked") != "0500":
+            errors.append("config/nddev-contract.json: lock parent locked mode mismatch")
+        if "lock_parent_mode_while_launching" in safety:
+            errors.append("config/nddev-contract.json: safety lock mode must not be launch-only")
+        if (
+            safety.get("bootstrap_lock")
+            != "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target)>.lock"
+        ):
+            errors.append("config/nddev-contract.json: bootstrap lock path mismatch")
+        if safety.get("bootstrap_lock_file_mode") != "0600":
+            errors.append("config/nddev-contract.json: bootstrap lock mode mismatch")
+        if (
+            safety.get("bootstrap_lock_binding")
+            != "schema/product/canonical-target/product-target-sha256 JSON"
+        ):
+            errors.append("config/nddev-contract.json: bootstrap lock binding mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
             errors.append("config/nddev-contract.json: backup path mismatch")
         if safety.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":

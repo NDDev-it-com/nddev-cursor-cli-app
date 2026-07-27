@@ -37,18 +37,34 @@ parents are reported as drift, are not chmodded through symlinks, and block
 launch before a child process starts.
 
 Lifecycle control state is target-internal under `.nddev-cursor-cli/`: active
-locks use a persistent `.nddev-cursor-cli/lock` file held with nonblocking
-`fcntl.flock` on an `O_NOFOLLOW` current-user-owned `0600` descriptor, and
-backups use
+locks use a persistent `.nddev-cursor-cli/locks/target.lock` file held with
+nonblocking `fcntl.flock` on an `O_NOFOLLOW` current-user-owned `0600`
+descriptor, and backups use
 `.nddev-cursor-cli/backups/<slot>/NDDEV-CURSOR-CLI-BACKUP.json`. Those
 directories must be real, current-user-owned, and mode `0700`; backup envelopes
 must be regular current-user-owned `0600` files without hard-link aliases.
-Sibling `.nddev-*` lock or backup paths are ignored. During launch the control
-root is `0500`, which lets later managers traverse to the lock file but denies
-ordinary child cleanup from unlinking it. A later manager safely recovers this
-mode after a parent crash once the flock is no longer held. The target-internal
-lock is the cooperative same-user boundary for manager operations, while
-target-root `0700` is the cross-user boundary.
+Sibling `.nddev-*` lock or backup paths are ignored. While any internal lock is
+held, only `.nddev-cursor-cli/locks` is `0500`, which lets later managers
+traverse to the lock file but denies ordinary child cleanup from unlinking it.
+The broader `.nddev-cursor-cli` control root and backup pool remain writable
+for manager-owned cleanup and state. A later manager safely recovers the lock
+directory mode after a parent crash once the flock is no longer held. The
+target-internal lock is the cooperative same-user boundary for manager
+operations, while target-root `0700` is the cross-user boundary.
+
+An authoritative external bootstrap lock is acquired before target creation or
+inspection and held until the full operation, child cleanup, and internal lock
+release finish. It lives outside the target and target parent under the resolved
+fixed system temp root, such as macOS `/private/tmp` or Ubuntu `/tmp`, in a real
+sticky system directory and a current-user-owned `0700` product root. The
+persistent `0600` lock filename includes the product namespace and full SHA-256
+of `product-name + NUL + canonical absolute target`, and the JSON payload is
+bound to that same product/target digest. The manager acquires the external lock first, the internal
+target lock second, releases the internal lock first, and releases the external
+lock last. The file is never unlinked on normal release, setup remove, or failed
+target creation; crash recovery relies on kernel `flock` release while the same
+inode and path remain. Deliberate same-UID tampering with the bootstrap root is
+outside the no-sandbox boundary.
 
 ## Source and integrity
 
@@ -78,11 +94,12 @@ falls back to a live or system Node.js binary and uses a fixed child `PATH` of
 Cursor `--version` and `--help` can write target-local runtime/process state and
 can rewrite managed config defaults even when no login is attempted. Manager
 `launch` keeps the target lock from preflight through child execution and
-managed-config restoration. While the child runs, only the lock parent and an
-ephemeral verified launch image are `0500` so ordinary unlink/replace attempts
-against the lock and actual executable fail. The managed target root, isolated
-HOME, `.nddev-cursor-runtime/tmp`, config/session paths, and installed runtime
-tree stay writable for expected Cursor state. The manager then revalidates the
+managed-config restoration. While the child runs, only
+`.nddev-cursor-cli/locks` and an ephemeral verified launch image are `0500` so
+ordinary unlink/replace attempts against the lock and actual executable fail.
+The broader control root, backup pool, managed target root, isolated HOME,
+`.nddev-cursor-runtime/tmp`, config/session paths, and installed runtime tree
+stay writable for expected Cursor state. The manager then revalidates the
 launch-image executable inode and digest immediately before `Popen`, restores
 the selected setup's managed config keys while preserving unowned config keys,
 and treats only safe target-owned `.running` runtime state as ephemeral

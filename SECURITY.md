@@ -28,16 +28,22 @@ private configuration, or backup contents in an issue or pull request.
   `.nddev-cursor-home`, `bin`, and `.nddev-software`, must be real
   current-user-owned `0700` directories; unsafe parents are drift and block
   launch before subprocess handoff.
-- Launch keeps a persistent `.nddev-cursor-cli/lock` file locked with
-  nonblocking `fcntl.flock` through child execution and managed-config
-  restoration. The lock parent plus ephemeral launch image are `0500` during
-  launch for ordinary same-UID unlink/replace denial; the target root, isolated
-  HOME, target-local TMPDIR, config/session paths, and installed runtime tree
-  remain writable.
+- Launch keeps a persistent `.nddev-cursor-cli/locks/target.lock` file locked
+  with nonblocking `fcntl.flock` through child execution and managed-config
+  restoration. Only `.nddev-cursor-cli/locks` plus the ephemeral launch image
+  are `0500` during launch for ordinary same-UID unlink/replace denial; the
+  control root, backup pool, target root, isolated HOME, target-local TMPDIR,
+  config/session paths, and installed runtime tree remain writable.
+- A persistent external bootstrap `flock` under the resolved fixed system temp
+  root is acquired before target creation or inspection and released after the
+  internal target lock. Its filename and JSON payload are bound to the product
+  namespace plus canonical absolute target, and it is never unlinked during
+  normal release, remove, or failed target creation.
 - The executable handoff is a write-protected verified-path handoff with
   immediate launch-image inode and digest revalidation before subprocess start.
   It does not claim portable fd execution or deliberate same-UID chmod
-  resistance without a sandbox.
+  resistance without a sandbox; deliberate same-UID tampering with the external
+  bootstrap root is the same no-sandbox boundary.
 - The builder capability is projected as a local native Cursor plugin with
   rules, skills, and agents. This manager does not provision Cursor team
   marketplace state.

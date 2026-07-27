@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.request
 from collections.abc import Iterator
@@ -37,8 +38,11 @@ STAMP_NAME = "NDDEV-CURSOR-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-CURSOR-CLI-BACKUP.json"
 SOFTWARE_STAMP_NAME = "NDDEV-CURSOR-CLI-SOFTWARE.json"
 CONTROL_ROOT_NAME = ".nddev-cursor-cli"
-CONTROL_LOCK_NAME = "lock"
+CONTROL_LOCKS_NAME = "locks"
+CONTROL_LOCK_NAME = "target.lock"
 CONTROL_BACKUPS_NAME = "backups"
+BOOTSTRAP_LOCK_ROOT_PREFIX = "nddev-cursor-cli-app-locks"
+BOOTSTRAP_LOCK_MAX_BYTES = 4096
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 OWNER_EXEC_MODE = 0o700
@@ -192,6 +196,14 @@ BACKUP_KEYS_V2 = {
     "created_at",
     "files",
 }
+BOOTSTRAP_LOCK_KEYS_V1 = {
+    "schema_version",
+    "product_name",
+    "canonical_target",
+    "target_sha256",
+}
+_BOOTSTRAP_LOCKS: dict[str, dict[str, Any]] = {}
+_BOOTSTRAP_STATE_LOCK = threading.RLock()
 
 
 class CursorSetupError(Exception):
@@ -582,6 +594,240 @@ def resolve_target(raw_target: str) -> Path:
     return target
 
 
+def canonical_target_text(target: Path) -> str:
+    if not target.is_absolute():
+        fail("--target must be an absolute path")
+    parent = target.parent
+    try:
+        parent_info = parent.lstat()
+    except FileNotFoundError:
+        fail("--target parent must already exist")
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        fail("canonical --target parent must be a real directory")
+    if target.exists() or target.is_symlink():
+        target_info = target.lstat()
+        if stat.S_ISLNK(target_info.st_mode) or not stat.S_ISDIR(target_info.st_mode):
+            fail("--target must be a real directory when it exists")
+    return str(parent.resolve(strict=True) / target.name)
+
+
+def bootstrap_lock_system_root() -> Path:
+    return Path("/tmp").resolve(strict=True)
+
+
+def bootstrap_lock_root() -> Path:
+    uid = current_user_id()
+    if uid is None:
+        fail("bootstrap lifecycle locks require POSIX current-user identity")
+    parent = bootstrap_lock_system_root()
+    try:
+        parent_info = parent.lstat()
+    except FileNotFoundError:
+        fail("system temp root must exist")
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        fail("system temp root must be a real directory")
+    if not (parent_info.st_mode & stat.S_ISVTX):
+        fail("system temp root must be sticky")
+    root = parent / f"{BOOTSTRAP_LOCK_ROOT_PREFIX}-{uid}"
+    try:
+        root.mkdir(mode=OWNER_DIRECTORY_MODE)
+    except FileExistsError:
+        require_owner_private_directory(root, "bootstrap lock root")
+    else:
+        root.chmod(OWNER_DIRECTORY_MODE)
+        require_owner_private_directory(root, "bootstrap lock root")
+    return root
+
+
+def bootstrap_lock_path(target: Path) -> tuple[Path, str, str]:
+    canonical = canonical_target_text(target)
+    digest = sha256_bytes(PRODUCT_NAME.encode("utf-8") + b"\0" + canonical.encode("utf-8"))
+    return bootstrap_lock_root() / f"{PRODUCT_NAME}-{digest}.lock", canonical, digest
+
+
+def open_bootstrap_lock_file(path: Path) -> int:
+    require_owner_private_directory(path.parent, "bootstrap lock root")
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, OWNER_FILE_MODE)
+        created = True
+    except FileExistsError:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                fail("bootstrap lock path is unsafe")
+            raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("bootstrap lock path is unsafe")
+        fail(f"bootstrap lock could not be opened: {exc}")
+    try:
+        if created:
+            os.fchmod(descriptor, OWNER_FILE_MODE)
+        require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def fd_read_bounded(descriptor: int, label: str, max_bytes: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    content = os.read(descriptor, max_bytes + 1)
+    if len(content) > max_bytes:
+        fail(f"{label} exceeds the {max_bytes}-byte size limit")
+    return content
+
+
+def fd_write_all(descriptor: int, content: bytes) -> None:
+    os.ftruncate(descriptor, 0)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    view = memoryview(content)
+    while view:
+        written = os.write(descriptor, view)
+        if written == 0:
+            fail("bootstrap lock write made no progress")
+        view = view[written:]
+    os.fsync(descriptor)
+
+
+def read_valid_bootstrap_binding(
+    descriptor: int, path: Path, canonical: str, digest: str
+) -> dict[str, Any] | None:
+    require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+    content = fd_read_bounded(descriptor, "bootstrap lock", BOOTSTRAP_LOCK_MAX_BYTES)
+    if not content.strip():
+        return None
+    try:
+        loaded = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("bootstrap lock binding is invalid")
+    if not isinstance(loaded, dict):
+        fail("bootstrap lock must contain a JSON object")
+    require_exact_keys(loaded, BOOTSTRAP_LOCK_KEYS_V1, "bootstrap lock")
+    if (
+        loaded["schema_version"] != 1
+        or loaded["product_name"] != PRODUCT_NAME
+        or loaded["target_sha256"] != digest
+        or loaded["canonical_target"] != canonical
+    ):
+        fail("bootstrap lock target binding mismatch")
+    return loaded
+
+
+def validate_or_write_bootstrap_binding(
+    descriptor: int, path: Path, canonical: str, digest: str
+) -> None:
+    if read_valid_bootstrap_binding(descriptor, path, canonical, digest) is not None:
+        return
+    binding = canonical_json(
+        {
+            "schema_version": 1,
+            "product_name": PRODUCT_NAME,
+            "canonical_target": canonical,
+            "target_sha256": digest,
+        }
+    )
+    if len(binding) > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail("bootstrap lock binding exceeds the size limit")
+    fd_write_all(descriptor, binding)
+    require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+    if read_valid_bootstrap_binding(descriptor, path, canonical, digest) is None:
+        fail("bootstrap lock binding was not persisted")
+
+
+@contextlib.contextmanager
+def bootstrap_lifecycle_lock(target: Path) -> Iterator[None]:
+    path, canonical, digest = bootstrap_lock_path(target)
+    owner = (os.getpid(), threading.get_ident())
+    descriptor: int | None = None
+    locked = False
+    reentrant = False
+    with _BOOTSTRAP_STATE_LOCK:
+        for key, held in list(_BOOTSTRAP_LOCKS.items()):
+            held_owner = held.get("owner")
+            if held_owner is not None and held_owner[0] != owner[0]:
+                inherited_descriptor = held.get("descriptor")
+                if inherited_descriptor is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(int(inherited_descriptor))
+                del _BOOTSTRAP_LOCKS[key]
+        held = _BOOTSTRAP_LOCKS.get(canonical)
+        if held is not None:
+            if held.get("owner") == owner and held.get("descriptor") is not None:
+                held["depth"] += 1
+                reentrant = True
+            else:
+                fail("target is already locked")
+        else:
+            _BOOTSTRAP_LOCKS[canonical] = {
+                "depth": 0,
+                "descriptor": None,
+                "owner": owner,
+                "path": path,
+            }
+    if reentrant:
+        try:
+            yield
+        finally:
+            with _BOOTSTRAP_STATE_LOCK:
+                held = _BOOTSTRAP_LOCKS.get(canonical)
+                if held is not None and held.get("owner") == owner:
+                    held["depth"] -= 1
+        return
+    try:
+        descriptor = open_bootstrap_lock_file(path)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                fail("target is already locked")
+            fail(f"bootstrap lock could not be acquired: {exc}")
+        locked = True
+        validate_or_write_bootstrap_binding(descriptor, path, canonical, digest)
+        with _BOOTSTRAP_STATE_LOCK:
+            held = _BOOTSTRAP_LOCKS.get(canonical)
+            if held is None or held.get("owner") != owner:
+                fail("bootstrap lock owner changed while acquiring")
+            held["depth"] = 1
+            held["descriptor"] = descriptor
+            held["path"] = path
+        try:
+            yield
+        finally:
+            with _BOOTSTRAP_STATE_LOCK:
+                held = _BOOTSTRAP_LOCKS.get(canonical)
+                if held is not None and held.get("owner") == owner:
+                    held["depth"] -= 1
+                    if held["depth"] == 0:
+                        del _BOOTSTRAP_LOCKS[canonical]
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        with _BOOTSTRAP_STATE_LOCK:
+            held = _BOOTSTRAP_LOCKS.get(canonical)
+            if held is not None and held.get("owner") == owner and held["depth"] == 0:
+                del _BOOTSTRAP_LOCKS[canonical]
+
+
+def bootstrap_locked(function: Any) -> Any:
+    def wrapped(target: Path, *args: Any, **kwargs: Any) -> Any:
+        with bootstrap_lifecycle_lock(target):
+            return function(target, *args, **kwargs)
+
+    return wrapped
+
+
 @contextlib.contextmanager
 def target_lock(
     target: Path,
@@ -590,14 +836,19 @@ def target_lock(
     protect_lock_parent: bool = False,
 ) -> Iterator[None]:
     root: Path | None = None
+    lock_root: Path | None = None
+    lock_root_fd: int | None = None
     lock: Path | None = None
     lock_fd: int | None = None
-    lock_parent_protected = False
+    lock_directory_protected = False
     failed = True
     try:
+        del protect_lock_parent
         require_owner_private_directory(target, "--target")
         root = ensure_control_root(target)
-        lock = root / CONTROL_LOCK_NAME
+        lock_root = ensure_control_lock_root(target)
+        lock_root_fd = open_control_lock_root_fd(lock_root)
+        lock = target_lock_path(target)
         lock_fd = open_target_lock_file(lock)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -606,20 +857,21 @@ def target_lock(
                 fail("target is already locked")
             fail(f"target lock could not be acquired: {exc}")
         require_lock_file_matches_fd(lock, lock_fd, "target lock")
-        if protect_lock_parent:
-            set_owner_directory_mode(root, "control root", LOCK_HELD_DIRECTORY_MODE)
-            lock_parent_protected = True
-            require_lock_file_matches_fd(lock, lock_fd, "target lock")
-        else:
-            set_owner_directory_mode(root, "control root", OWNER_DIRECTORY_MODE)
+        set_owner_directory_fd_mode(
+            lock_root, lock_root_fd, "target lock directory", LOCK_HELD_DIRECTORY_MODE
+        )
+        lock_directory_protected = True
+        require_lock_file_matches_fd(lock, lock_fd, "target lock")
         yield
         failed = False
     finally:
         active_error = sys.exc_info()[1]
         cleanup_error: BaseException | None = None
-        if lock_parent_protected and root is not None:
+        if lock_directory_protected and lock_root is not None and lock_root_fd is not None:
             try:
-                set_owner_directory_mode(root, "control root", OWNER_DIRECTORY_MODE)
+                set_owner_directory_fd_mode(
+                    lock_root, lock_root_fd, "target lock directory", OWNER_DIRECTORY_MODE
+                )
             except BaseException as exc:  # noqa: BLE001 - preserve original failure.
                 cleanup_error = exc
         if lock_fd is not None:
@@ -627,11 +879,14 @@ def target_lock(
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             with contextlib.suppress(OSError):
                 os.close(lock_fd)
+        if lock_root_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(lock_root_fd)
         if failed and cleanup_empty_target_on_error:
-            cleanup_empty_persistent_lock_target(target, root, lock)
+            cleanup_empty_persistent_lock_target(target, root, lock_root, lock)
         if cleanup_error is not None:
             if active_error is not None:
-                note = f"target lock parent restore failed: {cleanup_error}"
+                note = f"target lock directory restore failed: {cleanup_error}"
                 add_note = getattr(active_error, "add_note", None)
                 if add_note is not None:
                     with contextlib.suppress(Exception):
@@ -690,10 +945,31 @@ def ensure_control_root(target: Path) -> Path:
     try:
         root.mkdir(mode=OWNER_DIRECTORY_MODE)
     except FileExistsError:
-        require_control_root_directory(root)
+        require_owner_private_directory(root, "control root")
     else:
         root.chmod(OWNER_DIRECTORY_MODE)
         require_owner_private_directory(root, "control root")
+    return root
+
+
+def control_lock_root(target: Path) -> Path:
+    return control_root(target) / CONTROL_LOCKS_NAME
+
+
+def target_lock_path(target: Path) -> Path:
+    return control_lock_root(target) / CONTROL_LOCK_NAME
+
+
+def ensure_control_lock_root(target: Path) -> Path:
+    ensure_control_root(target)
+    root = control_lock_root(target)
+    try:
+        root.mkdir(mode=OWNER_DIRECTORY_MODE)
+    except FileExistsError:
+        require_lock_root_directory(root)
+    else:
+        root.chmod(OWNER_DIRECTORY_MODE)
+        require_lock_root_directory(root)
     return root
 
 
@@ -850,6 +1126,7 @@ def drift_for_target(target: Path, stamp: dict[str, Any]) -> list[str]:
     return drift
 
 
+@bootstrap_locked
 def inspect_target(target: Path) -> dict[str, Any]:
     if not target.exists() and not target.is_symlink():
         return {
@@ -871,7 +1148,8 @@ def inspect_target(target: Path) -> dict[str, Any]:
     if stamp is None:
         builder_findings = builder_parent_findings(target)
         runtime_findings = target_local_parent_findings(target, runtime_parent_directories(target))
-        drift = [*target_safety, *builder_findings, *runtime_findings]
+        control_findings = control_state_findings(target, require_persistent_lock=False)
+        drift = [*target_safety, *builder_findings, *runtime_findings, *control_findings]
         return {
             "state": "unmanaged" if config_exists else "empty",
             "setup_id": None,
@@ -891,6 +1169,7 @@ def inspect_target(target: Path) -> dict[str, Any]:
         }
     drift = [
         *target_safety,
+        *control_state_findings(target, require_persistent_lock=True),
         *drift_for_target(target, stamp),
         *target_local_parent_findings(target, runtime_parent_directories(target)),
     ]
@@ -967,6 +1246,50 @@ def target_safety_findings(target: Path) -> list[str]:
     return findings
 
 
+def control_state_findings(target: Path, *, require_persistent_lock: bool) -> list[str]:
+    findings: list[str] = []
+    uid = current_user_id()
+    for path, label in (
+        (control_root(target), CONTROL_ROOT_NAME),
+        (control_lock_root(target), f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}"),
+    ):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if require_persistent_lock:
+                findings.append(f"{label}:missing")
+            return findings
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            findings.append(f"{label}:unsafe")
+            return findings
+        if uid is not None and info.st_uid != uid:
+            findings.append(f"{label}:owner")
+        allowed_modes = (
+            {OWNER_DIRECTORY_MODE, LOCK_HELD_DIRECTORY_MODE}
+            if label == f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}"
+            else {OWNER_DIRECTORY_MODE}
+        )
+        if stat.S_IMODE(info.st_mode) not in allowed_modes:
+            findings.append(f"{label}:mode")
+    lock = target_lock_path(target)
+    try:
+        info = lock.lstat()
+    except FileNotFoundError:
+        if require_persistent_lock:
+            findings.append(f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}/{CONTROL_LOCK_NAME}:missing")
+        return findings
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        findings.append(f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}/{CONTROL_LOCK_NAME}:unsafe")
+        return findings
+    if uid is not None and info.st_uid != uid:
+        findings.append(f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}/{CONTROL_LOCK_NAME}:owner")
+    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        findings.append(f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}/{CONTROL_LOCK_NAME}:mode")
+    if info.st_nlink != 1:
+        findings.append(f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}/{CONTROL_LOCK_NAME}:hardlink")
+    return findings
+
+
 def require_owner_directory_mode(
     path: Path, label: str, allowed_modes: set[int]
 ) -> os.stat_result:
@@ -991,15 +1314,77 @@ def require_owner_private_directory(path: Path, label: str) -> os.stat_result:
 
 
 def require_control_root_directory(path: Path) -> os.stat_result:
+    return require_owner_private_directory(path, "control root")
+
+
+def require_lock_root_directory(path: Path) -> os.stat_result:
     return require_owner_directory_mode(
-        path, "control root", {LOCK_HELD_DIRECTORY_MODE, OWNER_DIRECTORY_MODE}
+        path, "target lock directory", {LOCK_HELD_DIRECTORY_MODE, OWNER_DIRECTORY_MODE}
     )
+
+
+def require_directory_matches_fd(
+    path: Path, descriptor: int, label: str, allowed_modes: set[int]
+) -> os.stat_result:
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} disappeared")
+    fd_info = os.fstat(descriptor)
+    if (path_info.st_dev, path_info.st_ino) != (fd_info.st_dev, fd_info.st_ino):
+        fail(f"{label} changed while it was being opened")
+    if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISDIR(fd_info.st_mode):
+        fail(f"{label} path is unsafe")
+    uid = current_user_id()
+    if uid is not None and fd_info.st_uid != uid:
+        fail(f"{label} must be owned by the current user")
+    mode = stat.S_IMODE(fd_info.st_mode)
+    if mode not in allowed_modes:
+        allowed = " or ".join(oct(item).replace("0o", "0") for item in sorted(allowed_modes))
+        fail(f"{label} must have mode {allowed}")
+    return fd_info
+
+
+def open_control_lock_root_fd(path: Path) -> int:
+    require_lock_root_directory(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("target lock directory path is unsafe")
+        fail(f"target lock directory could not be opened: {exc}")
+    try:
+        require_directory_matches_fd(
+            path,
+            descriptor,
+            "target lock directory",
+            {LOCK_HELD_DIRECTORY_MODE, OWNER_DIRECTORY_MODE},
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def set_owner_directory_mode(path: Path, label: str, mode: int) -> None:
     require_owner_directory_mode(path, label, {LOCK_HELD_DIRECTORY_MODE, OWNER_DIRECTORY_MODE})
     os.chmod(path, mode)
     require_owner_directory_mode(path, label, {mode})
+
+
+def set_owner_directory_fd_mode(path: Path, descriptor: int, label: str, mode: int) -> None:
+    require_directory_matches_fd(
+        path, descriptor, label, {LOCK_HELD_DIRECTORY_MODE, OWNER_DIRECTORY_MODE}
+    )
+    os.fchmod(descriptor, mode)
+    require_directory_matches_fd(path, descriptor, label, {mode})
 
 
 def require_lock_file_matches_fd(path: Path, descriptor: int, label: str) -> os.stat_result:
@@ -1023,7 +1408,7 @@ def require_lock_file_matches_fd(path: Path, descriptor: int, label: str) -> os.
 
 
 def open_target_lock_file(path: Path) -> int:
-    require_control_root_directory(path.parent)
+    require_lock_root_directory(path.parent)
     flags = os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -1055,7 +1440,7 @@ def open_target_lock_file(path: Path) -> int:
 
 
 def cleanup_empty_persistent_lock_target(
-    target: Path, root: Path | None, lock: Path | None
+    target: Path, root: Path | None, lock_root: Path | None, lock: Path | None
 ) -> None:
     if lock is not None:
         with contextlib.suppress(CursorSetupError, FileNotFoundError, OSError):
@@ -1063,6 +1448,9 @@ def cleanup_empty_persistent_lock_target(
             uid = current_user_id()
             if uid is None or info.st_uid == uid:
                 lock.unlink()
+    if lock_root is not None:
+        with contextlib.suppress(OSError):
+            lock_root.rmdir()
     if root is not None:
         with contextlib.suppress(OSError):
             root.rmdir()
@@ -1442,6 +1830,7 @@ def restore_files_from_backup(envelope: dict[str, Any]) -> dict[str, bytes | Non
     return desired
 
 
+@bootstrap_locked
 def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str, Any]:
     render_selection(content_setup_id, profile_id)
     state = inspect_target(target)
@@ -1504,6 +1893,7 @@ def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str
     }
 
 
+@bootstrap_locked
 def mutate_setup(
     target: Path, content_setup_id: str, profile_id: str, command: str
 ) -> dict[str, Any]:
@@ -1565,6 +1955,7 @@ def mutate_setup(
     }
 
 
+@bootstrap_locked
 def migrate_setup(
     target: Path, content_setup_id: str, requested_profile_id: str | None
 ) -> dict[str, Any]:
@@ -1615,6 +2006,7 @@ def migrate_setup(
     }
 
 
+@bootstrap_locked
 def restore_slot(target: Path, slot: int) -> dict[str, Any]:
     prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
@@ -1646,6 +2038,7 @@ def restore_slot(target: Path, slot: int) -> dict[str, Any]:
     }
 
 
+@bootstrap_locked
 def remove_setup(target: Path) -> dict[str, Any]:
     prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
@@ -2233,6 +2626,7 @@ def remove_empty_directory_if_created(path: Path, existed_before: bool) -> None:
         path.rmdir()
 
 
+@bootstrap_locked
 def software_status(target: Path) -> dict[str, Any]:
     if not target.exists() and not target.is_symlink():
         return {
@@ -2395,6 +2789,7 @@ def prepare_cursor_artifact() -> dict[str, Any]:
     }
 
 
+@bootstrap_locked
 def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
     if command == "update-cli":
         preflight = software_status(target)
@@ -2566,6 +2961,12 @@ def reject_managed_launch_overrides(cursor_args: list[str]) -> None:
                 blocked = BLOCKED_LAUNCH_SHORT_FLAGS.get(flag)
                 if blocked is not None:
                     fail(f"launch refuses managed Cursor override option: -{flag} ({blocked})")
+
+
+def normalized_launch_args(cursor_args: list[str]) -> list[str]:
+    if cursor_args[:1] == ["--"]:
+        return cursor_args[1:]
+    return list(cursor_args)
 
 
 def restore_managed_config_after_launch_locked(target: Path) -> None:
@@ -2768,8 +3169,9 @@ def launch_write_protection(launch_image_root: Path) -> Iterator[None]:
                 raise cleanup_error
 
 
+@bootstrap_locked
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
-    forwarded = cursor_args[1:] if cursor_args[:1] == ["--"] else cursor_args
+    forwarded = list(cursor_args)
     reject_managed_launch_overrides(forwarded)
     prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target, protect_lock_parent=True):
@@ -2911,6 +3313,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any] | int:
     if args.command == "list":
         return {
@@ -2944,7 +3350,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
     if args.command == "remove":
         return remove_setup(target)
     if args.command == "launch":
-        return launch_cursor(target, list(args.cursor_args))
+        return launch_cursor(target, normalized_launch_args(list(args.cursor_args)))
     fail(f"unsupported command: {args.command}")
 
 
@@ -2976,8 +3382,7 @@ def human_output(value: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parse_args(argv)
     try:
         result = run(args)
     except (CursorSetupError, OSError) as exc:

@@ -26,9 +26,14 @@ Existing targets used for install, switch, migrate, restore, remove, software
 install/update, or launch must already be owned by the current user and mode
 `0700`; the manager reports `target:owner` or `target:mode` drift instead of
 silently changing existing root permissions. Lifecycle lock and backup state
-lives inside the target under `.nddev-cursor-cli/{lock,backups}`. The lock is a
-persistent current-user-owned `0600` file held with nonblocking `fcntl.flock`;
-sibling `.nddev-*` lock or backup paths are ignored.
+lives inside the target under `.nddev-cursor-cli/{locks,backups}`. The lock is
+a persistent current-user-owned `.nddev-cursor-cli/locks/target.lock` `0600`
+file held with nonblocking `fcntl.flock`; sibling `.nddev-*` lock or backup
+paths are ignored.
+Every target operation also acquires a persistent external bootstrap `flock`
+under the resolved fixed system temp root before target creation or inspection;
+its filename is the full SHA-256 of the product namespace plus canonical target.
+The external lock is released last and is not exposed to child processes.
 Existing target-local builder and runtime parent directories, including
 `.nddev-cursor-home`, `bin`, and `.nddev-software`, must also be real
 current-user-owned directories with mode `0700`; unsafe parents are reported as
@@ -63,6 +68,10 @@ target-internal `TMPDIR` scoped only to the child process:
 python3 cli-tools/nddev_cursor_cli.py launch --target /absolute/cursor-config -- -p "summarize"
 ```
 
+The first `--` after manager options is the manager/Cursor separator and is not
+forwarded. A second or later `--` is preserved as an intentional Cursor
+argument.
+
 `launch` requires a clean managed setup plus current target-owned software,
 executes a verified target-internal launch image, never falls back to `PATH`,
 and uses a fixed minimal child `PATH` of `/usr/bin:/bin`. The launcher uses
@@ -70,11 +79,12 @@ and uses a fixed minimal child `PATH` of `/usr/bin:/bin`. The launcher uses
 approval, sandbox, worktree, shell-integration, worker, or self-update
 lifecycle, and uses only the pinned target-owned runtime tree, including its
 bundled Node.js binary. The manager keeps the target lock through child
-execution and managed-config restoration. During launch it makes only the lock
-parent and an ephemeral verified launch image read/execute-only (`0500`) for
-ordinary unlink/replace denial; the managed target root, isolated HOME,
-target-local TMPDIR, config/session paths, and installed runtime tree remain
-writable. It revalidates the launch-image executable inode and digest
+execution and managed-config restoration. During launch it makes only
+`.nddev-cursor-cli/locks` and an ephemeral verified launch image
+read/execute-only (`0500`) for ordinary unlink/replace denial; the control
+root, backup pool, managed target root, isolated HOME, target-local TMPDIR,
+config/session paths, and installed runtime tree remain writable. It
+revalidates the launch-image executable inode and digest
 immediately before the subprocess handoff. This is not portable fd execution
 and does not claim resistance to deliberate same-UID chmod without a sandbox.
 
