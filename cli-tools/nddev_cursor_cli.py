@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -40,6 +42,7 @@ CONTROL_BACKUPS_NAME = "backups"
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 OWNER_EXEC_MODE = 0o700
+LOCK_HELD_DIRECTORY_MODE = 0o500
 METADATA_MAX_BYTES = 256 * 1024
 MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
 SOFTWARE_ARTIFACT_MAX_BYTES = 300 * 1024 * 1024
@@ -577,40 +580,62 @@ def resolve_target(raw_target: str) -> Path:
 
 @contextlib.contextmanager
 def target_lock(
-    target: Path, *, cleanup_empty_target_on_error: bool = False
+    target: Path,
+    *,
+    cleanup_empty_target_on_error: bool = False,
+    protect_lock_parent: bool = False,
 ) -> Iterator[None]:
     root: Path | None = None
     lock: Path | None = None
-    lock_created = False
+    lock_fd: int | None = None
+    lock_parent_protected = False
     failed = True
     try:
         require_owner_private_directory(target, "--target")
         root = ensure_control_root(target)
         lock = root / CONTROL_LOCK_NAME
+        lock_fd = open_target_lock_file(lock)
         try:
-            lock.mkdir(mode=OWNER_DIRECTORY_MODE)
-        except FileExistsError:
-            try:
-                info = lock.lstat()
-            except FileNotFoundError:
-                fail("target lock changed concurrently")
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                fail("target lock path is unsafe")
-            require_owner_private_directory(lock, "target lock")
-            fail("target is already locked")
-        lock_created = True
-        require_owner_private_directory(lock, "target lock")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                fail("target is already locked")
+            fail(f"target lock could not be acquired: {exc}")
+        require_lock_file_matches_fd(lock, lock_fd, "target lock")
+        if protect_lock_parent:
+            set_owner_directory_mode(root, "control root", LOCK_HELD_DIRECTORY_MODE)
+            lock_parent_protected = True
+            require_lock_file_matches_fd(lock, lock_fd, "target lock")
+        else:
+            set_owner_directory_mode(root, "control root", OWNER_DIRECTORY_MODE)
         yield
         failed = False
     finally:
-        if lock_created and lock is not None:
-            with contextlib.suppress(FileNotFoundError):
-                lock.rmdir()
-        with contextlib.suppress(OSError):
-            if root is not None:
-                root.rmdir()
+        active_error = sys.exc_info()[1]
+        cleanup_error: BaseException | None = None
+        if lock_parent_protected and root is not None:
+            try:
+                set_owner_directory_mode(root, "control root", OWNER_DIRECTORY_MODE)
+            except BaseException as exc:  # noqa: BLE001 - preserve original failure.
+                cleanup_error = exc
+        if lock_fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(lock_fd)
         if failed and cleanup_empty_target_on_error:
-            remove_empty_directory_if_created(target, existed_before=False)
+            cleanup_empty_persistent_lock_target(target, root, lock)
+        if cleanup_error is not None:
+            if active_error is not None:
+                note = f"target lock parent restore failed: {cleanup_error}"
+                add_note = getattr(active_error, "add_note", None)
+                if add_note is not None:
+                    with contextlib.suppress(Exception):
+                        add_note(note)
+                with contextlib.suppress(Exception):
+                    print(f"nddev-cursor-cli: warning: {note}", file=sys.stderr)
+            else:
+                raise cleanup_error
 
 
 def require_private_or_sticky_parent(parent: Path) -> os.stat_result:
@@ -661,7 +686,7 @@ def ensure_control_root(target: Path) -> Path:
     try:
         root.mkdir(mode=OWNER_DIRECTORY_MODE)
     except FileExistsError:
-        require_owner_private_directory(root, "control root")
+        require_control_root_directory(root)
     else:
         root.chmod(OWNER_DIRECTORY_MODE)
         require_owner_private_directory(root, "control root")
@@ -938,7 +963,9 @@ def target_safety_findings(target: Path) -> list[str]:
     return findings
 
 
-def require_owner_private_directory(path: Path, label: str) -> os.stat_result:
+def require_owner_directory_mode(
+    path: Path, label: str, allowed_modes: set[int]
+) -> os.stat_result:
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -948,9 +975,94 @@ def require_owner_private_directory(path: Path, label: str) -> os.stat_result:
     uid = current_user_id()
     if uid is not None and info.st_uid != uid:
         fail(f"{label} must be owned by the current user")
-    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
-        fail(f"{label} must have mode 0700")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode not in allowed_modes:
+        allowed = " or ".join(oct(item).replace("0o", "0") for item in sorted(allowed_modes))
+        fail(f"{label} must have mode {allowed}")
     return info
+
+
+def require_owner_private_directory(path: Path, label: str) -> os.stat_result:
+    return require_owner_directory_mode(path, label, {OWNER_DIRECTORY_MODE})
+
+
+def require_control_root_directory(path: Path) -> os.stat_result:
+    return require_owner_directory_mode(
+        path, "control root", {LOCK_HELD_DIRECTORY_MODE, OWNER_DIRECTORY_MODE}
+    )
+
+
+def set_owner_directory_mode(path: Path, label: str, mode: int) -> None:
+    require_owner_directory_mode(path, label, {LOCK_HELD_DIRECTORY_MODE, OWNER_DIRECTORY_MODE})
+    os.chmod(path, mode)
+    require_owner_directory_mode(path, label, {mode})
+
+
+def require_lock_file_matches_fd(path: Path, descriptor: int, label: str) -> os.stat_result:
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} disappeared")
+    fd_info = os.fstat(descriptor)
+    if (path_info.st_dev, path_info.st_ino) != (fd_info.st_dev, fd_info.st_ino):
+        fail(f"{label} changed while it was being opened")
+    if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISREG(fd_info.st_mode):
+        fail(f"{label} path is unsafe")
+    if fd_info.st_nlink != 1:
+        fail(f"{label} must not have hard-link aliases")
+    uid = current_user_id()
+    if uid is not None and fd_info.st_uid != uid:
+        fail(f"{label} must be owned by the current user")
+    if stat.S_IMODE(fd_info.st_mode) != OWNER_FILE_MODE:
+        fail(f"{label} must have mode 0600")
+    return fd_info
+
+
+def open_target_lock_file(path: Path) -> int:
+    require_control_root_directory(path.parent)
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, OWNER_FILE_MODE)
+        created = True
+    except FileExistsError:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                fail("target lock path is unsafe")
+            raise
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("target lock path is unsafe")
+        fail(f"target lock could not be opened: {exc}")
+    try:
+        if created:
+            os.fchmod(descriptor, OWNER_FILE_MODE)
+        require_lock_file_matches_fd(path, descriptor, "target lock")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def cleanup_empty_persistent_lock_target(
+    target: Path, root: Path | None, lock: Path | None
+) -> None:
+    if lock is not None:
+        with contextlib.suppress(CursorSetupError, FileNotFoundError, OSError):
+            info = require_regular_file(lock, "target lock", max_bytes=METADATA_MAX_BYTES)
+            uid = current_user_id()
+            if uid is None or info.st_uid == uid:
+                lock.unlink()
+    if root is not None:
+        with contextlib.suppress(OSError):
+            root.rmdir()
+    remove_empty_directory_if_created(target, existed_before=False)
 
 
 def directory_component_label(relative: Path) -> str:
@@ -1391,7 +1503,7 @@ def mutate_setup(
     render_selection(content_setup_id, profile_id)
     created_target = prepare_lifecycle_target(target, create_missing=command == "install")
     try:
-        with target_lock(target):
+        with target_lock(target, cleanup_empty_target_on_error=created_target):
             state = inspect_target(target)
             if state["state"] == "unmanaged":
                 fail("unmanaged target contains Cursor CLI state; refusing to overwrite")
@@ -2435,12 +2547,21 @@ def restore_managed_config_after_launch(target: Path) -> None:
 
 
 def revalidate_launch_executable(target: Path) -> dict[str, Any]:
-    status = software_status(target)
-    if not status["installed"] or not status["current"]:
-        fail("launch requires current target-owned Cursor CLI software at exec handoff")
     stamp = load_software_stamp(target)
     if stamp is None:
         fail("Cursor software stamp disappeared before exec handoff")
+    asset_path, artifact_sha256, artifact_size = current_platform_asset()
+    expected = {
+        "build_version": VERSION,
+        "version": CURSOR_VERSION,
+        "official_source": official_asset_url(asset_path),
+        "asset_path": asset_path,
+        "artifact_sha256": artifact_sha256,
+        "artifact_size": artifact_size,
+    }
+    for key, value in expected.items():
+        if stamp[key] != value:
+            fail(f"Cursor software stamp {key} changed before exec handoff")
     executable = managed_agent_path(target)
     before = require_regular_file(
         executable, f"Cursor launch executable {executable}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
@@ -2485,11 +2606,70 @@ def report_cleanup_failure_after_child_exception(
         print(f"nddev-cursor-cli: warning: {note}", file=sys.stderr)
 
 
+def launch_protected_directories(target: Path) -> tuple[Path, ...]:
+    return (
+        managed_agent_path(target).parent,
+        software_container(target),
+        software_root(target),
+        software_root(target) / "versions",
+        software_version_dir(target),
+    )
+
+
+def require_launch_protected_directories(target: Path) -> tuple[Path, ...]:
+    directories = launch_protected_directories(target)
+    for directory in directories:
+        try:
+            relative = directory.relative_to(target)
+        except ValueError:
+            fail(f"launch protected directory is outside target: {directory}")
+        require_target_local_directory_chain(target, relative, "launch protected directory")
+    return directories
+
+
+@contextlib.contextmanager
+def launch_write_protection(target: Path) -> Iterator[None]:
+    directories = require_launch_protected_directories(target)
+    protected: list[Path] = []
+    try:
+        for directory in directories:
+            set_owner_directory_mode(
+                directory, f"launch protected directory {directory}", LOCK_HELD_DIRECTORY_MODE
+            )
+            protected.append(directory)
+        yield
+    finally:
+        active_error = sys.exc_info()[1]
+        cleanup_errors: list[BaseException] = []
+        for directory in reversed(protected):
+            try:
+                set_owner_directory_mode(
+                    directory, f"launch protected directory {directory}", OWNER_DIRECTORY_MODE
+                )
+            except BaseException as exc:  # noqa: BLE001 - preserve original failure.
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            cleanup_error = cleanup_errors[0]
+            if active_error is not None:
+                add_note = getattr(active_error, "add_note", None)
+                if add_note is not None:
+                    with contextlib.suppress(Exception):
+                        add_note(f"launch write-protection restore failed: {cleanup_error}")
+                with contextlib.suppress(Exception):
+                    print(
+                        "nddev-cursor-cli: warning: launch write-protection restore "
+                        f"failed: {cleanup_error}",
+                        file=sys.stderr,
+                    )
+            else:
+                raise cleanup_error
+
+
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
     forwarded = cursor_args[1:] if cursor_args[:1] == ["--"] else cursor_args
     reject_managed_launch_overrides(forwarded)
     prepare_lifecycle_target(target, create_missing=False)
-    with target_lock(target):
+    with target_lock(target, protect_lock_parent=True):
         require_clean_managed(target)
         software = software_status(target)
         if not software["installed"] or not software["current"]:
@@ -2511,20 +2691,21 @@ def launch_cursor(target: Path, cursor_args: list[str]) -> int:
             environment.pop(name, None)
         executable = managed_agent_path(target)
         child_error: BaseException | None = None
-        try:
-            revalidate_launch_executable(target)
-            completed = run_cursor_child(executable, forwarded, environment)
-        except BaseException as exc:
-            child_error = exc
-            raise
-        finally:
+        with launch_write_protection(target):
             try:
-                restore_managed_config_after_launch_locked(target)
-            except BaseException as cleanup_error:
-                if child_error is not None:
-                    report_cleanup_failure_after_child_exception(child_error, cleanup_error)
-                else:
-                    raise
+                revalidate_launch_executable(target)
+                completed = run_cursor_child(executable, forwarded, environment)
+            except BaseException as exc:
+                child_error = exc
+                raise
+            finally:
+                try:
+                    restore_managed_config_after_launch_locked(target)
+                except BaseException as cleanup_error:
+                    if child_error is not None:
+                        report_cleanup_failure_after_child_exception(child_error, cleanup_error)
+                    else:
+                        raise
         if completed.returncode < 0:
             return 128 + abs(completed.returncode)
         return completed.returncode

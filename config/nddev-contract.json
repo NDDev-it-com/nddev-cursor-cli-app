@@ -64,7 +64,11 @@
     "successful_child_output_wrapped": false,
     "target_environment_scope": "child-process-only",
     "target_lock_scope": "preflight-through-child-and-managed-config-restore",
-    "exec_handoff_revalidation": "bin/agent inode and digest immediately before subprocess"
+    "lock_mechanism": "persistent 0600 file opened with O_NOFOLLOW and held by nonblocking fcntl.flock",
+    "lock_parent_mode_while_launching": "0500",
+    "software_parent_mode_while_launching": "0500",
+    "exec_handoff_revalidation": "verified-path bin/agent inode and digest immediately before subprocess",
+    "exec_handoff_boundary": "write-protected verified-path handoff under no-sandbox same-UID limits; no portable fd execution claimed"
   },
   "software_install": {
     "supported": true,
@@ -152,6 +156,9 @@
     "existing_target_required_mode": "0700",
     "control_root": ".nddev-cursor-cli",
     "lock_path": ".nddev-cursor-cli/lock",
+    "lock_type": "persistent flock file",
+    "lock_file_mode": "0600",
+    "lock_parent_mode_while_launching": "0500",
     "backup_path": ".nddev-cursor-cli/backups",
     "target_local_directory_parents": "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed",
     "relative_target_rejected": true,

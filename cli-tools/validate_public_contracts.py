@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -194,10 +195,24 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
     if launch.get("target_lock_scope") != "preflight-through-child-and-managed-config-restore":
         errors.append(f"{owner}: runtime_launch target lock scope mismatch")
     if (
+        launch.get("lock_mechanism")
+        != "persistent 0600 file opened with O_NOFOLLOW and held by nonblocking fcntl.flock"
+    ):
+        errors.append(f"{owner}: runtime_launch lock mechanism mismatch")
+    if launch.get("lock_parent_mode_while_launching") != "0500":
+        errors.append(f"{owner}: runtime_launch lock parent mode mismatch")
+    if launch.get("software_parent_mode_while_launching") != "0500":
+        errors.append(f"{owner}: runtime_launch software parent mode mismatch")
+    if (
         launch.get("exec_handoff_revalidation")
-        != "bin/agent inode and digest immediately before subprocess"
+        != "verified-path bin/agent inode and digest immediately before subprocess"
     ):
         errors.append(f"{owner}: runtime_launch exec handoff revalidation mismatch")
+    if (
+        launch.get("exec_handoff_boundary")
+        != "write-protected verified-path handoff under no-sandbox same-UID limits; no portable fd execution claimed"
+    ):
+        errors.append(f"{owner}: runtime_launch exec handoff boundary mismatch")
 
 
 def validate_software(owner: str, software: dict, errors: list[str]) -> None:
@@ -398,6 +413,40 @@ def with_restored_attr(module: Any, name: str, value: Any):
     return RestoreAttr()
 
 
+def run_concurrent_switch(target: Path, profile: str = "safe") -> subprocess.CompletedProcess[str]:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    return subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "cli-tools" / "nddev_cursor_cli.py"),
+            "switch",
+            "--setup",
+            "nddev-builder",
+            "--profile",
+            profile,
+            "--target",
+            str(target),
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def assert_concurrent_switch_denied(target: Path, errors: list[str], label: str) -> None:
+    result = run_concurrent_switch(target)
+    output = f"{result.stdout}\n{result.stderr}"
+    if result.returncode == 0:
+        errors.append(f"{label} allowed concurrent lifecycle switch")
+    elif "already locked" not in output:
+        errors.append(f"{label} concurrent switch failed with unexpected output: {output}")
+
+
 def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
     manager_source = (ROOT / "cli-tools" / "nddev_cursor_cli.py").read_text(encoding="utf-8")
     disallowed_source_patterns = {
@@ -410,6 +459,9 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
     for label, pattern in disallowed_source_patterns.items():
         if re.search(pattern, manager_source):
             errors.append(f"nddev_cursor_cli.py must not expose {label}")
+    for needle in ("fcntl.flock", "fcntl.LOCK_EX | fcntl.LOCK_NB", "O_NOFOLLOW"):
+        if needle not in manager_source:
+            errors.append(f"nddev_cursor_cli.py must keep verified lock fd evidence: {needle}")
 
     artifact = b"official artifact bytes"
     asset_path = "linux/x64/agent-cli-package.tar.gz"
@@ -506,6 +558,9 @@ def validate_insecure_internal_control_state_smoke(module: Any, errors: list[str
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
         external = root / "external-root"
         external.mkdir(mode=0o700)
+        control = module.control_root(target)
+        (control / module.CONTROL_LOCK_NAME).unlink()
+        control.rmdir()
         os.symlink(external, module.control_root(target))
         try:
             module.mutate_setup(target, "nddev-builder", "safe", "switch")
@@ -518,6 +573,7 @@ def validate_insecure_internal_control_state_smoke(module: Any, errors: list[str
         target = root / "lock-symlink"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
         control = module.ensure_control_root(target)
+        (control / module.CONTROL_LOCK_NAME).unlink()
         os.symlink(external, control / module.CONTROL_LOCK_NAME)
         try:
             module.mutate_setup(target, "nddev-builder", "safe", "switch")
@@ -736,16 +792,18 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
         ) -> Any:
             del executable, forwarded
             seen_environment.update(environment)
+            control = module.control_root(target)
             lock = module.control_root(target) / module.CONTROL_LOCK_NAME
-            if not lock.is_dir() or lock.is_symlink():
-                errors.append("launch smoke did not hold target lock during child execution")
-            try:
-                module.mutate_setup(target, "nddev-builder", "safe", "switch")
-            except module.CursorSetupError as exc:
-                if "already locked" not in str(exc):
-                    errors.append("launch lock smoke failed with unexpected nested error")
+            if not lock.is_file() or lock.is_symlink():
+                errors.append("launch smoke did not expose a persistent lock file")
             else:
-                errors.append("launch lock smoke allowed nested manager mutation")
+                mode = stat.S_IMODE(lock.lstat().st_mode)
+                if mode != module.OWNER_FILE_MODE:
+                    errors.append(f"launch smoke lock file mode mismatch: {oct(mode)}")
+            control_mode = stat.S_IMODE(control.lstat().st_mode)
+            if control_mode != module.LOCK_HELD_DIRECTORY_MODE:
+                errors.append(f"launch smoke control root was writable: {oct(control_mode)}")
+            assert_concurrent_switch_denied(target, errors, "launch lock smoke")
             config = module.load_target_config(target)
             assert config is not None
             config["approvalMode"] = "allowlist"
@@ -818,10 +876,93 @@ def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
                     errors.append(f"swap-at-exec smoke failed with unexpected error: {exc}")
             else:
                 errors.append("swap-at-exec smoke unexpectedly allowed launch")
-        if calls < 2:
-            errors.append("swap-at-exec smoke did not recheck software status before exec")
+        if calls < 1:
+            errors.append("swap-at-exec smoke did not run software status preflight")
         if child_ran:
             errors.append("swap-at-exec smoke executed the replaced agent")
+
+
+def permission_denials_are_observable() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is None or geteuid() != 0
+
+
+def expect_permission_denied(action: Any, errors: list[str], label: str) -> None:
+    if not permission_denials_are_observable():
+        return
+    try:
+        action()
+    except PermissionError:
+        return
+    except OSError as exc:
+        errors.append(f"{label} failed with unexpected OSError: {exc}")
+    else:
+        errors.append(f"{label} unexpectedly succeeded")
+
+
+def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-launch-protection-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+
+        def fake_run_cursor_child(
+            executable: Path, forwarded: list[str], environment: dict[str, str]
+        ) -> Any:
+            del executable, forwarded, environment
+            control = module.control_root(target)
+            lock = control / module.CONTROL_LOCK_NAME
+            if not lock.is_file() or lock.is_symlink():
+                errors.append("launch protection smoke did not expose lock as regular file")
+            if stat.S_IMODE(control.lstat().st_mode) != module.LOCK_HELD_DIRECTORY_MODE:
+                errors.append("launch protection smoke did not protect control root")
+            expect_permission_denied(
+                lambda: lock.unlink(), errors, "launch protection lock unlink"
+            )
+
+            replacement = target / "replacement-agent"
+            replacement.write_bytes(b"replacement\n")
+            replacement.chmod(module.OWNER_EXEC_MODE)
+            expect_permission_denied(
+                lambda: module.managed_agent_path(target).unlink(),
+                errors,
+                "launch protection bin/agent unlink",
+            )
+            expect_permission_denied(
+                lambda: os.replace(replacement, module.managed_agent_path(target)),
+                errors,
+                "launch protection bin/agent replace",
+            )
+            if replacement.exists():
+                replacement.unlink()
+
+            runtime_replacement = target / "replacement-runtime-agent"
+            runtime_replacement.write_bytes(b"replacement runtime\n")
+            runtime_replacement.chmod(module.OWNER_EXEC_MODE)
+            expect_permission_denied(
+                lambda: os.replace(runtime_replacement, module.software_tree_binary(target)),
+                errors,
+                "launch protection runtime binary replace",
+            )
+            if runtime_replacement.exists():
+                runtime_replacement.unlink()
+
+            assert_concurrent_switch_denied(target, errors, "launch protection smoke")
+            return type("Completed", (), {"returncode": 0})()
+
+        with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
+            result = module.launch_cursor(target, ["--", "-p", "noop"])
+        if result != 0:
+            errors.append(f"launch protection smoke returned {result}")
+        if stat.S_IMODE(module.control_root(target).lstat().st_mode) != module.OWNER_DIRECTORY_MODE:
+            errors.append("launch protection smoke did not restore control root mode")
+        for directory in module.launch_protected_directories(target):
+            if stat.S_IMODE(directory.lstat().st_mode) != module.OWNER_DIRECTORY_MODE:
+                errors.append(f"launch protection smoke did not restore {directory}")
+        status = module.software_status(target)
+        if not status["current"]:
+            errors.append(f"launch protection smoke left software drift: {status['drift']}")
 
 
 def expect_launch_blocked_without_child(
@@ -928,6 +1069,7 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
     validate_initial_target_parent_smoke(module, errors)
     validate_launch_exception_restore_smoke(module, errors)
     validate_launch_swap_at_exec_smoke(module, errors)
+    validate_launch_lock_file_and_write_protection_smoke(module, errors)
     validate_target_local_parent_symlink_smokes(module, errors)
 
 
@@ -1033,6 +1175,12 @@ def main() -> int:
             errors.append("build/manifest.json: control root mismatch")
         if transaction.get("lock") != ".nddev-cursor-cli/lock":
             errors.append("build/manifest.json: lock path mismatch")
+        if transaction.get("lock_type") != "persistent flock file":
+            errors.append("build/manifest.json: lock type mismatch")
+        if transaction.get("lock_file_mode") != "0600":
+            errors.append("build/manifest.json: lock file mode mismatch")
+        if transaction.get("lock_parent_mode_while_launching") != "0500":
+            errors.append("build/manifest.json: lock parent launch mode mismatch")
         if (
             transaction.get("target_local_directory_parents")
             != "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed"
@@ -1074,6 +1222,12 @@ def main() -> int:
             errors.append("config/nddev-contract.json: control root mismatch")
         if safety.get("lock_path") != ".nddev-cursor-cli/lock":
             errors.append("config/nddev-contract.json: lock path mismatch")
+        if safety.get("lock_type") != "persistent flock file":
+            errors.append("config/nddev-contract.json: lock type mismatch")
+        if safety.get("lock_file_mode") != "0600":
+            errors.append("config/nddev-contract.json: lock file mode mismatch")
+        if safety.get("lock_parent_mode_while_launching") != "0500":
+            errors.append("config/nddev-contract.json: lock parent launch mode mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
             errors.append("config/nddev-contract.json: backup path mismatch")
         if (

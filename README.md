@@ -26,8 +26,9 @@ Existing targets used for install, switch, migrate, restore, remove, software
 install/update, or launch must already be owned by the current user and mode
 `0700`; the manager reports `target:owner` or `target:mode` drift instead of
 silently changing existing root permissions. Lifecycle lock and backup state
-lives inside the target under `.nddev-cursor-cli/{lock,backups}`; sibling
-`.nddev-*` lock or backup paths are ignored.
+lives inside the target under `.nddev-cursor-cli/{lock,backups}`. The lock is a
+persistent current-user-owned `0600` file held with nonblocking `fcntl.flock`;
+sibling `.nddev-*` lock or backup paths are ignored.
 Existing target-local builder and runtime parent directories, including
 `.nddev-cursor-home`, `bin`, and `.nddev-software`, must also be real
 current-user-owned directories with mode `0700`; unsafe parents are reported as
@@ -69,8 +70,12 @@ uses a fixed minimal child `PATH` of `/usr/bin:/bin`. The launcher uses
 approval, sandbox, worktree, shell-integration, worker, or self-update
 lifecycle, and uses only the pinned target-owned runtime tree, including its
 bundled Node.js binary. The manager keeps the target lock through child
-execution and managed-config restoration, then revalidates the `bin/agent`
-inode and digest immediately before the subprocess handoff.
+execution and managed-config restoration. During launch it makes the lock
+parent and executable/software parent directories read/execute-only (`0500`)
+for ordinary unlink/replace denial, then revalidates the verified-path
+`bin/agent` inode and digest immediately before the subprocess handoff. This is
+not portable fd execution and does not claim resistance to deliberate same-UID
+chmod without a sandbox.
 
 The setup/profile model also projects `nddev-builder` as a local native Cursor plugin
 under `.nddev-cursor-home/.cursor/plugins/local/nddev-builder` inside the

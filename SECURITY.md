@@ -28,9 +28,14 @@ private configuration, or backup contents in an issue or pull request.
   `.nddev-cursor-home`, `bin`, and `.nddev-software`, must be real
   current-user-owned `0700` directories; unsafe parents are drift and block
   launch before subprocess handoff.
-- Launch keeps the target lock through child execution and managed-config
-  restoration; `.nddev-cursor-cli/lock` is the cooperative same-user boundary
-  and target-root `0700` is the cross-user boundary.
+- Launch keeps a persistent `.nddev-cursor-cli/lock` file locked with
+  nonblocking `fcntl.flock` through child execution and managed-config
+  restoration. The lock parent plus executable/software parent directories are
+  `0500` during launch for ordinary same-UID unlink/replace denial.
+- The executable handoff is a write-protected verified-path handoff with
+  immediate inode and digest revalidation before subprocess start. It does not
+  claim portable fd execution or deliberate same-UID chmod resistance without a
+  sandbox.
 - The builder capability is projected as a local native Cursor plugin with
   rules, skills, and agents. This manager does not provision Cursor team
   marketplace state.
