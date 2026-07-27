@@ -1049,7 +1049,9 @@ def extract_cursor_runtime(archive: bytes) -> dict[str, Any]:
             if total_size > SOFTWARE_ARTIFACT_MAX_BYTES:
                 fail("Cursor artifact runtime tree exceeds the decompressed size limit")
             files[relative_name] = (content, mode)
-    missing = sorted(path.as_posix() for path in CURSOR_RUNTIME_REQUIRED_FILES - {Path(name) for name in files})
+    missing = sorted(
+        path.as_posix() for path in CURSOR_RUNTIME_REQUIRED_FILES - {Path(name) for name in files}
+    )
     if missing:
         fail(f"Cursor artifact runtime tree is missing required files: {missing}")
     runtime_sha256, runtime_size, runtime_file_count = runtime_tree_digest(files)
@@ -1074,26 +1076,26 @@ def managed_agent_launcher_bytes(target: Path) -> bytes:
     return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
-        "export CURSOR_INVOKED_AS=\"${0##*/}\"\n"
+        'export CURSOR_INVOKED_AS="${0##*/}"\n'
         f"SCRIPT_DIR={script_dir}\n"
-        "NODE_BIN=\"$SCRIPT_DIR/node\"\n"
-        "if [ -z \"${NODE_COMPILE_CACHE:-}\" ]; then\n"
-        "  if [[ \"${OSTYPE:-}\" == darwin* ]]; then\n"
-        "    export NODE_COMPILE_CACHE=\"$HOME/Library/Caches/cursor-compile-cache\"\n"
+        'NODE_BIN="$SCRIPT_DIR/node"\n'
+        'if [ -z "${NODE_COMPILE_CACHE:-}" ]; then\n'
+        '  if [[ "${OSTYPE:-}" == darwin* ]]; then\n'
+        '    export NODE_COMPILE_CACHE="$HOME/Library/Caches/cursor-compile-cache"\n'
         "  else\n"
-        "    export NODE_COMPILE_CACHE=\"${XDG_CACHE_HOME:-$HOME/.cache}/cursor-compile-cache\"\n"
+        '    export NODE_COMPILE_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cursor-compile-cache"\n'
         "  fi\n"
         "fi\n"
         "should_skip_system_ca() {\n"
-        "  case \"${AGENT_CLI_CREDENTIAL_STORE:-}\" in\n"
+        '  case "${AGENT_CLI_CREDENTIAL_STORE:-}" in\n'
         "    file) return 0 ;;\n"
         "  esac\n"
         "  return 1\n"
         "}\n"
-        "if ! should_skip_system_ca && \"$NODE_BIN\" --use-system-ca --version >/dev/null 2>&1; then\n"
-        "  exec -a \"$0\" \"$NODE_BIN\" --use-system-ca \"$SCRIPT_DIR/index.js\" \"$@\"\n"
+        'if ! should_skip_system_ca && "$NODE_BIN" --use-system-ca --version >/dev/null 2>&1; then\n'
+        '  exec -a "$0" "$NODE_BIN" --use-system-ca "$SCRIPT_DIR/index.js" "$@"\n'
         "fi\n"
-        "exec -a \"$0\" \"$NODE_BIN\" \"$SCRIPT_DIR/index.js\" \"$@\"\n"
+        'exec -a "$0" "$NODE_BIN" "$SCRIPT_DIR/index.js" "$@"\n'
     ).encode("utf-8")
 
 
@@ -1324,7 +1326,9 @@ def runtime_tree_identity_from_disk(root: Path) -> dict[str, Any] | None:
             max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
         )
         files[relative.as_posix()] = (content, mode)
-    missing = sorted(path.as_posix() for path in CURSOR_RUNTIME_REQUIRED_FILES - {Path(name) for name in files})
+    missing = sorted(
+        path.as_posix() for path in CURSOR_RUNTIME_REQUIRED_FILES - {Path(name) for name in files}
+    )
     if missing:
         return {
             "sha256": None,
