@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -135,8 +136,10 @@ REQUIRED_BUILDER_COMMANDS = {
 }
 BUILDER_ROOT_FILES = {"README.md"}
 BUILDER_COMPONENT_ROOTS = {".cursor-plugin", "agents", "commands", "rules", "skills"}
+EXPECTED_AGENTS_SHA256 = "fd1e7974c5815eff7489483af38a2e3dd4e68e492854957af1fc226f5a49f7bb"
 REQUIRED_ARCHIVE_ROOTS = {
     ".github",
+    "AGENTS.md",
     "CHANGELOG.md",
     "LICENSE",
     "README.md",
@@ -472,6 +475,28 @@ def validate_release_roots(errors: list[str]) -> None:
         for root in sorted(roots):
             if not (ROOT / root).exists():
                 errors.append(f".github/workflows/release.yml: {field} root missing: {root}")
+    runtime_roots = release_workflow_roots("runtime_paths", errors)
+    if "AGENTS.md" in runtime_roots:
+        errors.append(".github/workflows/release.yml: AGENTS.md must stay source-archive-only")
+
+
+def validate_agents_onboarding_contract(errors: list[str]) -> None:
+    path = ROOT / "AGENTS.md"
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        errors.append(f"AGENTS.md: unreadable: {exc}")
+        return
+    digest = hashlib.sha256(content).hexdigest()
+    if digest != EXPECTED_AGENTS_SHA256:
+        errors.append("AGENTS.md: exact onboarding bytes changed")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        errors.append(f"AGENTS.md: not UTF-8: {exc}")
+        return
+    if "GDS repository contract" in text or "GENERATED FILE - DO NOT EDIT DIRECTLY" in text:
+        errors.append("AGENTS.md: must not duplicate generated GDS policy")
 
 
 def load_manager(errors: list[str]) -> Any | None:
@@ -2192,6 +2217,7 @@ def main() -> int:
     validate_profiles(errors)
     validate_builder_toolkit(version, build_version, errors)
     validate_release_roots(errors)
+    validate_agents_onboarding_contract(errors)
     validate_public_manager_smokes(errors)
     validate_no_forbidden_public_paths(errors)
 
