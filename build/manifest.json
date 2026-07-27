@@ -1,25 +1,36 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "name": "nddev-cursor-cli-app",
-  "build_version": "0.1.0",
+  "build_version": "0.2.0",
   "entrypoint": "python3 cli-tools/nddev_cursor_cli.py",
-  "source_root": "setups",
-  "setup_ids": ["full-auto", "review", "safe"],
+  "source_roots": {
+    "setups": "setups",
+    "profiles": "profiles"
+  },
+  "content_setup_ids": ["nddev-builder"],
+  "profile_ids": ["full-auto", "safe"],
+  "default_content_setup_id": "nddev-builder",
+  "default_profile_id": "full-auto",
   "managed_files": [
     "cli-config.json",
     "NDDEV-CURSOR-CLI-SETUP.json"
   ],
   "command_policy": {
-    "json_supported": ["list", "status", "plan", "install", "switch", "restore", "remove", "software-status", "install-cli", "update-cli"],
+    "json_supported": ["list", "status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli"],
     "plan_mutates": false,
     "restore_backup_option": "--backup <0..9>",
-    "target_required": ["status", "plan", "install", "switch", "restore", "remove", "software-status", "install-cli", "update-cli", "launch"]
+    "target_required": ["status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "launch"]
   },
   "backup_policy": {
     "canonical_target_bound": true,
     "envelope": "NDDEV-CURSOR-CLI-BACKUP.json",
     "location": "sibling .<target-name>.nddev-cursor-cli-backups",
     "slots": 10
+  },
+  "legacy_policy": {
+    "readable_for": ["status", "migrate", "restore", "remove"],
+    "launch_denied": true,
+    "install_switch_denied": true
   },
   "runtime_compatibility": {
     "baseline_ref": "references/cursor-cli-baseline.json",
@@ -28,8 +39,9 @@
   "runtime_launch": {
     "command": "agent",
     "managed_command": "bin/agent",
-    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> <absolute-target>/bin/agent [args...]",
+    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> HOME=<absolute-target>/.nddev-cursor-home <absolute-target>/bin/agent [args...]",
     "environment_variable": "CURSOR_CONFIG_DIR",
+    "isolated_home": ".nddev-cursor-home",
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
     "json_manager_errors_supported": true,
@@ -37,6 +49,7 @@
     "managed_override_args_blocked": ["--approve-mcps", "--force", "-f", "--network", "--sandbox", "--skip-worktree-setup", "--trust", "--worktree", "-w", "--yolo", "acp", "install-shell-integration", "sandbox", "uninstall-shell-integration", "update", "worker"],
     "requires_clean_managed_target": true,
     "requires_current_target_owned_software": true,
+    "requires_non_legacy_setup_stamp": true,
     "path_fallback": false,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
@@ -65,19 +78,23 @@
     "status": "native-local-plugin-projection",
     "default_on": true,
     "plugin_manifest": "plugins/nddev-builder/.cursor-plugin/plugin.json",
-    "target_plugin_path": "plugins/local/nddev-builder",
-    "surfaces": ["plugin", "rules", "skills", "agents"],
+    "target_plugin_path": ".nddev-cursor-home/.cursor/plugins/local/nddev-builder",
+    "surfaces": ["plugin", "rules", "skills", "agents", "commands"],
+    "hooks_installed": false,
+    "mcp_servers_installed": false,
     "official_documentation": {
       "plugins": "https://cursor.com/docs/plugins",
       "plugins_reference": "https://cursor.com/docs/reference/plugins",
       "rules": "https://cursor.com/docs/rules",
       "skills": "https://cursor.com/docs/skills",
-      "agents": "https://cursor.com/docs/subagents"
+      "agents": "https://cursor.com/docs/subagents",
+      "hooks": "https://cursor.com/docs/hooks",
+      "mcp": "https://cursor.com/docs/mcp"
     },
     "marketplace": {
       "team_marketplace_supported_by_cursor": true,
       "module_installs_marketplace": false,
-      "reason": "The setup manager projects a local native Cursor plugin into the selected target; it does not provision Cursor team marketplace state."
+      "reason": "The setup manager projects a local native Cursor plugin into the launch-isolated target home; it does not provision Cursor team marketplace state."
     }
   },
   "transaction_policy": {

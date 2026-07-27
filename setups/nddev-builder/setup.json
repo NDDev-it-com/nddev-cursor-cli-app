@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "id": "nddev-builder",
+  "description": "Canonical NDDev builder content setup for isolated Cursor CLI targets.",
+  "managed_files": ["cli-config.json"],
+  "builder_projection": "default-on",
+  "plugin_id": "nddev-builder"
+}

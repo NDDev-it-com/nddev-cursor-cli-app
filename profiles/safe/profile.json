@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "safe",
+  "description": "Safe Cursor CLI profile with allowlisted commands, enabled sandboxing, and network access disabled.",
+  "permission_profile": "safe",
+  "managed_files": ["cli-config.json"],
+  "approval_mode": "allowlist",
+  "sandbox_mode": "enabled",
+  "network_access": "disabled"
+}

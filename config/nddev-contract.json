@@ -1,28 +1,41 @@
 {
-  "contract_version": 2,
+  "contract_version": 3,
   "product_name": "nddev-cursor-cli-app",
   "display_name": "NDDev Cursor CLI Setup Manager",
-  "description": "Portable, target-explicit manager for Cursor CLI configuration and a default-on native nddev-builder Cursor plugin projection.",
+  "description": "Portable, target-explicit manager for Cursor CLI configuration, target-owned Cursor Agent software, and a default-on native nddev-builder Cursor plugin projection.",
   "github_repository": "NDDev-it-com/nddev-cursor-cli-app",
   "license": "AGPL-3.0-or-later",
   "manifest_ref": "build/manifest.json",
   "version_ref": "build/version.json",
-  "source_root": "setups",
+  "source_roots": {
+    "setups": "setups",
+    "profiles": "profiles"
+  },
   "managed_state": {
     "managed_files": ["cli-config.json"],
     "managed_file_mode": "0600",
     "preserve_other_state": true,
     "preserve_unmanaged_config_keys": true,
     "stamp_file": "NDDEV-CURSOR-CLI-SETUP.json",
-    "stamp_schema": 1
+    "stamp_schema": 2
   },
   "setup_system": {
     "catalog_root": "setups",
-    "identity_source": "<setup>/setup.json:id",
+    "profile_root": "profiles",
+    "content_setup_ids": ["nddev-builder"],
+    "profile_ids": ["full-auto", "safe"],
+    "default_content_setup_id": "nddev-builder",
+    "default_profile_id": "full-auto",
+    "identity_source": "setups/<id>/setup.json:id and profiles/<id>/profile.json:id",
     "list_command": "python3 cli-tools/nddev_cursor_cli.py list [--json]",
-    "selection_option": "--setup <id>",
-    "setup_ids": ["full-auto", "review", "safe"],
-    "status_command": "python3 cli-tools/nddev_cursor_cli.py status --target <absolute-dir> [--json]"
+    "selection_options": ["--setup <id>", "--profile <id>"],
+    "status_command": "python3 cli-tools/nddev_cursor_cli.py status --target <absolute-dir> [--json]",
+    "migrate_command": "python3 cli-tools/nddev_cursor_cli.py migrate --target <absolute-dir> [--profile <id>] [--json]"
+  },
+  "legacy_policy": {
+    "readable_for": ["status", "migrate", "restore", "remove"],
+    "launch_denied": true,
+    "install_switch_denied": true
   },
   "runtime_compatibility": {
     "baseline_ref": "references/cursor-cli-baseline.json",
@@ -31,8 +44,9 @@
   "runtime_launch": {
     "command": "agent",
     "managed_command": "bin/agent",
-    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> <absolute-target>/bin/agent [args...]",
+    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> HOME=<absolute-target>/.nddev-cursor-home <absolute-target>/bin/agent [args...]",
     "environment_variable": "CURSOR_CONFIG_DIR",
+    "isolated_home": ".nddev-cursor-home",
     "forwards_arguments": true,
     "forwards_child_exit_code": true,
     "json_manager_errors_supported": true,
@@ -40,6 +54,7 @@
     "managed_override_args_blocked": ["--approve-mcps", "--force", "-f", "--network", "--sandbox", "--skip-worktree-setup", "--trust", "--worktree", "-w", "--yolo", "acp", "install-shell-integration", "sandbox", "uninstall-shell-integration", "update", "worker"],
     "requires_clean_managed_target": true,
     "requires_current_target_owned_software": true,
+    "requires_non_legacy_setup_stamp": true,
     "path_fallback": false,
     "streams_child_stdio": true,
     "successful_child_output_wrapped": false,
@@ -93,15 +108,17 @@
     "default_on": true,
     "installation": {
       "cache_owner": "nddev-cursor-cli-app",
-      "install_command": "python3 cli-tools/nddev_cursor_cli.py install --setup <id> --target <absolute-target> [--json]",
-      "native_local_plugin_path": "plugins/local/nddev-builder",
-      "orthogonal_to_setup_switching": false,
+      "install_command": "python3 cli-tools/nddev_cursor_cli.py install --target <absolute-target> [--profile <id>] [--json]",
+      "native_local_plugin_path": ".nddev-cursor-home/.cursor/plugins/local/nddev-builder",
+      "orthogonal_to_setup_switching": true,
       "plugin_manifest": "plugins/nddev-builder/.cursor-plugin/plugin.json",
       "preserved_on_switch_restore": true,
       "status_command": "python3 cli-tools/nddev_cursor_cli.py status --target <absolute-target> [--json]"
     },
     "official_documentation": {
       "agents": "https://cursor.com/docs/subagents",
+      "hooks": "https://cursor.com/docs/hooks",
+      "mcp": "https://cursor.com/docs/mcp",
       "plugins": "https://cursor.com/docs/plugins",
       "plugins_reference": "https://cursor.com/docs/reference/plugins",
       "rules": "https://cursor.com/docs/rules",
@@ -112,13 +129,15 @@
       "status": "unsupported-by-this-manager",
       "team_marketplace_supported_by_cursor": true
     },
-    "surfaces": ["plugin", "rules", "skills", "agents"]
+    "surfaces": ["plugin", "rules", "skills", "agents", "commands"],
+    "hooks_installed": false,
+    "mcp_servers_installed": false
   },
   "safety": {
     "absolute_target_required": true,
     "canonical_target_binding": true,
     "default_target": null,
-    "explicit_target_required": ["status", "plan", "install", "switch", "restore", "remove", "software-status", "install-cli", "update-cli", "launch"],
+    "explicit_target_required": ["status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "launch"],
     "max_backups": 10,
     "missing_target_argument_rejected": true,
     "new_target_mode": "0700",

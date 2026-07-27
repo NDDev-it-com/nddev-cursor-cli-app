@@ -1,7 +1,7 @@
 {
   "name": "nddev-builder",
-  "version": "0.1.0",
-  "description": "NDDev setup authoring guidance for Cursor Agent.",
+  "version": "0.2.0",
+  "description": "NDDev setup authoring guidance for isolated Cursor Agent targets.",
   "author": {
     "name": "NDDev"
   },
@@ -9,5 +9,6 @@
   "repository": "https://github.com/NDDev-it-com/nddev-cursor-cli-app",
   "rules": "./rules",
   "skills": "./skills",
-  "agents": "./agents"
+  "agents": "./agents",
+  "commands": "./commands"
 }

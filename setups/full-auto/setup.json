@@ -1,7 +1,0 @@
-{
-  "schema_version": 1,
-  "id": "full-auto",
-  "description": "Cursor CLI defaults for trusted isolated targets with unrestricted approval mode.",
-  "managed_files": ["cli-config.json"],
-  "builder_projection": "default-on"
-}

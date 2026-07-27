@@ -9,17 +9,8 @@
   },
   "notifications": true,
   "permissions": {
-    "allow": [
-      "Shell(cat)",
-      "Shell(git diff)",
-      "Shell(git status)",
-      "Shell(ls)",
-      "Shell(pwd)",
-      "Shell(test)"
-    ],
-    "deny": [
-      "Shell(sudo)"
-    ]
+    "allow": [],
+    "deny": []
   },
   "sandbox": {
     "mode": "disabled",

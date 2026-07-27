@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "full-auto",
+  "description": "Trusted isolated Cursor CLI profile with unrestricted approval, disabled sandboxing, and network access enabled.",
+  "permission_profile": "full-auto",
+  "managed_files": ["cli-config.json"],
+  "approval_mode": "unrestricted",
+  "sandbox_mode": "disabled",
+  "network_access": "enabled"
+}

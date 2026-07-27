@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "verified_ref": "references/cursor-cli-baseline.json",
-  "verified_date": "2026-07-26",
+  "verified_date": "2026-07-27",
   "release": {
     "id": "2026.07.23-e383d2b",
     "installer": "https://cursor.com/install",
