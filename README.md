@@ -20,31 +20,24 @@ permission profiles. The default profile is `full-auto`; `safe` is available for
 sandboxed allowlisted work. Legacy managed targets can be inspected, migrated,
 restored, or removed, but they are not launchable.
 
-New targets are created owner-private (`0700`) only under a real parent that is
-current-user-owned and not writable by group/other, or a sticky directory.
-Existing targets used for install, switch, migrate, restore, remove, software
-install/update, or launch must already be owned by the current user and mode
-`0700`; the manager reports `target:owner` or `target:mode` drift instead of
-silently changing existing root permissions. Lifecycle lock and backup state
-lives inside the target under `.nddev-cursor-cli/{locks,backups}`. The lock is
-a persistent current-user-owned `.nddev-cursor-cli/locks/target.lock` `0600`
-file held with nonblocking `fcntl.flock`; sibling `.nddev-*` lock or backup
-paths are ignored.
-Every target operation also acquires a persistent external bootstrap `flock`
-under the resolved fixed system temp root before target creation or inspection;
-its filename is the full SHA-256 of the product namespace plus canonical target.
-The external lock is released last and is not exposed to child processes.
-Existing target-local builder and runtime parent directories, including
-`.nddev-cursor-home`, `bin`, and `.nddev-software`, must also be real
-current-user-owned directories with mode `0700`; unsafe parents are reported as
-drift and block launch before a child process starts.
+Targets are explicit, owner-bound directories. The manager reports unsafe
+ownership, mode, symlink, hardlink, or parent drift instead of silently
+normalizing an existing target. It keeps cooperative lifecycle locks across
+mutating operations and launch cleanup, writes target-bound backups, and ignores
+legacy sibling control state. Exact path names, modes, lock binding, backup
+layout, and drift labels are code-owned by
+`cli-tools/nddev_cursor_cli.py` and summarized by `config/nddev-contract.json`,
+`build/manifest.json`, and `status --target <target> --json`.
+
+The lock model is a cooperative same-UID boundary for manager operations and a
+target-privacy boundary for other local users. It does not claim resistance to
+deliberate same-UID tampering without a sandbox.
 
 ## Software lifecycle
 
 The Cursor setup lifecycle and Cursor Agent runtime lifecycle are separate.
 `software-status`, `install-cli`, and `update-cli` manage a target-owned copy
-of the current Cursor Agent runtime package from the official Cursor artifact
-URL:
+of the pinned official Cursor Agent runtime package:
 
 ```bash
 python3 cli-tools/nddev_cursor_cli.py software-status --target /absolute/cursor-config --json
@@ -52,17 +45,14 @@ python3 cli-tools/nddev_cursor_cli.py install-cli --target /absolute/cursor-conf
 python3 cli-tools/nddev_cursor_cli.py update-cli --target /absolute/cursor-config --json
 ```
 
-Production installs use the pinned `https://cursor.com/install` release id
-`2026.07.23-e383d2b` and pinned SHA-256 digests for the official
-`downloads.cursor.com` artifacts. npm and pip install paths are not supported.
-`software-status` reports `present` and `presence` for target-owned software
-paths. `install-cli` requires absent software presence. `update-cli` requires
-existing software presence, can repair safe partial state such as a missing or
-mode-drifted identity stamp, and is an idempotent no-op when `software-status`
-reports `current=true`.
+Production installs use only the official pinned artifact described by
+`references/cursor-cli-baseline.json`, with release/runtime closure owned by
+`build/manifest.json` and enforced by `cli-tools/nddev_cursor_cli.py`. npm and
+pip install paths are not supported. Use `software-status --json` for the exact
+local software state, drift, and current/repair/no-op outcomes.
 
-`launch` runs `agent` with `CURSOR_CONFIG_DIR`, an isolated `HOME`, and a
-target-internal `TMPDIR` scoped only to the child process:
+`launch` runs Cursor Agent from the managed target with isolated runtime state
+scoped only to the child process:
 
 ```bash
 python3 cli-tools/nddev_cursor_cli.py launch --target /absolute/cursor-config -- -p "summarize"
@@ -73,23 +63,16 @@ forwarded. A second or later `--` is preserved as an intentional Cursor
 argument.
 
 `launch` requires a clean managed setup plus current target-owned software,
-executes a verified target-internal launch image, never falls back to `PATH`,
-and uses a fixed minimal child `PATH` of `/usr/bin:/bin`. The launcher uses
-`/bin/bash`, rejects Cursor flags or subcommands that would override the managed
-approval, sandbox, worktree, shell-integration, worker, or self-update
-lifecycle, and uses only the pinned target-owned runtime tree, including its
-bundled Node.js binary. The manager keeps the target lock through child
-execution and managed-config restoration. During launch it makes only
-`.nddev-cursor-cli/locks` and an ephemeral verified launch image
-read/execute-only (`0500`) for ordinary unlink/replace denial; the control
-root, backup pool, managed target root, isolated HOME, target-local TMPDIR,
-config/session paths, and installed runtime tree remain writable. It
-revalidates the launch-image executable inode and digest
-immediately before the subprocess handoff. This is not portable fd execution
-and does not claim resistance to deliberate same-UID chmod without a sandbox.
+blocks Cursor arguments that would override managed lifecycle boundaries, and
+restores managed config after the child exits or raises. Exact child
+environment, blocked arguments, executable verification, runtime write surface,
+and handoff mechanics are owned by `cli-tools/nddev_cursor_cli.py`; the public
+contract is summarized in `config/nddev-contract.json` and
+`build/manifest.json`.
 
 The setup/profile model also projects `nddev-builder` as a local native Cursor plugin
-under `.nddev-cursor-home/.cursor/plugins/local/nddev-builder` inside the
-selected target. The projection uses Cursor's plugin, rules, skills, custom
-agents, and commands surfaces. It does not activate hooks or MCP servers and
-does not provision Cursor team marketplaces.
+inside the selected target's isolated home. The projection uses Cursor's
+plugin, rules, skills, custom agents, and commands surfaces. It does not
+activate hooks or MCP servers and does not provision Cursor team marketplaces.
+Exact projection paths and installed surfaces are owned by
+`config/nddev-contract.json`, `build/manifest.json`, and `status --json`.

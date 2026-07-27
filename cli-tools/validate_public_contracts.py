@@ -2003,6 +2003,49 @@ def validate_no_forbidden_public_paths(errors: list[str]) -> None:
                     errors.append(f"{candidate.relative_to(ROOT)}: unsupported OS contract text")
 
 
+def validate_public_doc_hygiene(errors: list[str]) -> None:
+    docs = {
+        "README.md": ROOT / "README.md",
+        "docs/software-lifecycle.md": ROOT / "docs" / "software-lifecycle.md",
+    }
+    required_needles = (
+        "cli-tools/nddev_cursor_cli.py",
+        "config/nddev-contract.json",
+        "references/cursor-cli-baseline.json",
+        "build/manifest.json",
+        "status --target",
+        "software-status --target",
+        "--json",
+    )
+    volatile_needles = (
+        CURSOR_RELEASE_ID,
+        "downloads.cursor.com",
+        "`0700`",
+        "`0600`",
+        "`0500`",
+        ".nddev-cursor-cli/locks/target.lock",
+        ".nddev-cursor-runtime/tmp",
+        ".nddev-software/cursor-cli/versions/",
+        ".nddev-cursor-home/.cursor/plugins/local/nddev-builder",
+        "`/bin/bash`",
+        "`/usr/bin:/bin`",
+        "`Popen`",
+    )
+    for label, path in docs.items():
+        if not path.is_file():
+            errors.append(f"missing {label}")
+            continue
+        text = path.read_text(encoding="utf-8")
+        for needle in required_needles:
+            if needle not in text:
+                errors.append(f"{label}: missing source-owner pointer {needle}")
+        for needle in volatile_needles:
+            if needle in text:
+                errors.append(f"{label}: copies volatile source-owned fact {needle}")
+        if "same-UID" not in text:
+            errors.append(f"{label}: missing same-UID boundary note")
+
+
 def main() -> int:
     errors: list[str] = []
     build_version = load_build_version(errors)
@@ -2010,7 +2053,6 @@ def main() -> int:
     manifest = load_json("build/manifest.json", errors)
     contract = load_json("config/nddev-contract.json", errors)
     baseline = load_json("references/cursor-cli-baseline.json", errors)
-    docs = ROOT / "docs" / "software-lifecycle.md"
 
     if version is not None:
         missing = REQUIRED_VERSION_KEYS - set(version)
@@ -2234,25 +2276,11 @@ def main() -> int:
         if install.get("npm") is not None or install.get("pip") is not None:
             errors.append("references/cursor-cli-baseline.json: software_install must not use npm/pip")
 
-    if not docs.is_file():
-        errors.append("missing docs/software-lifecycle.md")
-    else:
-        text = docs.read_text(encoding="utf-8")
-        for needle in (
-            "install-cli",
-            "update-cli",
-            "software-status",
-            "bin/agent",
-            CURSOR_RELEASE_ID,
-            BUILDER_TARGET_PATH,
-        ):
-            if needle not in text:
-                errors.append(f"docs/software-lifecycle.md: missing {needle}")
-
     validate_profiles(errors)
     validate_builder_toolkit(version, build_version, errors)
     validate_release_roots(errors)
     validate_agents_onboarding_contract(errors)
+    validate_public_doc_hygiene(errors)
     validate_public_manager_smokes(errors)
     validate_no_forbidden_public_paths(errors)
 

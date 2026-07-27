@@ -7,113 +7,64 @@ caller home, system prefix, npm global prefix, or pip environment.
 ## Commands
 
 - `software-status --target <absolute-target>` is read-only and reports
-  `present`/`presence` for target-owned software paths.
+  target-owned software state without executing Cursor.
 - `install-cli --target <absolute-target>` installs only when managed software
   presence is absent.
 - `update-cli --target <absolute-target>` requires existing target-owned
-  software presence. It can repair safe partial state such as a missing,
-  malformed, or mode-drifted identity stamp; symlink, hardlink, and wrong-type
-  paths fail closed before artifact reads.
-  If the target is already current, it returns an idempotent no-op without downloading.
+  software presence. It can repair safe partial state and is an idempotent
+  no-op when the target is already current.
 - `launch --target <absolute-target> -- ...` requires both a clean setup stamp
-  and current target-owned software, then executes a verified target-internal
-  launch image built from the managed runtime.
-  It rejects Cursor flags or subcommands that would override the managed
-  approval, sandbox, worktree, shell-integration, worker, or self-update
-  lifecycle. Legacy setup stamps must be migrated or removed before launch.
-  The child receives a target-internal `TMPDIR` at
-  `.nddev-cursor-runtime/tmp`; ambient `TMPDIR` is not inherited.
+  and current target-owned software, then executes the managed runtime with
+  isolated child state.
+  It rejects Cursor arguments that would override managed lifecycle boundaries.
+  Legacy setup stamps must be migrated or removed before launch.
 
-Initial target creation is allowed only under a real parent directory that is
-current-user-owned and not writable by group/other, or sticky. Existing targets
-used by mutating commands, restore, remove, migrate, software install/update, or
-launch must already be current-user-owned real directories with mode `0700`.
-Read-only status surfaces report `target:owner` or `target:mode` drift; the
-manager does not silently chmod an existing target root.
-Existing target-local builder and runtime parent directories, including
-`.nddev-cursor-home`, `bin`, and `.nddev-software`, are validated
-component-by-component as real current-user-owned `0700` directories. Unsafe
-parents are reported as drift, are not chmodded through symlinks, and block
-launch before a child process starts.
+Exact status fields, drift labels, target path requirements, backup/control
+layout, lock binding, child environment, blocked argument set, and launch
+handoff are intentionally not duplicated here. The executable owner is
+`cli-tools/nddev_cursor_cli.py`; machine-readable public contract summaries
+live in `config/nddev-contract.json` and `build/manifest.json`. For a concrete
+target, use `status --target <absolute-target> --json` and
+`software-status --target <absolute-target> --json`.
 
-Lifecycle control state is target-internal under `.nddev-cursor-cli/`: active
-locks use a persistent `.nddev-cursor-cli/locks/target.lock` file held with
-nonblocking `fcntl.flock` on an `O_NOFOLLOW` current-user-owned `0600`
-descriptor, and backups use
-`.nddev-cursor-cli/backups/<slot>/NDDEV-CURSOR-CLI-BACKUP.json`. Those
-directories must be real, current-user-owned, and mode `0700`; backup envelopes
-must be regular current-user-owned `0600` files without hard-link aliases.
-Sibling `.nddev-*` lock or backup paths are ignored. While any internal lock is
-held, only `.nddev-cursor-cli/locks` is `0500`, which lets later managers
-traverse to the lock file but denies ordinary child cleanup from unlinking it.
-The broader `.nddev-cursor-cli` control root and backup pool remain writable
-for manager-owned cleanup and state. A later manager safely recovers the lock
-directory mode after a parent crash once the flock is no longer held. The
-target-internal lock is the cooperative same-user boundary for manager
-operations, while target-root `0700` is the cross-user boundary.
-
-An authoritative external bootstrap lock is acquired before target creation or
-inspection and held until the full operation, child cleanup, and internal lock
-release finish. It lives outside the target and target parent under the resolved
-fixed system temp root, such as macOS `/private/tmp` or Ubuntu `/tmp`, in a real
-sticky system directory and a current-user-owned `0700` product root. The
-persistent `0600` lock filename includes the product namespace and full SHA-256
-of `product-name + NUL + canonical absolute target`, and the JSON payload is
-bound to that same product/target digest. The manager acquires the external lock first, the internal
-target lock second, releases the internal lock first, and releases the external
-lock last. The file is never unlinked on normal release, setup remove, or failed
-target creation; crash recovery relies on kernel `flock` release while the same
-inode and path remain. Deliberate same-UID tampering with the bootstrap root is
-outside the no-sandbox boundary.
+The lifecycle guarantee is cooperative: manager operations use target-bound
+state and lifecycle locks to avoid racing other well-behaved manager processes,
+including launch cleanup and managed-config restoration. Target privacy protects
+against other local users according to the current contract, but this is a
+no-sandbox same-UID boundary. It does not claim resistance to deliberate
+same-user tampering outside the manager.
 
 ## Source and integrity
 
-The current official release id is `2026.07.23-e383d2b`, as used by
-`https://cursor.com/install`. Production installs use only the corresponding
-`https://downloads.cursor.com/lab/2026.07.23-e383d2b/{os}/{arch}/agent-cli-package.tar.gz`
-artifacts. The exact SHA-256 and size for each supported macOS/Linux artifact
-are pinned in `references/cursor-cli-baseline.json`.
+Production installs use only the pinned official Cursor artifact described by
+`references/cursor-cli-baseline.json`. That baseline owns the current official
+release id, artifact URLs, supported platform artifact map, sizes, and SHA-256
+digests. `build/manifest.json` owns the runtime closure published with this
+module version.
 
 ## Archive safety and rollback
 
-The archive reader never extracts an artifact wholesale. It streams only the
-official `dist-package/` runtime tree, requires `cursor-agent`, `node`, and
-`index.js`, normalizes target-owned file modes, and rejects absolute paths,
-parent traversal, drive-qualified paths, NUL paths, symlink, hardlink, device,
-duplicate, group/world-writable, special-mode, and oversize members.
+The archive reader is bounded and fail-closed, and updates stage a complete
+target-owned runtime before an atomic swap. On failure, the manager restores the
+previous target-owned software state. Exact member allowlists, runtime
+inventory, file modes, launcher implementation, path policy, rollback state, and
+handoff verification are owned by `cli-tools/nddev_cursor_cli.py` and summarized
+by `config/nddev-contract.json`, `build/manifest.json`, and
+`software-status --json`.
 
-Updates stage a complete version tree under
-`.nddev-software/cursor-cli/versions/2026.07.23-e383d2b/` and then atomically
-rename it into place. On failure, the manager restores the previous version
-tree, `bin/agent`, and `NDDEV-CURSOR-CLI-SOFTWARE.json`. The installed
-`bin/agent` is a target-owned launcher that executes the pinned target-owned
-runtime tree through `/bin/bash`, including its bundled `node`; launch never
-falls back to a live or system Node.js binary and uses a fixed child `PATH` of
-`/usr/bin:/bin`.
-
-Cursor `--version` and `--help` can write target-local runtime/process state and
-can rewrite managed config defaults even when no login is attempted. Manager
-`launch` keeps the target lock from preflight through child execution and
-managed-config restoration. While the child runs, only
-`.nddev-cursor-cli/locks` and an ephemeral verified launch image are `0500` so
-ordinary unlink/replace attempts against the lock and actual executable fail.
-The broader control root, backup pool, managed target root, isolated HOME,
-`.nddev-cursor-runtime/tmp`, config/session paths, and installed runtime tree
-stay writable for expected Cursor state. The manager then revalidates the
-launch-image executable inode and digest immediately before `Popen`, restores
-the selected setup's managed config keys while preserving unowned config keys,
-and treats only safe target-owned `.running` runtime state as ephemeral
-status-neutral state. This is a write-protected verified-path handoff under a
-no-sandbox same-UID boundary, not portable fd execution; a deliberate same-UID
-chmod is outside the claimed boundary.
+Cursor commands can write target-local runtime/process state and can rewrite
+managed config defaults even when no login is attempted. Manager `launch`
+therefore keeps lifecycle protection through child execution and restores the
+selected setup's managed config keys while preserving unowned config keys. Use
+the manager's JSON status commands for the exact status-neutral runtime state
+rules.
 
 ## Builder plugin projection
 
 The setup manager projects the public `nddev-builder` toolkit as a native local
-Cursor plugin under the launch-isolated home:
-
-`.nddev-cursor-home/.cursor/plugins/local/nddev-builder`
-
-The toolkit includes rules, Agent Skills with routed references and validation
-scripts, custom agents, and commands. It does not install hook definitions, MCP
-server definitions, live credentials, or marketplace state.
+Cursor plugin under the launch-isolated home. The toolkit includes rules, Agent
+Skills with routed references and validation scripts, custom agents, and
+commands. It does not install hook definitions, MCP server definitions, live
+credentials, or marketplace state. Exact projection paths and installed surface
+lists are owned by `config/nddev-contract.json`, `build/manifest.json`, and
+`status --json`.
