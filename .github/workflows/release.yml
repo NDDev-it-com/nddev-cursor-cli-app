@@ -24,8 +24,8 @@ jobs:
       version: ${{ github.ref_name }}
       package_name: nddev-cursor-cli-app
       archive_paths: >-
-        AGENTS.md README.md LICENSE VERSION CHANGELOG.md SECURITY.md .github build
-        cli-tools config docs plugins profiles references setups
+        AGENTS.md .claude README.md LICENSE VERSION CHANGELOG.md SECURITY.md
+        .github build cli-tools config docs plugins profiles references setups
       runtime_paths: >-
-        README.md LICENSE VERSION build cli-tools config plugins profiles
-        references setups
+        AGENTS.md .claude README.md LICENSE VERSION build cli-tools config
+        plugins profiles references setups

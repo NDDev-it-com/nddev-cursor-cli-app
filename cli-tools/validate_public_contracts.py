@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import importlib.util
 import json
 import os
@@ -136,9 +135,9 @@ REQUIRED_BUILDER_COMMANDS = {
 }
 BUILDER_ROOT_FILES = {"README.md"}
 BUILDER_COMPONENT_ROOTS = {".cursor-plugin", "agents", "commands", "rules", "skills"}
-EXPECTED_AGENTS_SHA256 = "fd1e7974c5815eff7489483af38a2e3dd4e68e492854957af1fc226f5a49f7bb"
 REQUIRED_ARCHIVE_ROOTS = {
     ".github",
+    ".claude",
     "AGENTS.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -155,6 +154,8 @@ REQUIRED_ARCHIVE_ROOTS = {
     "setups",
 }
 REQUIRED_RUNTIME_ROOTS = {
+    ".claude",
+    "AGENTS.md",
     "LICENSE",
     "README.md",
     "VERSION",
@@ -476,20 +477,26 @@ def validate_release_roots(errors: list[str]) -> None:
             if not (ROOT / root).exists():
                 errors.append(f".github/workflows/release.yml: {field} root missing: {root}")
     runtime_roots = release_workflow_roots("runtime_paths", errors)
-    if "AGENTS.md" in runtime_roots:
-        errors.append(".github/workflows/release.yml: AGENTS.md must stay source-archive-only")
+    for root in ("AGENTS.md", ".claude"):
+        if root not in runtime_roots:
+            errors.append(f".github/workflows/release.yml: runtime_paths missing {root}")
 
 
 def validate_agents_onboarding_contract(errors: list[str]) -> None:
     path = ROOT / "AGENTS.md"
     try:
+        info = path.lstat()
+    except OSError as exc:
+        errors.append(f"AGENTS.md: cannot lstat: {exc}")
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        errors.append("AGENTS.md: must be a real regular file")
+        return
+    try:
         content = path.read_bytes()
     except OSError as exc:
         errors.append(f"AGENTS.md: unreadable: {exc}")
         return
-    digest = hashlib.sha256(content).hexdigest()
-    if digest != EXPECTED_AGENTS_SHA256:
-        errors.append("AGENTS.md: exact onboarding bytes changed")
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -497,6 +504,34 @@ def validate_agents_onboarding_contract(errors: list[str]) -> None:
         return
     if "GDS repository contract" in text or "GENERATED FILE - DO NOT EDIT DIRECTLY" in text:
         errors.append("AGENTS.md: must not duplicate generated GDS policy")
+    bridge_root = ROOT / ".claude"
+    try:
+        bridge_root_info = bridge_root.lstat()
+    except OSError as exc:
+        errors.append(f".claude: cannot lstat: {exc}")
+        return
+    if stat.S_ISLNK(bridge_root_info.st_mode) or not stat.S_ISDIR(bridge_root_info.st_mode):
+        errors.append(".claude: must be a real directory")
+        return
+    entries = sorted(path.name for path in bridge_root.iterdir())
+    if entries != ["CLAUDE.md"]:
+        errors.append(f".claude: entries must be exactly ['CLAUDE.md'], got {entries}")
+    bridge = bridge_root / "CLAUDE.md"
+    try:
+        bridge_info = bridge.lstat()
+    except OSError as exc:
+        errors.append(f".claude/CLAUDE.md: cannot lstat: {exc}")
+        return
+    if stat.S_ISLNK(bridge_info.st_mode) or not stat.S_ISREG(bridge_info.st_mode):
+        errors.append(".claude/CLAUDE.md: must be a real regular file")
+        return
+    try:
+        bridge_content = bridge.read_bytes()
+    except OSError as exc:
+        errors.append(f".claude/CLAUDE.md: unreadable: {exc}")
+        return
+    if bridge_content != b"@../AGENTS.md\n":
+        errors.append(".claude/CLAUDE.md: exact import bytes mismatch")
 
 
 def load_manager(errors: list[str]) -> Any | None:
