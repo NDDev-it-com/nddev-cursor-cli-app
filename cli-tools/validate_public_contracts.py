@@ -46,9 +46,10 @@ BOOTSTRAP_PUBLICATION = (
 READ_ONLY_ANCHOR_COMMANDS = ["status", "plan", "software-status"]
 CLEANUP_PENDING_PATH = ".nddev-cursor-cli/cleanup-pending"
 CLEANUP_PENDING_JOURNAL = ".nddev-cursor-cli/cleanup-pending/journal.json"
+CLEANUP_PENDING_INTENT = ".nddev-cursor-cli/cleanup-pending/intent.json"
 CLEANUP_JOURNAL_MAX_BYTES = 2 * 1024 * 1024
 CLEANUP_PENDING_SEMANTICS = (
-    "immutable schema-1 cleanup journal with identity-bound relative tombstones; "
+    "schema-1 cleanup journal plus durable pre-move intent with fixed-anchor relative sources; "
     "read-only validates and reports cleanup_pending without mutation; mutations drain before "
     "active changes; malformed or orphaned cleanup state fails closed"
 )
@@ -59,8 +60,8 @@ LAUNCH_IMAGE_MAX_COUNT = 8
 LAUNCH_IMAGE_MAX_TOTAL_SIZE = 300 * 1024 * 1024
 LAUNCH_IMAGE_RESIDUE_SEMANTICS = (
     "read-only status validates and exposes active/stale lease-bound images without mutation; "
-    "mutations drain stale images through cleanup-pending before active work and fail closed "
-    "while a lease is active"
+    "mutations drain stale images with bounded no-follow cleanup before active work and fail "
+    "closed while a lease is active"
 )
 SOFTWARE_PRESENCE_SIGNAL = (
     "software-status JSON exposes present=true and presence entries for "
@@ -1184,6 +1185,10 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         "fail_if_orphaned_canonical_anchor",
         "cleanup_pending_root",
         "cleanup_journal_path",
+        "cleanup_intent_path",
+        "cleanup_source_descriptor",
+        "cleanup_source_from_descriptor",
+        "recover_cleanup_publication_stage",
         "CLEANUP_JOURNAL_MAX_BYTES",
         "publish_cleanup_pending",
         "drain_cleanup_pending",
@@ -3513,6 +3518,8 @@ def main() -> int:
             errors.append("build/manifest.json: cleanup pending path mismatch")
         if transaction.get("cleanup_pending_journal") != CLEANUP_PENDING_JOURNAL:
             errors.append("build/manifest.json: cleanup pending journal mismatch")
+        if transaction.get("cleanup_pending_intent") != CLEANUP_PENDING_INTENT:
+            errors.append("build/manifest.json: cleanup pending intent mismatch")
         if transaction.get("cleanup_journal_max_bytes") != CLEANUP_JOURNAL_MAX_BYTES:
             errors.append("build/manifest.json: cleanup journal max bytes mismatch")
         if transaction.get("cleanup_pending_semantics") != CLEANUP_PENDING_SEMANTICS:
@@ -3642,6 +3649,8 @@ def main() -> int:
             errors.append("config/nddev-contract.json: cleanup pending path mismatch")
         if safety.get("cleanup_pending_journal") != CLEANUP_PENDING_JOURNAL:
             errors.append("config/nddev-contract.json: cleanup pending journal mismatch")
+        if safety.get("cleanup_pending_intent") != CLEANUP_PENDING_INTENT:
+            errors.append("config/nddev-contract.json: cleanup pending intent mismatch")
         if safety.get("cleanup_journal_max_bytes") != CLEANUP_JOURNAL_MAX_BYTES:
             errors.append("config/nddev-contract.json: cleanup journal max bytes mismatch")
         if safety.get("cleanup_pending_semantics") != CLEANUP_PENDING_SEMANTICS:

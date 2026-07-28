@@ -117,7 +117,7 @@
     "launch_image_mode_while_launching": "0500",
     "launch_image_max_count": 8,
     "launch_image_max_total_size": 314572800,
-    "launch_image_residue_semantics": "read-only status validates and exposes active/stale lease-bound images without mutation; mutations drain stale images through cleanup-pending before active work and fail closed while a lease is active",
+    "launch_image_residue_semantics": "read-only status validates and exposes active/stale lease-bound images without mutation; mutations drain stale images with bounded no-follow cleanup before active work and fail closed while a lease is active",
     "exec_handoff_revalidation": "verified launch-image executable inode and digest immediately before subprocess",
     "exec_handoff_boundary": "write-protected verified-path handoff with child-held launch-image lease fd under no-sandbox same-UID limits; no portable fd execution claimed"
   },
@@ -197,8 +197,9 @@
     "read_only_orphan_canonical_anchor": "fail-closed",
     "cleanup_pending_path": ".nddev-cursor-cli/cleanup-pending",
     "cleanup_pending_journal": ".nddev-cursor-cli/cleanup-pending/journal.json",
+    "cleanup_pending_intent": ".nddev-cursor-cli/cleanup-pending/intent.json",
     "cleanup_journal_max_bytes": 2097152,
-    "cleanup_pending_semantics": "immutable schema-1 cleanup journal with identity-bound relative tombstones; read-only validates and reports cleanup_pending without mutation; mutations drain before active changes; malformed or orphaned cleanup state fails closed",
+    "cleanup_pending_semantics": "schema-1 cleanup journal plus durable pre-move intent with fixed-anchor relative sources; read-only validates and reports cleanup_pending without mutation; mutations drain before active changes; malformed or orphaned cleanup state fails closed",
     "mutable_runtime_tmp": ".nddev-cursor-runtime/tmp"
   }
 }

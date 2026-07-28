@@ -52,6 +52,7 @@ BACKUP_RETIRED_PREFIX = ".slot-retired-"
 BACKUP_CLEANUP_PREFIX = ".slot-cleanup-"
 CLEANUP_STAGE_PREFIX = ".cleanup-stage-"
 CLEANUP_JOURNAL_NAME = "journal.json"
+CLEANUP_INTENT_NAME = "intent.json"
 CLEANUP_TOMBSTONES_NAME = "tombstones"
 CLEANUP_SCHEMA_VERSION = 1
 CLEANUP_MAX_TOMBSTONES = 8
@@ -322,12 +323,46 @@ CLEANUP_ENTRY_KEYS_V1 = {
     "kind",
     "uid",
     "mode",
+    "cleanup_mode",
     "nlink",
     "device",
     "inode",
     "size",
     "mtime_ns",
     "sha256",
+    "link_target",
+    "rdev",
+}
+CLEANUP_INTENT_KEYS_V1 = {
+    "schema_version",
+    "product_name",
+    "build_version",
+    "canonical_target",
+    "cleanup_parent",
+    "stage_name",
+    "move_count",
+    "moves",
+}
+CLEANUP_INTENT_MOVE_KEYS_V1 = {
+    "name",
+    "source",
+    "destination",
+    "tombstone",
+}
+CLEANUP_INTENT_SOURCE_KEYS_V1 = {
+    "anchor",
+    "kind",
+    "parent",
+    "relative",
+}
+CLEANUP_INTENT_PARENT_KEYS_V1 = {
+    "uid",
+    "mode",
+    "nlink",
+    "device",
+    "inode",
+    "size",
+    "mtime_ns",
 }
 _BOOTSTRAP_LOCKS: dict[str, dict[str, Any]] = {}
 _BOOTSTRAP_STATE_LOCK = threading.RLock()
@@ -1764,9 +1799,10 @@ def with_mutation_bootstrap_target(
         target_entered = True
         product_context.__exit__(None, None, None)
         product_context = None
+        cleanup_recovered = recover_cleanup_publication_stages(target)
         cleanup_drained = drain_cleanup_pending(target, fail_closed=True)
         launch_images_drained = drain_launch_image_residue(target, fail_closed=True)
-        cleanup_drained = cleanup_drained or launch_images_drained
+        cleanup_drained = cleanup_recovered or cleanup_drained or launch_images_drained
         result = function(target, *args, **kwargs)
         if isinstance(result, dict):
             result.setdefault("cleanup_drained", cleanup_drained)
@@ -2302,6 +2338,10 @@ def cleanup_journal_path(target: Path) -> Path:
     return cleanup_pending_root(target) / CLEANUP_JOURNAL_NAME
 
 
+def cleanup_intent_path(stage: Path) -> Path:
+    return stage / CLEANUP_INTENT_NAME
+
+
 def cleanup_journal_temp_path(journal: Path) -> Path:
     return journal.with_name(
         f".{journal.name}.nddev-cleanup-tmp.{os.getpid()}.{time.time_ns()}"
@@ -2332,7 +2372,14 @@ def require_cleanup_name(name: str, label: str) -> str:
     return name
 
 
-def cleanup_tree_manifest(root: Path, name: str, label: str) -> dict[str, Any]:
+def cleanup_tree_manifest(
+    root: Path,
+    name: str,
+    label: str,
+    *,
+    allow_mutable_modes: bool = False,
+    allow_links_and_special: bool = False,
+) -> dict[str, Any]:
     require_cleanup_name(name, label)
     if not path_exists_no_follow(root):
         cleanup_metadata_error(f"{label} is missing")
@@ -2351,23 +2398,33 @@ def cleanup_tree_manifest(root: Path, name: str, label: str) -> dict[str, Any]:
             "kind": "",
             "uid": info.st_uid,
             "mode": mode,
+            "cleanup_mode": None,
             "nlink": info.st_nlink,
             "device": info.st_dev,
             "inode": info.st_ino,
             "size": info.st_size,
             "mtime_ns": info.st_mtime_ns,
             "sha256": None,
+            "link_target": None,
+            "rdev": None,
         }
         if stat.S_ISLNK(info.st_mode):
-            cleanup_metadata_error(f"{label} must not contain symlinks: {relative}")
-        if stat.S_ISDIR(info.st_mode):
-            if mode != OWNER_DIRECTORY_MODE:
+            if not allow_links_and_special:
+                cleanup_metadata_error(f"{label} must not contain symlinks: {relative}")
+            record["kind"] = "symlink"
+            record["link_target"] = os.readlink(path)
+        elif stat.S_ISDIR(info.st_mode):
+            if mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+                cleanup_metadata_error(f"{label} directory has special mode bits: {relative}")
+            if not allow_mutable_modes and mode != OWNER_DIRECTORY_MODE:
                 cleanup_metadata_error(f"{label} directory mode mismatch: {relative}")
             record["kind"] = "dir"
         elif stat.S_ISREG(info.st_mode):
-            if info.st_nlink != 1:
+            if info.st_nlink != 1 and not allow_links_and_special:
                 cleanup_metadata_error(f"{label} file has hard-link aliases: {relative}")
-            if mode not in {OWNER_FILE_MODE, OWNER_EXEC_MODE}:
+            if mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+                cleanup_metadata_error(f"{label} file has special mode bits: {relative}")
+            if not allow_mutable_modes and mode not in {OWNER_FILE_MODE, OWNER_EXEC_MODE}:
                 cleanup_metadata_error(f"{label} file mode mismatch: {relative}")
             content = read_regular_file(
                 path, f"{label} file {relative}", max_bytes=CLEANUP_MAX_TOTAL_SIZE
@@ -2379,7 +2436,12 @@ def cleanup_tree_manifest(root: Path, name: str, label: str) -> dict[str, Any]:
             record["size"] = len(content)
             record["sha256"] = sha256_bytes(content)
         else:
-            cleanup_metadata_error(f"{label} contains unsupported object: {relative}")
+            if not allow_links_and_special:
+                cleanup_metadata_error(f"{label} contains unsupported object: {relative}")
+            record["kind"] = "special"
+            record["rdev"] = getattr(info, "st_rdev", 0)
+        if allow_mutable_modes and record["kind"] == "dir" and mode != OWNER_DIRECTORY_MODE:
+            record["cleanup_mode"] = OWNER_DIRECTORY_MODE
         entries.append(record)
         if len(entries) > CLEANUP_MAX_ENTRIES:
             cleanup_metadata_error(f"{label} exceeds cleanup entry bound")
@@ -2427,6 +2489,332 @@ def cleanup_journal_bytes(target: Path, tombstones: list[dict[str, Any]]) -> byt
     if len(content) > CLEANUP_JOURNAL_MAX_BYTES:
         cleanup_metadata_error("cleanup journal exceeds serialized size bound")
     return content
+
+
+def cleanup_intent_bytes(
+    target: Path,
+    stage: Path,
+    active_sources: list[tuple[Path, str]],
+    tombstones: list[dict[str, Any]],
+) -> bytes:
+    if len(active_sources) != len(tombstones):
+        cleanup_metadata_error("cleanup intent source count mismatch")
+    moves = []
+    for (source, name), tombstone in zip(active_sources, tombstones):
+        if tombstone["name"] != name:
+            cleanup_metadata_error("cleanup intent tombstone name mismatch")
+        moves.append(
+            {
+                "name": name,
+                "source": cleanup_source_descriptor(target, source),
+                "destination": f"{CLEANUP_TOMBSTONES_NAME}/{name}",
+                "tombstone": tombstone,
+            }
+        )
+    content = canonical_json(
+        {
+            "schema_version": CLEANUP_SCHEMA_VERSION,
+            "product_name": PRODUCT_NAME,
+            "build_version": VERSION,
+            "canonical_target": str(target.resolve(strict=False)),
+            "cleanup_parent": CONTROL_CLEANUP_PENDING_NAME,
+            "stage_name": stage.name,
+            "move_count": len(moves),
+            "moves": moves,
+        }
+    )
+    if len(content) > CLEANUP_JOURNAL_MAX_BYTES:
+        cleanup_metadata_error("cleanup intent exceeds serialized size bound")
+    return content
+
+
+def cleanup_tree_identity_matches(root: Path, tombstone: dict[str, Any], label: str) -> bool:
+    if not path_exists_no_follow(root):
+        return False
+    entries = cleanup_entry_map(tombstone)
+    expected = set(entries)
+    actual = current_snapshot_paths(root)
+    if actual != expected:
+        return False
+    for relative, entry in entries.items():
+        path = root if relative == "." else root / safe_relative(relative)
+        if not cleanup_entry_matches(path, entry, f"{label} {relative}"):
+            return False
+    return True
+
+
+def cleanup_source_descriptor(target: Path, source: Path) -> dict[str, Any]:
+    anchors: tuple[tuple[str, Path, tuple[tuple[str, str], ...]], ...] = (
+        (
+            "control-root",
+            control_root(target),
+            (
+                ("managed-transaction", MANAGED_TRANSACTION_PREFIX),
+                ("software-remove-rollback", SOFTWARE_REMOVE_ROLLBACK_PREFIX),
+            ),
+        ),
+        (
+            "backup-pool",
+            backup_pool(target),
+            (("backup-retired-slot", BACKUP_RETIRED_PREFIX),),
+        ),
+        (
+            "software-versions",
+            software_root(target) / "versions",
+            (("software-install-rollback", ".rollback-"),),
+        ),
+    )
+    for anchor, root, kinds in anchors:
+        try:
+            relative = source.relative_to(root)
+        except ValueError:
+            continue
+        if len(relative.parts) != 1:
+            continue
+        name = relative.as_posix()
+        for kind, prefix in kinds:
+            if name.startswith(prefix):
+                return {
+                    "anchor": anchor,
+                    "kind": kind,
+                    "parent": cleanup_parent_identity(source.parent, "cleanup source parent"),
+                    "relative": name,
+                }
+    cleanup_metadata_error("cleanup source is outside declared manager-owned anchors")
+
+
+def cleanup_parent_identity(path: Path, label: str) -> dict[str, int]:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        cleanup_metadata_error(f"{label} must be a real directory")
+    uid = current_user_id()
+    if uid is not None and info.st_uid != uid:
+        cleanup_metadata_error(f"{label} must be owned by the current user")
+    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+        cleanup_metadata_error(f"{label} must have mode 0700")
+    return {
+        "uid": info.st_uid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "nlink": info.st_nlink,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+    }
+
+
+def validate_cleanup_parent_identity(path: Path, expected: Any, label: str) -> None:
+    if not isinstance(expected, dict):
+        cleanup_metadata_error(f"{label} identity must be an object")
+    require_exact_keys(expected, CLEANUP_INTENT_PARENT_KEYS_V1, f"{label} identity")
+    current = cleanup_parent_identity(path, label)
+    stable_keys = ("uid", "mode", "device", "inode")
+    for key in stable_keys:
+        if current[key] != expected[key]:
+            cleanup_metadata_error(f"{label} identity mismatch")
+
+
+def restore_cleanup_parent_metadata(path: Path, expected: dict[str, Any], label: str) -> None:
+    validate_cleanup_parent_identity(path, expected, label)
+    os.chmod(path, int(expected["mode"]))
+    os.utime(path, ns=(int(expected["mtime_ns"]), int(expected["mtime_ns"])), follow_symlinks=False)
+    current = cleanup_parent_identity(path, label)
+    for key in ("uid", "mode", "device", "inode", "mtime_ns"):
+        if current[key] != expected[key]:
+            cleanup_metadata_error(f"{label} metadata restore failed")
+
+
+def cleanup_source_anchor(target: Path, anchor: str) -> Path:
+    if anchor == "control-root":
+        return control_root(target)
+    if anchor == "backup-pool":
+        return backup_pool(target)
+    if anchor == "software-versions":
+        return software_root(target) / "versions"
+    cleanup_metadata_error("cleanup source anchor is invalid")
+
+
+def cleanup_source_from_descriptor(target: Path, descriptor: Any) -> Path:
+    if not isinstance(descriptor, dict):
+        cleanup_metadata_error("cleanup source descriptor must be an object")
+    require_exact_keys(descriptor, CLEANUP_INTENT_SOURCE_KEYS_V1, "cleanup source descriptor")
+    anchor = str(descriptor["anchor"])
+    kind = str(descriptor["kind"])
+    relative = safe_relative(str(descriptor["relative"]))
+    if len(relative.parts) != 1:
+        cleanup_metadata_error("cleanup source relative path must be one bounded name")
+    name = relative.as_posix()
+    allowed: dict[tuple[str, str], str] = {
+        ("control-root", "managed-transaction"): MANAGED_TRANSACTION_PREFIX,
+        ("control-root", "software-remove-rollback"): SOFTWARE_REMOVE_ROLLBACK_PREFIX,
+        ("backup-pool", "backup-retired-slot"): BACKUP_RETIRED_PREFIX,
+        ("software-versions", "software-install-rollback"): ".rollback-",
+    }
+    prefix = allowed.get((anchor, kind))
+    if prefix is None or not name.startswith(prefix):
+        cleanup_metadata_error("cleanup source kind is not allowed for its anchor")
+    parent = cleanup_source_anchor(target, anchor)
+    validate_cleanup_parent_identity(parent, descriptor["parent"], "cleanup source parent")
+    return parent / relative
+
+
+def load_cleanup_intent(target: Path, stage: Path) -> dict[str, Any]:
+    intent_path = cleanup_intent_path(stage)
+    loaded = parse_json_object(
+        read_regular_file(intent_path, "cleanup publication intent", max_bytes=CLEANUP_JOURNAL_MAX_BYTES),
+        "cleanup publication intent",
+    )
+    require_exact_keys(loaded, CLEANUP_INTENT_KEYS_V1, "cleanup publication intent")
+    if (
+        loaded["schema_version"] != CLEANUP_SCHEMA_VERSION
+        or loaded["product_name"] != PRODUCT_NAME
+        or loaded["build_version"] != VERSION
+        or loaded["canonical_target"] != str(target.resolve(strict=False))
+        or loaded["cleanup_parent"] != CONTROL_CLEANUP_PENDING_NAME
+        or loaded["stage_name"] != stage.name
+    ):
+        cleanup_metadata_error("cleanup publication intent binding mismatch")
+    moves = loaded["moves"]
+    if not isinstance(moves, list) or loaded["move_count"] != len(moves):
+        cleanup_metadata_error("cleanup publication intent move count mismatch")
+    if len(moves) > CLEANUP_MAX_TOMBSTONES:
+        cleanup_metadata_error("cleanup publication intent exceeds tombstone bound")
+    names: set[str] = set()
+    for move in moves:
+        if not isinstance(move, dict):
+            cleanup_metadata_error("cleanup publication intent move must be an object")
+        require_exact_keys(move, CLEANUP_INTENT_MOVE_KEYS_V1, "cleanup publication intent move")
+        name = require_cleanup_name(str(move["name"]), "cleanup intent tombstone")
+        if name in names:
+            cleanup_metadata_error("cleanup publication intent tombstone duplicated")
+        names.add(name)
+        if move["destination"] != f"{CLEANUP_TOMBSTONES_NAME}/{name}":
+            cleanup_metadata_error("cleanup publication intent destination mismatch")
+        cleanup_source_from_descriptor(target, move["source"])
+        tombstone = move["tombstone"]
+        if not isinstance(tombstone, dict):
+            cleanup_metadata_error("cleanup publication intent tombstone must be an object")
+        require_exact_keys(tombstone, CLEANUP_TOMBSTONE_KEYS_V1, "cleanup tombstone")
+        if tombstone["name"] != name:
+            cleanup_metadata_error("cleanup publication intent tombstone name mismatch")
+    return loaded
+
+
+def recover_cleanup_publication_stage(target: Path, stage: Path, *, complete: bool) -> None:
+    if not stage.name.startswith(CLEANUP_STAGE_PREFIX):
+        cleanup_metadata_error("cleanup publication stage name is invalid")
+    if stage.is_symlink() or not stage.is_dir():
+        cleanup_metadata_error("cleanup publication stage is not a real directory")
+    intent_file = cleanup_intent_path(stage)
+    if not path_exists_no_follow(intent_file):
+        children = {child.name: child for child in stage.iterdir()}
+        tombstones_root = children.get(CLEANUP_TOMBSTONES_NAME)
+        if set(children) - {CLEANUP_TOMBSTONES_NAME}:
+            cleanup_metadata_error("cleanup publication stage has no durable intent")
+        if tombstones_root is not None:
+            if tombstones_root.is_symlink() or not tombstones_root.is_dir():
+                cleanup_metadata_error("cleanup publication tombstones are unsafe")
+            if any(tombstones_root.iterdir()):
+                cleanup_metadata_error("cleanup publication stage has moved data without intent")
+            tombstones_root.rmdir()
+            fsync_directory(stage)
+        stage.rmdir()
+        fsync_directory(stage.parent)
+        return
+    intent = load_cleanup_intent(target, stage)
+    tombstones_root = stage / CLEANUP_TOMBSTONES_NAME
+    if path_exists_no_follow(tombstones_root):
+        require_owner_private_directory(tombstones_root, "cleanup publication tombstones")
+    moves = list(intent["moves"])
+    move_order = moves if complete else list(reversed(moves))
+    for move in move_order:
+        source = cleanup_source_from_descriptor(target, move["source"])
+        destination = stage / safe_relative(str(move["destination"]))
+        tombstone = move["tombstone"]
+        source_parent_identity = move["source"]["parent"]
+        source_present = path_exists_no_follow(source)
+        destination_present = path_exists_no_follow(destination)
+        if source_present and destination_present:
+            cleanup_metadata_error("cleanup publication source and tombstone are both present")
+        if not source_present and not destination_present:
+            cleanup_metadata_error("cleanup publication source and tombstone are both missing")
+        if complete and source_present:
+            if not cleanup_tree_identity_matches(source, tombstone, "cleanup publication source"):
+                cleanup_metadata_error("cleanup publication source identity mismatch")
+            os.rename(source, destination)
+            fsync_directory(source.parent)
+            fsync_directory(destination.parent)
+        elif destination_present:
+            if not cleanup_tree_identity_matches(
+                destination, tombstone, "cleanup publication tombstone"
+            ):
+                cleanup_metadata_error("cleanup publication tombstone identity mismatch")
+            if complete:
+                continue
+            if path_exists_no_follow(source):
+                cleanup_metadata_error("cleanup publication source appeared concurrently")
+            os.rename(destination, source)
+            fsync_directory(destination.parent)
+            fsync_directory(source.parent)
+            restore_cleanup_parent_metadata(
+                source.parent,
+                source_parent_identity,
+                "cleanup source parent",
+            )
+        elif not cleanup_tree_identity_matches(source, tombstone, "cleanup publication source"):
+            cleanup_metadata_error("cleanup publication source identity mismatch")
+    if complete:
+        journal = stage / CLEANUP_JOURNAL_NAME
+        if path_exists_no_follow(journal):
+            recover_cleanup_journal_publication_alias(journal)
+            require_regular_file(
+                journal,
+                "cleanup journal",
+                max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+            )
+        else:
+            tombstones = [move["tombstone"] for move in moves]
+            journal_content = cleanup_journal_bytes(target, tombstones)
+            if publish_cleanup_journal_no_replace(journal, journal_content):
+                fail("cleanup journal stage publication is incomplete")
+        pending = cleanup_pending_root(target)
+        if path_exists_no_follow(pending):
+            cleanup_metadata_error("cleanup-pending state already exists")
+        os.rename(stage, pending)
+        fsync_directory(pending.parent)
+        state = cleanup_pending_metadata(target, recover_alias=True)
+        if not state["pending"]:
+            cleanup_metadata_error("cleanup publication recovery produced no pending state")
+        return
+    journal = stage / CLEANUP_JOURNAL_NAME
+    for child in list(stage.iterdir()):
+        if child.name == CLEANUP_JOURNAL_NAME or is_cleanup_publication_alias(child, journal):
+            with contextlib.suppress(FileNotFoundError):
+                child.unlink()
+    allowed = {CLEANUP_INTENT_NAME, CLEANUP_TOMBSTONES_NAME}
+    leftovers = {child.name for child in stage.iterdir()} - allowed
+    if leftovers:
+        cleanup_metadata_error("cleanup publication stage contains unknown entries")
+    if path_exists_no_follow(tombstones_root):
+        if any(tombstones_root.iterdir()):
+            cleanup_metadata_error("cleanup publication tombstones remain after recovery")
+        tombstones_root.rmdir()
+    intent_file.unlink()
+    fsync_directory(stage)
+    stage.rmdir()
+    fsync_directory(stage.parent)
+
+
+def recover_cleanup_publication_stages(target: Path) -> bool:
+    control = control_root(target)
+    if not path_exists_no_follow(control) or control.is_symlink() or not control.is_dir():
+        return False
+    recovered = False
+    for child in sorted(control.iterdir(), key=lambda item: item.name):
+        if child.name.startswith(CLEANUP_STAGE_PREFIX):
+            recover_cleanup_publication_stage(target, child, complete=True)
+            recovered = True
+    return recovered
 
 
 def publish_cleanup_journal_no_replace(journal: Path, content: bytes) -> bool:
@@ -2615,12 +3003,31 @@ def load_cleanup_journal(target: Path, *, recover_alias: bool) -> dict[str, Any]
                     cleanup_metadata_error("cleanup file digest is invalid")
             elif entry["sha256"] is not None:
                 cleanup_metadata_error("cleanup directory digest must be null")
+            cleanup_mode = entry["cleanup_mode"]
+            if cleanup_mode is not None and (
+                entry["kind"] != "dir"
+                or not isinstance(cleanup_mode, int)
+                or cleanup_mode != OWNER_DIRECTORY_MODE
+            ):
+                cleanup_metadata_error("cleanup entry cleanup mode is invalid")
+            link_target = entry["link_target"]
+            if entry["kind"] == "symlink":
+                if not isinstance(link_target, str):
+                    cleanup_metadata_error("cleanup symlink target is invalid")
+            elif link_target is not None:
+                cleanup_metadata_error("cleanup non-symlink target must be null")
+            rdev = entry["rdev"]
+            if entry["kind"] == "special":
+                if not isinstance(rdev, int):
+                    cleanup_metadata_error("cleanup special device id is invalid")
+            elif rdev is not None:
+                cleanup_metadata_error("cleanup non-special device id must be null")
     if loaded["entry_count"] != entry_count or loaded["total_size"] != total_size:
         cleanup_metadata_error("cleanup journal aggregate mismatch")
     if not root.is_dir() or root.is_symlink():
         cleanup_metadata_error("cleanup parent must be a real directory")
     actual_root_names = {child.name for child in root.iterdir()}
-    allowed_root_names = {CLEANUP_JOURNAL_NAME, CLEANUP_TOMBSTONES_NAME}
+    allowed_root_names = {CLEANUP_JOURNAL_NAME, CLEANUP_TOMBSTONES_NAME, CLEANUP_INTENT_NAME}
     if actual_root_names - allowed_root_names:
         cleanup_metadata_error("cleanup parent contains unknown entries")
     if CLEANUP_TOMBSTONES_NAME not in actual_root_names:
@@ -2638,11 +3045,8 @@ def cleanup_entry_matches(path: Path, entry: dict[str, Any], label: str) -> bool
         info = path.lstat()
     except FileNotFoundError:
         return False
-    if stat.S_ISLNK(info.st_mode):
-        cleanup_metadata_error(f"{label} became a symlink")
     if (
         info.st_uid != entry["uid"]
-        or stat.S_IMODE(info.st_mode) != entry["mode"]
         or info.st_nlink != entry["nlink"]
         or info.st_dev != entry["device"]
         or info.st_ino != entry["inode"]
@@ -2650,9 +3054,22 @@ def cleanup_entry_matches(path: Path, entry: dict[str, Any], label: str) -> bool
         or info.st_mtime_ns != entry["mtime_ns"]
     ):
         return False
+    mode = stat.S_IMODE(info.st_mode)
+    cleanup_mode = entry.get("cleanup_mode")
+    if mode != entry["mode"] and mode != cleanup_mode:
+        return False
     if entry["kind"] == "dir":
         return stat.S_ISDIR(info.st_mode)
-    if not stat.S_ISREG(info.st_mode):
+    if entry["kind"] == "symlink":
+        return stat.S_ISLNK(info.st_mode) and os.readlink(path) == entry["link_target"]
+    if entry["kind"] == "special":
+        return (
+            not stat.S_ISDIR(info.st_mode)
+            and not stat.S_ISREG(info.st_mode)
+            and not stat.S_ISLNK(info.st_mode)
+            and getattr(info, "st_rdev", 0) == entry["rdev"]
+        )
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         return False
     content = read_regular_file(path, label, max_bytes=CLEANUP_MAX_TOTAL_SIZE)
     return sha256_bytes(content) == entry["sha256"]
@@ -2837,6 +3254,10 @@ def drain_cleanup_pending(target: Path, *, fail_closed: bool) -> bool:
         for tombstone in journal["tombstones"]:
             if validate_cleanup_tombstone_identity(target, tombstone):
                 cleanup_metadata_error("cleanup tombstone survived deletion")
+        intent_path = cleanup_pending_root(target) / CLEANUP_INTENT_NAME
+        if path_exists_no_follow(intent_path):
+            intent_path.unlink()
+            fsync_directory(intent_path.parent)
         journal_path = cleanup_journal_path(target)
         journal_path.unlink()
         fsync_directory(journal_path.parent)
@@ -2872,7 +3293,7 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
     journal_content = cleanup_journal_bytes(target, tombstones)
     stage: Path | None = None
     pending_visible = False
-    moved: list[tuple[Path, Path]] = []
+    final_validated = False
     try:
         stage = Path(
             tempfile.mkdtemp(prefix=f"{CLEANUP_STAGE_PREFIX}{os.getpid()}-", dir=str(root))
@@ -2883,6 +3304,13 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
         tombstones_root.mkdir(mode=OWNER_DIRECTORY_MODE)
         tombstones_root.chmod(OWNER_DIRECTORY_MODE)
         fsync_directory(stage)
+        intent_content = cleanup_intent_bytes(target, stage, active_sources, tombstones)
+        write_exclusive_file_with_mode(
+            cleanup_intent_path(stage),
+            intent_content,
+            OWNER_FILE_MODE,
+        )
+        fsync_directory(stage)
         for source, name in active_sources:
             destination = tombstones_root / name
             if destination.exists() or destination.is_symlink():
@@ -2890,7 +3318,6 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
             os.rename(source, destination)
             fsync_directory(source.parent)
             fsync_directory(tombstones_root)
-            moved.append((destination, source))
         if publish_cleanup_journal_no_replace(stage / CLEANUP_JOURNAL_NAME, journal_content):
             fail("cleanup journal stage publication is incomplete")
         if path_exists_no_follow(pending):
@@ -2899,22 +3326,29 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
         pending_visible = True
         stage = None
         try:
+            state = cleanup_pending_metadata(target, recover_alias=False)
+            if not state["pending"]:
+                cleanup_metadata_error("cleanup-pending final validation found no pending state")
+            final_validated = True
             fsync_directory(root)
-        except BaseException:
+        except BaseException as exc:
+            try:
+                state = cleanup_pending_metadata(target, recover_alias=False)
+                if not state["pending"]:
+                    cleanup_metadata_error("cleanup-pending final validation found no pending state")
+                final_validated = True
+            except BaseException as validation_error:
+                raise validation_error from exc
             return True
     except BaseException:
         if not pending_visible:
-            for destination, source in reversed(moved):
-                if path_exists_no_follow(destination) and not path_exists_no_follow(source):
-                    with contextlib.suppress(BaseException):
-                        os.rename(destination, source)
-                        fsync_directory(source.parent)
-            with contextlib.suppress(BaseException):
-                if stage is not None and path_exists_no_follow(stage):
-                    shutil.rmtree(stage)
-                    fsync_directory(root)
+            if stage is not None and path_exists_no_follow(stage):
+                with contextlib.suppress(BaseException):
+                    recover_cleanup_publication_stage(target, stage, complete=False)
             raise
-        return True
+        if final_validated:
+            return True
+        raise
     drain_cleanup_pending(target, fail_closed=False)
     try:
         return bool(cleanup_pending_metadata(target, recover_alias=False)["pending"])
@@ -4391,13 +4825,32 @@ def launch_image_metadata_record(
     }
 
 
+def iter_launch_image_persistent_paths(root: Path) -> Iterator[Path]:
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            children = sorted(current.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            fail(f"Cursor launch image residue is malformed: directory cannot be listed: {exc}")
+        for child in children:
+            relative = child.relative_to(root)
+            if relative.parts and Path(relative.parts[0]) in CURSOR_RUNTIME_EPHEMERAL_ROOTS:
+                continue
+            yield child
+            try:
+                info = child.lstat()
+            except FileNotFoundError:
+                fail("Cursor launch image residue changed during validation")
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                stack.append(child)
+
+
 def launch_image_runtime_payload_from_disk(root: Path) -> dict[str, tuple[bytes, int]]:
     files: dict[str, tuple[bytes, int]] = {}
-    for path in sorted(root.rglob("*")):
+    for path in iter_launch_image_persistent_paths(root):
         relative = path.relative_to(root)
         if not relative.parts:
-            continue
-        if Path(relative.parts[0]) in CURSOR_RUNTIME_EPHEMERAL_ROOTS:
             continue
         if relative == Path(LAUNCH_IMAGE_AGENT_NAME):
             continue
@@ -4451,7 +4904,7 @@ def validate_launch_image_tree_bounds(root: Path) -> dict[str, int]:
     uid = current_user_id()
     entry_count = 1
     total_size = 0
-    for path in sorted(root.rglob("*")):
+    for path in iter_launch_image_persistent_paths(root):
         entry_count += 1
         if entry_count > CLEANUP_MAX_ENTRIES:
             fail("Cursor launch image residue is malformed: image entry count exceeds bound")
@@ -4479,7 +4932,9 @@ def validate_launch_image_tree_bounds(root: Path) -> dict[str, int]:
     return {"entry_count": entry_count, "total_size": total_size}
 
 
-def validate_launch_image_record(target: Path, image_root: Path) -> dict[str, Any]:
+def validate_launch_image_record(
+    target: Path, image_root: Path, *, validate_runtime: bool = True
+) -> dict[str, Any]:
     require_launch_image_name(image_root.name)
     root_info = require_owner_directory_mode(
         image_root,
@@ -4530,30 +4985,36 @@ def validate_launch_image_record(target: Path, image_root: Path) -> dict[str, An
     for key in ("lease_sha256", "entrypoint_sha256", "runtime_tree_sha256"):
         if not isinstance(metadata[key], str) or not SHA256_HEX_PATTERN.fullmatch(metadata[key]):
             fail(f"Cursor launch image residue is malformed: metadata {key}")
-    executable = image_root / LAUNCH_IMAGE_AGENT_NAME
-    executable_content = read_regular_file(
-        executable,
-        "Cursor launch image executable",
-        max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
-    )
-    executable_info = require_regular_file(
-        executable,
-        "Cursor launch image executable",
-        max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
-    )
-    if stat.S_IMODE(executable_info.st_mode) != OWNER_EXEC_MODE:
-        fail("Cursor launch image residue is malformed: executable mode")
-    if sha256_bytes(executable_content) != metadata["entrypoint_sha256"]:
-        fail("Cursor launch image residue is malformed: executable digest")
-    runtime_files = launch_image_runtime_payload_from_disk(image_root)
-    runtime_tree_sha256, runtime_size, runtime_file_count = runtime_tree_digest(runtime_files)
-    if (
-        runtime_tree_sha256 != metadata["runtime_tree_sha256"]
-        or runtime_size != metadata["runtime_size"]
-        or runtime_file_count != metadata["runtime_file_count"]
-    ):
-        fail("Cursor launch image residue is malformed: runtime binding mismatch")
-    bounds = validate_launch_image_tree_bounds(image_root)
+    if validate_runtime:
+        executable = image_root / LAUNCH_IMAGE_AGENT_NAME
+        executable_content = read_regular_file(
+            executable,
+            "Cursor launch image executable",
+            max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+        )
+        executable_info = require_regular_file(
+            executable,
+            "Cursor launch image executable",
+            max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+        )
+        if stat.S_IMODE(executable_info.st_mode) != OWNER_EXEC_MODE:
+            fail("Cursor launch image residue is malformed: executable mode")
+        if sha256_bytes(executable_content) != metadata["entrypoint_sha256"]:
+            fail("Cursor launch image residue is malformed: executable digest")
+        runtime_files = launch_image_runtime_payload_from_disk(image_root)
+        runtime_tree_sha256, runtime_size, runtime_file_count = runtime_tree_digest(runtime_files)
+        if (
+            runtime_tree_sha256 != metadata["runtime_tree_sha256"]
+            or runtime_size != metadata["runtime_size"]
+            or runtime_file_count != metadata["runtime_file_count"]
+        ):
+            fail("Cursor launch image residue is malformed: runtime binding mismatch")
+        bounds = validate_launch_image_tree_bounds(image_root)
+    else:
+        bounds = {
+            "entry_count": int(metadata["runtime_file_count"]) + 3,
+            "total_size": int(metadata["runtime_size"]),
+        }
     return {
         "path": image_root,
         "name": image_root.name,
@@ -4593,7 +5054,7 @@ def launch_image_lease_is_active(lease_path: Path) -> bool:
 
 
 def launch_image_residue_metadata(
-    target: Path, *, require_stale_exact: bool
+    target: Path, *, require_stale_exact: bool, allow_child_mutated: bool = False
 ) -> dict[str, Any]:
     root = launch_images_root(target)
     if not path_exists_no_follow(root):
@@ -4610,7 +5071,11 @@ def launch_image_residue_metadata(
     for child in children:
         if child.is_symlink() or not child.is_dir():
             fail("Cursor launch image residue is malformed: root contains unknown entries")
-        record = validate_launch_image_record(target, child)
+        record = validate_launch_image_record(
+            target,
+            child,
+            validate_runtime=not allow_child_mutated,
+        )
         is_active = launch_image_lease_is_active(Path(record["lease_path"]))
         if is_active:
             active += 1
@@ -4619,18 +5084,7 @@ def launch_image_residue_metadata(
             stale += 1
             state = "stale"
             if require_stale_exact:
-                if record["root_mode"] != OWNER_DIRECTORY_MODE:
-                    set_owner_directory_mode(
-                        child,
-                        f"Cursor stale launch image {child}",
-                        OWNER_DIRECTORY_MODE,
-                    )
-                    record = validate_launch_image_record(target, child)
-                cleanup_tree_manifest(
-                    child,
-                    launch_image_tombstone_name(child),
-                    "Cursor stale launch image",
-                )
+                prepare_launch_image_tree_for_removal(child)
         total_size += int(record["total_size"])
         total_entries += int(record["entry_count"])
         if total_size > LAUNCH_IMAGE_MAX_TOTAL_SIZE:
@@ -4685,22 +5139,21 @@ def launch_image_drift_findings(result: dict[str, Any]) -> list[str]:
 
 def drain_launch_image_residue(target: Path, *, fail_closed: bool) -> bool:
     try:
-        state = launch_image_residue_metadata(target, require_stale_exact=True)
+        state = launch_image_residue_metadata(
+            target,
+            require_stale_exact=True,
+            allow_child_mutated=True,
+        )
         if not state["pending"]:
             return False
         active = int(state["metadata"]["active_count"])
         if active:
             fail("Cursor launch image residue is still active")
-        sources = [
-            (Path(record["path"]), launch_image_tombstone_name(Path(record["path"])))
-            for record in state["records"]
-            if record["state"] == "stale"
-        ]
-        if not sources:
+        stale_records = [record for record in state["records"] if record["state"] == "stale"]
+        if not stale_records:
             return False
-        publish_cleanup_pending(target, sources)
-        if cleanup_pending_metadata(target, recover_alias=False)["pending"]:
-            fail("Cursor launch image cleanup is still pending")
+        for record in stale_records:
+            cleanup_launch_image(Path(record["path"]))
         remove_empty_directory(launch_images_root(target))
         return True
     except BaseException:
@@ -6398,27 +6851,51 @@ def ensure_mutable_runtime_tmp_dir(target: Path) -> Path:
     )
 
 
-def make_tree_owner_writable(path: Path) -> None:
-    if not path.exists() and not path.is_symlink():
-        return
-    if path.is_symlink():
-        path.unlink()
-        return
-    if path.is_dir():
-        for child in path.iterdir():
-            make_tree_owner_writable(child)
-        path.chmod(OWNER_DIRECTORY_MODE)
-    elif path.is_file():
-        path.chmod(OWNER_FILE_MODE)
+def prepare_launch_image_tree_for_removal(root: Path) -> list[Path]:
+    if not path_exists_no_follow(root):
+        return []
+    uid = current_user_id()
+    ordered: list[Path] = []
+    stack = [root]
+    total_size = 0
+    while stack:
+        current = stack.pop()
+        info = current.lstat()
+        if uid is not None and info.st_uid != uid:
+            fail("Cursor launch image cleanup refused an object owned by another user")
+        ordered.append(current)
+        if len(ordered) > CLEANUP_MAX_ENTRIES:
+            fail("Cursor launch image cleanup refused an over-bound tree")
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            os.chmod(current, OWNER_DIRECTORY_MODE)
+            try:
+                children = sorted(current.iterdir(), key=lambda item: item.name)
+            except OSError as exc:
+                fail(f"Cursor launch image cleanup could not list a directory: {exc}")
+            stack.extend(reversed(children))
+        elif stat.S_ISREG(info.st_mode):
+            require_bounded_size(info, "Cursor launch image cleanup file", SOFTWARE_ARTIFACT_MAX_BYTES)
+            total_size += info.st_size
+            if total_size > LAUNCH_IMAGE_MAX_TOTAL_SIZE:
+                fail("Cursor launch image cleanup refused an over-bound byte total")
+    return sorted(
+        ordered,
+        key=lambda item: (len(item.relative_to(root).parts), item.relative_to(root).as_posix()),
+        reverse=True,
+    )
 
 
 def cleanup_launch_image(path: Path | None) -> None:
     if path is None:
         return
     with contextlib.suppress(FileNotFoundError):
-        make_tree_owner_writable(path)
-        shutil.rmtree(path)
-        fsync_directory(path.parent)
+        for current in prepare_launch_image_tree_for_removal(path):
+            info = current.lstat()
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                current.rmdir()
+            else:
+                current.unlink()
+            fsync_directory(current.parent)
 
 
 def close_launch_image_lease(lease_fd: int | None) -> None:
