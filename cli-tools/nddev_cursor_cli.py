@@ -2297,7 +2297,12 @@ def publish_cleanup_journal_no_replace(journal: Path, content: bytes) -> bool:
     descriptor: int | None = None
     final_visible = False
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, OWNER_FILE_MODE)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, OWNER_FILE_MODE)
         view = memoryview(content)
         while view:
             written = os.write(descriptor, view)
@@ -2595,12 +2600,12 @@ def cleanup_tombstone_progress(
 
 def cleanup_pending_metadata(target: Path, *, recover_alias: bool) -> dict[str, Any]:
     root = cleanup_pending_root(target)
+    control = control_root(target)
+    if path_exists_no_follow(control) and control.is_dir() and not control.is_symlink():
+        for child in control.iterdir():
+            if child.name.startswith(CLEANUP_STAGE_PREFIX):
+                cleanup_metadata_error("cleanup publication stage is incomplete")
     if not path_exists_no_follow(root):
-        control = control_root(target)
-        if path_exists_no_follow(control) and control.is_dir() and not control.is_symlink():
-            for child in control.iterdir():
-                if child.name.startswith(CLEANUP_STAGE_PREFIX):
-                    cleanup_metadata_error("cleanup publication stage is incomplete")
         return {"pending": False, "metadata": None}
     require_owner_private_directory(root, "cleanup pending")
     journal = load_cleanup_journal(target, recover_alias=recover_alias)
@@ -2704,18 +2709,19 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
     pending = cleanup_pending_root(target)
     if path_exists_no_follow(pending):
         cleanup_metadata_error("cleanup-pending state already exists")
-    pending_created = False
-    journal_visible = False
+    stage: Path | None = None
+    pending_visible = False
     moved: list[tuple[Path, Path]] = []
     try:
-        pending.mkdir(mode=OWNER_DIRECTORY_MODE)
-        pending_created = True
-        pending.chmod(OWNER_DIRECTORY_MODE)
+        stage = Path(
+            tempfile.mkdtemp(prefix=f"{CLEANUP_STAGE_PREFIX}{os.getpid()}-", dir=str(root))
+        )
+        stage.chmod(OWNER_DIRECTORY_MODE)
         fsync_directory(root)
-        tombstones_root = pending / CLEANUP_TOMBSTONES_NAME
+        tombstones_root = stage / CLEANUP_TOMBSTONES_NAME
         tombstones_root.mkdir(mode=OWNER_DIRECTORY_MODE)
         tombstones_root.chmod(OWNER_DIRECTORY_MODE)
-        fsync_directory(pending)
+        fsync_directory(stage)
         tombstones: list[dict[str, Any]] = []
         for source, name in active_sources:
             destination = tombstones_root / name
@@ -2727,24 +2733,35 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
             moved.append((destination, source))
             tombstones.append(cleanup_tree_manifest(destination, name, "cleanup tombstone"))
         journal_content = cleanup_journal_bytes(target, tombstones)
-        if publish_cleanup_journal_no_replace(pending / CLEANUP_JOURNAL_NAME, journal_content):
-            journal_visible = True
+        if publish_cleanup_journal_no_replace(stage / CLEANUP_JOURNAL_NAME, journal_content):
+            fail("cleanup journal stage publication is incomplete")
+        if path_exists_no_follow(pending):
+            cleanup_metadata_error("cleanup-pending state already exists")
+        os.rename(stage, pending)
+        pending_visible = True
+        stage = None
+        try:
+            fsync_directory(root)
+        except BaseException:
             return True
-        journal_visible = True
     except BaseException:
-        if not journal_visible:
+        if not pending_visible:
             for destination, source in reversed(moved):
                 if path_exists_no_follow(destination) and not path_exists_no_follow(source):
                     with contextlib.suppress(BaseException):
                         os.rename(destination, source)
                         fsync_directory(source.parent)
             with contextlib.suppress(BaseException):
-                if pending_created:
-                    shutil.rmtree(pending)
+                if stage is not None and path_exists_no_follow(stage):
+                    shutil.rmtree(stage)
                     fsync_directory(root)
             raise
         return True
-    return drain_cleanup_pending(target, fail_closed=False)
+    drain_cleanup_pending(target, fail_closed=False)
+    try:
+        return bool(cleanup_pending_metadata(target, recover_alias=False)["pending"])
+    except BaseException:
+        return True
 
 
 def require_owner_directory_mode(path: Path, label: str, allowed_modes: set[int]) -> os.stat_result:
@@ -3856,6 +3873,40 @@ def _mutate_setup_locked(
     with exact_target_lifecycle_guard(target, f"setup {command}"):
         if command == "update" and not (target.exists() or target.is_symlink()):
             fail("update requires an existing managed target")
+        if command == "update":
+            prepare_lifecycle_target(target, create_missing=False)
+            state = _inspect_target_locked(target)
+            if state["state"] == "unmanaged":
+                fail("unmanaged target contains Cursor CLI state; refusing to overwrite")
+            if state["state"] == "managed" and state.get("legacy"):
+                fail("legacy managed target must be migrated before install, update, or switch")
+            if state["state"] != "managed":
+                fail("update requires an existing managed target")
+            blocking_update_drift = setup_update_blocking_drift(state["drift"])
+            if blocking_update_drift:
+                fail(f"managed target has drift: {', '.join(blocking_update_drift)}")
+            current_setup = state["content_setup_id"]
+            current_profile = state["profile_id"]
+            if current_setup is None or current_profile is None:
+                fail("update requires an installed setup/profile identity")
+            content_setup_id = str(current_setup)
+            profile_id = str(current_profile)
+            render_selection(content_setup_id, profile_id)
+            existing_config = load_target_config(target)
+            desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
+            before = capture_managed_files(target)
+            if all(before.get(relative) == content for relative, content in desired.items()):
+                return {
+                    "schema_version": 2,
+                    "command": command,
+                    "target": str(target),
+                    "content_setup_id": content_setup_id,
+                    "profile_id": profile_id,
+                    "changed": [],
+                    "backup_slot": None,
+                    "builder_projection": "current",
+                    "cleanup_pending": False,
+                }
         created_target = prepare_lifecycle_target(target, create_missing=command == "install")
         try:
             with target_lock(target, cleanup_empty_target_on_error=created_target):
@@ -5157,17 +5208,12 @@ def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
         before_target_exists = target.exists() or target.is_symlink()
         if command == "update-cli" and not before_target_exists:
             fail("update-cli requires existing target-owned Cursor CLI software presence")
-        created_target = prepare_lifecycle_target(target, create_missing=command == "install-cli")
-        with target_lock(target, cleanup_empty_target_on_error=created_target):
+        if command == "update-cli":
+            prepare_lifecycle_target(target, create_missing=False)
             status = _software_status_locked(target)
-            if command == "install-cli" and status["present"]:
-                fail(
-                    "install-cli requires absent target-owned Cursor CLI software presence; "
-                    "use update-cli for existing or partial state"
-                )
-            if command == "update-cli" and not status["present"]:
+            if not status["present"]:
                 fail("update-cli requires existing target-owned Cursor CLI software presence")
-            if command == "update-cli" and status["current"]:
+            if status["current"]:
                 return {
                     "schema_version": 1,
                     "command": command,
@@ -5178,6 +5224,16 @@ def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
                     "changed": [],
                     "managed_command": str(managed_agent_path(target).resolve(strict=False)),
                 }
+        created_target = prepare_lifecycle_target(target, create_missing=command == "install-cli")
+        with target_lock(target, cleanup_empty_target_on_error=created_target):
+            status = _software_status_locked(target)
+            if command == "install-cli" and status["present"]:
+                fail(
+                    "install-cli requires absent target-owned Cursor CLI software presence; "
+                    "use update-cli for existing or partial state"
+                )
+            if command == "update-cli" and not status["present"]:
+                fail("update-cli requires existing target-owned Cursor CLI software presence")
             artifact = prepare_cursor_artifact()
             container = software_container(target)
             root = software_root(target)
@@ -5427,6 +5483,19 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
                 "managed_command": str(managed_agent_path(target).resolve(strict=False)),
             }
         prepare_lifecycle_target(target, create_missing=False)
+        initial_status = _software_status_locked(target)
+        initial_presence = list(initial_status["presence"])
+        if not initial_presence:
+            return {
+                "schema_version": 1,
+                "command": "remove-cli",
+                "operation": "absent",
+                "target": str(target.resolve(strict=False)),
+                "current": False,
+                "present": False,
+                "changed": [],
+                "managed_command": str(managed_agent_path(target).resolve(strict=False)),
+            }
         with target_lock(target):
             initial_status = _software_status_locked(target)
             initial_presence = list(initial_status["presence"])
