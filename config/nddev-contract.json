@@ -30,6 +30,9 @@
     "list_command": "python3 cli-tools/nddev_cursor_cli.py list [--json]",
     "selection_options": ["--setup <id>", "--profile <id>"],
     "status_command": "python3 cli-tools/nddev_cursor_cli.py status --target <absolute-dir> [--json]",
+    "install_command": "python3 cli-tools/nddev_cursor_cli.py install --target <absolute-dir> [--setup <id>] [--profile <id>] [--json]",
+    "update_command": "python3 cli-tools/nddev_cursor_cli.py update --target <absolute-dir> [--setup <id>] [--profile <id>] [--json]",
+    "switch_command": "python3 cli-tools/nddev_cursor_cli.py switch --target <absolute-dir> [--setup <id>] [--profile <id>] [--json]",
     "migrate_command": "python3 cli-tools/nddev_cursor_cli.py migrate --target <absolute-dir> [--profile <id>] [--json]"
   },
   "legacy_policy": {
@@ -199,7 +202,7 @@
     "absolute_target_required": true,
     "canonical_target_binding": true,
     "default_target": null,
-    "explicit_target_required": ["status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "remove-cli", "launch"],
+    "explicit_target_required": ["status", "plan", "install", "update", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "remove-cli", "launch"],
     "max_backups": 10,
     "missing_target_argument_rejected": true,
     "new_target_mode": "0700",

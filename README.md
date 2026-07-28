@@ -9,6 +9,7 @@ absolute Cursor config target, never the caller's live `~/.cursor` by default.
 python3 cli-tools/nddev_cursor_cli.py list
 python3 cli-tools/nddev_cursor_cli.py plan --setup nddev-builder --profile full-auto --target /absolute/cursor-config
 python3 cli-tools/nddev_cursor_cli.py install --setup nddev-builder --profile full-auto --target /absolute/cursor-config
+python3 cli-tools/nddev_cursor_cli.py update --setup nddev-builder --profile full-auto --target /absolute/cursor-config
 python3 cli-tools/nddev_cursor_cli.py switch --setup nddev-builder --profile safe --target /absolute/cursor-config
 python3 cli-tools/nddev_cursor_cli.py migrate --setup nddev-builder --profile safe --target /absolute/cursor-config
 python3 cli-tools/nddev_cursor_cli.py restore --backup 0 --target /absolute/cursor-config
@@ -36,6 +37,8 @@ deliberate same-UID tampering without a sandbox.
 ## Software lifecycle
 
 The Cursor setup lifecycle and Cursor Agent runtime lifecycle are separate.
+Setup `update` refreshes an already installed matching setup/profile identity;
+`update-cli` manages only the target-owned Cursor Agent runtime.
 `software-status`, `install-cli`, `update-cli`, and `remove-cli` manage a
 target-owned copy of the pinned official Cursor Agent runtime package:
 

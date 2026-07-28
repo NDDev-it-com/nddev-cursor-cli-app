@@ -59,6 +59,23 @@ MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
 SOFTWARE_ARTIFACT_MAX_BYTES = 300 * 1024 * 1024
 DEFAULT_CONTENT_SETUP_ID = "nddev-builder"
 DEFAULT_PROFILE_ID = "full-auto"
+TARGET_COMMANDS = frozenset(
+    {
+        "status",
+        "plan",
+        "install",
+        "update",
+        "switch",
+        "migrate",
+        "restore",
+        "remove",
+        "software-status",
+        "install-cli",
+        "update-cli",
+        "remove-cli",
+        "launch",
+    }
+)
 LEGACY_SETUP_PROFILE_IDS = {
     "full-auto": "full-auto",
     "safe": "safe",
@@ -1168,8 +1185,8 @@ def drift_for_target(target: Path, stamp: dict[str, Any]) -> list[str]:
     return drift
 
 
-@bootstrap_locked
 def inspect_target(target: Path) -> dict[str, Any]:
+    require_current_host_supported()
     if not target.exists() and not target.is_symlink():
         return {
             "state": "missing",
@@ -1932,8 +1949,13 @@ def managed_transaction_path(target: Path) -> Path:
     transaction = Path(
         tempfile.mkdtemp(prefix=f"{MANAGED_TRANSACTION_PREFIX}{os.getpid()}-", dir=str(root))
     )
-    transaction.chmod(OWNER_DIRECTORY_MODE)
-    fsync_directory(root)
+    try:
+        transaction.chmod(OWNER_DIRECTORY_MODE)
+        fsync_directory(root)
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            shutil.rmtree(transaction)
+        raise
     return transaction
 
 
@@ -1943,64 +1965,160 @@ def cleanup_managed_transaction(transaction: Path) -> None:
         fsync_directory(transaction.parent)
 
 
-def write_managed_destination(
-    target: Path, relative: Path, content: bytes | None, mode: int | None
+def managed_parent_chain(relative: Path) -> tuple[Path, ...]:
+    parents: list[Path] = []
+    parent = relative.parent
+    while parent != Path("."):
+        parents.append(parent)
+        parent = parent.parent
+    return tuple(parents)
+
+
+def existing_managed_parents(target: Path, relative: Path) -> set[Path]:
+    existing: set[Path] = set()
+    for parent in managed_parent_chain(relative):
+        path = target / parent
+        if path.exists() or path.is_symlink():
+            existing.add(parent)
+    return existing
+
+
+def remove_created_managed_parents(
+    target: Path, relative: Path, preexisting_parents: set[Path]
 ) -> None:
-    destination = target / relative
-    if content is None:
-        if destination.exists() or destination.is_symlink():
-            require_regular_file(
-                destination,
-                f"managed path {relative.as_posix()}",
-                max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
-            )
-            destination.unlink()
-            fsync_existing_parent(destination)
-            remove_empty_parents(target, destination)
+    for parent in managed_parent_chain(relative):
+        if parent in preexisting_parents:
+            break
+        path = target / parent
+        with contextlib.suppress(FileNotFoundError, OSError):
+            path.rmdir()
+            fsync_directory(path.parent)
+
+
+def discard_managed_destination(transaction: Path, destination: Path) -> None:
+    if not (destination.exists() or destination.is_symlink()):
         return
-    ensure_real_directory(target, relative.parent)
-    if destination.exists() or destination.is_symlink():
-        require_regular_file(
-            destination,
-            f"managed path {relative.as_posix()}",
-            max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
-        )
-    temporary = destination.with_name(
-        f".{destination.name}.nddev-tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    require_regular_file(
+        destination,
+        f"managed path {destination}",
+        max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
     )
-    try:
-        write_exclusive_file_with_mode(temporary, content, mode or OWNER_FILE_MODE)
-        fsync_existing_parent(temporary)
-        os.replace(temporary, destination)
-        fsync_existing_parent(destination)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
+    discarded = transaction / f"discard-{secrets.token_hex(8)}"
+    os.rename(destination, discarded)
+    fsync_existing_parent(destination)
+    with contextlib.suppress(FileNotFoundError):
+        discarded.unlink()
+        fsync_directory(transaction)
 
 
-def restore_managed_records(
-    target: Path, records: list[dict[str, Any]], state: str, *, attempts: int = 4
-) -> None:
-    errors: list[str] = []
-    for _ in range(attempts):
-        for record in records:
-            relative = record["relative"]
-            content = record[f"{state}_content"]
-            mode = record[f"{state}_mode"]
-            if managed_path_matches(target, relative, content, mode):
-                continue
-            try:
-                write_managed_destination(target, relative, content, mode)
-            except BaseException as exc:  # noqa: BLE001 - keep restoring every path.
-                errors.append(f"{relative.as_posix()}: {exc}")
-        if all(
-            managed_path_matches(
-                target, record["relative"], record[f"{state}_content"], record[f"{state}_mode"]
-            )
-            for record in records
-        ):
+class ManagedStateTransaction:
+    def __init__(
+        self,
+        target: Path,
+        transaction: Path | None,
+        records: list[dict[str, Any]],
+    ) -> None:
+        self.target = target
+        self.transaction = transaction
+        self.records = records
+        self.closed = False
+
+    def publish(self) -> None:
+        if self.transaction is None:
             return
-    fail(f"managed transaction {state} verification failed: {errors[-5:]}")
+        published: list[dict[str, Any]] = []
+        try:
+            for record in self.records:
+                relative: Path = record["relative"]
+                destination = self.target / relative
+                before_content = record["before_content"]
+                desired_content = record["desired_content"]
+                before_store: Path | None = record["before_store"]
+                desired_store: Path | None = record["desired_store"]
+                published.append(record)
+                ensure_real_directory(self.target, relative.parent)
+                if before_content is not None:
+                    require_regular_file(
+                        destination,
+                        f"managed path {relative.as_posix()}",
+                        max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+                    )
+                    if before_store is None:
+                        fail("managed transaction missing before store")
+                    os.rename(destination, before_store)
+                    fsync_existing_parent(destination)
+                elif destination.exists() or destination.is_symlink():
+                    fail(f"managed path appeared concurrently: {relative.as_posix()}")
+                if desired_content is not None:
+                    if desired_store is None:
+                        fail("managed transaction missing desired store")
+                    os.rename(desired_store, destination)
+                    fsync_existing_parent(destination)
+            if not self.matches("desired"):
+                fail("managed transaction desired verification failed")
+        except BaseException:
+            self.rollback(records=published)
+            raise
+
+    def matches(self, state: str) -> bool:
+        return all(
+            managed_path_matches(
+                self.target,
+                record["relative"],
+                record[f"{state}_content"],
+                record[f"{state}_mode"],
+            )
+            for record in self.records
+        )
+
+    def rollback(self, *, records: list[dict[str, Any]] | None = None) -> None:
+        if self.closed or self.transaction is None:
+            return
+        active_records = self.records if records is None else records
+        errors: list[str] = []
+        for _ in range(4):
+            for record in reversed(active_records):
+                relative: Path = record["relative"]
+                destination = self.target / relative
+                before_content = record["before_content"]
+                before_store: Path | None = record["before_store"]
+                try:
+                    if not managed_path_matches(
+                        self.target,
+                        relative,
+                        before_content,
+                        record["before_mode"],
+                    ):
+                        discard_managed_destination(self.transaction, destination)
+                        if before_content is not None:
+                            if before_store is None or not before_store.exists():
+                                fail(
+                                    "managed transaction cannot restore missing before object: "
+                                    f"{relative.as_posix()}"
+                                )
+                            ensure_real_directory(self.target, relative.parent)
+                            os.rename(before_store, destination)
+                            fsync_existing_parent(destination)
+                    if before_content is None:
+                        remove_created_managed_parents(
+                            self.target,
+                            relative,
+                            record["preexisting_parents"],
+                        )
+                except BaseException as exc:  # noqa: BLE001 - retry the whole rollback set.
+                    errors.append(f"{relative.as_posix()}: {exc}")
+            if self.matches("before"):
+                cleanup_managed_transaction(self.transaction)
+                self.closed = True
+                return
+        fail(f"managed transaction rollback verification failed: {errors[-5:]}")
+
+    def commit(self) -> None:
+        if self.closed:
+            return
+        if self.transaction is not None:
+            cleanup_managed_transaction(self.transaction)
+        self.closed = True
 
 
 def validate_expected_managed_state(
@@ -2030,31 +2148,56 @@ def replace_managed_state(
     *,
     names: tuple[str, ...] | None = None,
 ) -> None:
+    transaction = begin_managed_state_transaction(target, desired, expected, names=names)
+    try:
+        transaction.publish()
+        transaction.commit()
+    except BaseException:
+        transaction.rollback()
+        raise
+
+
+def begin_managed_state_transaction(
+    target: Path,
+    desired: dict[str, bytes | None],
+    expected: Any | None = None,
+    *,
+    names: tuple[str, ...] | None = None,
+) -> ManagedStateTransaction:
     selected = tuple(desired) if names is None else names
     validate_expected_managed_state(target, selected, expected)
-    transaction = managed_transaction_path(target)
     records: list[dict[str, Any]] = []
-    try:
-        for index, relative_name in enumerate(selected):
-            relative = safe_relative(relative_name)
-            before_content, before_mode = snapshot_managed_path(target, relative)
-            desired_content = desired.get(relative_name)
-            record = {
+    for relative_name in selected:
+        relative = safe_relative(relative_name)
+        before_content, before_mode = snapshot_managed_path(target, relative)
+        desired_content = desired.get(relative_name)
+        desired_mode = None if desired_content is None else OWNER_FILE_MODE
+        if before_content == desired_content and before_mode == desired_mode:
+            continue
+        records.append(
+            {
                 "relative": relative,
                 "before_content": before_content,
                 "before_mode": before_mode,
                 "desired_content": desired_content,
-                "desired_mode": None if desired_content is None else OWNER_FILE_MODE,
+                "desired_mode": desired_mode,
+                "preexisting_parents": existing_managed_parents(target, relative),
+                "before_store": None,
+                "desired_store": None,
             }
-            records.append(record)
-            if before_content is not None:
-                write_exclusive_file_with_mode(
-                    transaction / f"{index}.before", before_content, OWNER_FILE_MODE
-                )
+        )
+    if not records:
+        return ManagedStateTransaction(target, None, [])
+    transaction = managed_transaction_path(target)
+    try:
+        for index, record in enumerate(records):
+            if record["before_content"] is not None:
+                record["before_store"] = transaction / f"{index}.before"
+            desired_content = record["desired_content"]
             if desired_content is not None:
-                write_exclusive_file_with_mode(
-                    transaction / f"{index}.desired", desired_content, OWNER_FILE_MODE
-                )
+                desired_store = transaction / f"{index}.desired"
+                record["desired_store"] = desired_store
+                write_exclusive_file_with_mode(desired_store, desired_content, OWNER_FILE_MODE)
         journal = [
             {
                 "path": record["relative"].as_posix(),
@@ -2069,29 +2212,11 @@ def replace_managed_state(
         ]
         write_exclusive_file(transaction / "journal.json", canonical_json(journal))
         fsync_directory(transaction)
-        restore_managed_records(target, records, "desired", attempts=1)
-        if not all(
-            managed_path_matches(
-                target, record["relative"], record["desired_content"], record["desired_mode"]
-            )
-            for record in records
-        ):
-            fail("managed transaction desired verification failed")
+        return ManagedStateTransaction(target, transaction, records)
     except BaseException:
         with contextlib.suppress(BaseException):
-            restore_managed_records(target, records, "before")
-        if not all(
-            managed_path_matches(
-                target, record["relative"], record["before_content"], record["before_mode"]
-            )
-            for record in records
-        ):
-            with contextlib.suppress(BaseException):
-                cleanup_managed_transaction(transaction)
-            fail("managed transaction rollback verification failed")
-        cleanup_managed_transaction(transaction)
+            cleanup_managed_transaction(transaction)
         raise
-    cleanup_managed_transaction(transaction)
 
 
 def backup_file_digest(relative: str, content: bytes | None) -> str:
@@ -2128,10 +2253,15 @@ PLAN_LOCK_BOOTSTRAP_FINDINGS = frozenset(
         f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}/{CONTROL_LOCK_NAME}:missing",
     }
 )
+SETUP_UPDATE_REPAIRABLE_DRIFT = frozenset({CONFIG_NAME, BUILDER_TARGET_ROOT.as_posix()})
 
 
 def plan_blocking_drift(drift: list[str]) -> list[str]:
     return [finding for finding in drift if finding not in PLAN_LOCK_BOOTSTRAP_FINDINGS]
+
+
+def setup_update_blocking_drift(drift: list[str]) -> list[str]:
+    return [finding for finding in drift if finding not in SETUP_UPDATE_REPAIRABLE_DRIFT]
 
 
 def desired_for_selection(
@@ -2204,8 +2334,8 @@ def restore_files_from_backup(envelope: dict[str, Any]) -> dict[str, bytes | Non
     return desired
 
 
-@bootstrap_locked
 def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str, Any]:
+    require_current_host_supported()
     render_selection(content_setup_id, profile_id)
     state = inspect_target(target)
     operation = "install"
@@ -2271,11 +2401,22 @@ def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str
     }
 
 
-@bootstrap_locked
 def mutate_setup(
     target: Path, content_setup_id: str, profile_id: str, command: str
 ) -> dict[str, Any]:
+    require_current_host_supported()
+    return _mutate_setup_locked(target, content_setup_id, profile_id, command)
+
+
+@bootstrap_locked
+def _mutate_setup_locked(
+    target: Path, content_setup_id: str, profile_id: str, command: str
+) -> dict[str, Any]:
     render_selection(content_setup_id, profile_id)
+    if command not in {"install", "update", "switch"}:
+        fail(f"unsupported setup mutation command: {command}")
+    if command == "update" and not (target.exists() or target.is_symlink()):
+        fail("update requires an existing managed target")
     created_target = prepare_lifecycle_target(target, create_missing=command == "install")
     try:
         with target_lock(target, cleanup_empty_target_on_error=created_target):
@@ -2283,16 +2424,22 @@ def mutate_setup(
             if state["state"] == "unmanaged":
                 fail("unmanaged target contains Cursor CLI state; refusing to overwrite")
             if state["state"] == "managed" and state.get("legacy"):
-                fail("legacy managed target must be migrated before install or switch")
-            if command == "switch" and state["state"] != "managed":
-                fail("switch requires an existing managed target")
-            if state["state"] == "managed" and state["drift"]:
+                fail("legacy managed target must be migrated before install, update, or switch")
+            if command in {"switch", "update"} and state["state"] != "managed":
+                fail(f"{command} requires an existing managed target")
+            if command == "update":
+                blocking_update_drift = setup_update_blocking_drift(state["drift"])
+                if blocking_update_drift:
+                    fail(f"managed target has drift: {', '.join(blocking_update_drift)}")
+            elif state["state"] == "managed" and state["drift"]:
                 fail(f"managed target has drift: {', '.join(state['drift'])}")
             current_setup = state["content_setup_id"] if state["state"] == "managed" else None
             current_profile = state["profile_id"] if state["state"] == "managed" else None
             selected_current = current_setup == content_setup_id and current_profile == profile_id
             if command == "switch" and selected_current:
                 fail("switch requires a different setup or profile")
+            if command == "update" and not selected_current:
+                fail("update requires the selected setup/profile to match the installed identity")
             existing_config = load_target_config(target) if state["state"] == "managed" else None
             desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
             before = capture_managed_files(target)
@@ -2302,9 +2449,11 @@ def mutate_setup(
             backup_publication: BackupPublication | None = None
             if state["state"] == "managed" and not selected_current:
                 backup_publication = write_backup(target, state)
+            managed_transaction: ManagedStateTransaction | None = None
             try:
                 if changed:
-                    replace_managed_state(target, desired, before)
+                    managed_transaction = begin_managed_state_transaction(target, desired, before)
+                    managed_transaction.publish()
                 final = inspect_target(target)
                 if (
                     final["state"] != "managed"
@@ -2315,8 +2464,11 @@ def mutate_setup(
                 ):
                     fail("setup mutation postcondition failed")
                 finish_backup_publication(backup_publication)
+                if managed_transaction is not None:
+                    managed_transaction.commit()
             except BaseException:
-                replace_managed_state(target, before, None)
+                if managed_transaction is not None:
+                    managed_transaction.rollback()
                 rollback_backup_publication(backup_publication)
                 raise
     except BaseException:
@@ -2335,8 +2487,15 @@ def mutate_setup(
     }
 
 
-@bootstrap_locked
 def migrate_setup(
+    target: Path, content_setup_id: str, requested_profile_id: str | None
+) -> dict[str, Any]:
+    require_current_host_supported()
+    return _migrate_setup_locked(target, content_setup_id, requested_profile_id)
+
+
+@bootstrap_locked
+def _migrate_setup_locked(
     target: Path, content_setup_id: str, requested_profile_id: str | None
 ) -> dict[str, Any]:
     render_content_setup(content_setup_id)
@@ -2359,8 +2518,10 @@ def migrate_setup(
             relative for relative, content in desired.items() if before.get(relative) != content
         ]
         backup_publication = write_backup(target, state)
+        managed_transaction: ManagedStateTransaction | None = None
         try:
-            replace_managed_state(target, desired, before)
+            managed_transaction = begin_managed_state_transaction(target, desired, before)
+            managed_transaction.publish()
             final = inspect_target(target)
             if (
                 final["state"] != "managed"
@@ -2371,8 +2532,10 @@ def migrate_setup(
             ):
                 fail("migrate postcondition failed")
             finish_backup_publication(backup_publication)
+            managed_transaction.commit()
         except BaseException:
-            replace_managed_state(target, before, None)
+            if managed_transaction is not None:
+                managed_transaction.rollback()
             rollback_backup_publication(backup_publication)
             raise
     return {
@@ -2388,8 +2551,13 @@ def migrate_setup(
     }
 
 
-@bootstrap_locked
 def restore_slot(target: Path, slot: int) -> dict[str, Any]:
+    require_current_host_supported()
+    return _restore_slot_locked(target, slot)
+
+
+@bootstrap_locked
+def _restore_slot_locked(target: Path, slot: int) -> dict[str, Any]:
     prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
         envelope = load_backup(target, slot)
@@ -2398,13 +2566,17 @@ def restore_slot(target: Path, slot: int) -> dict[str, Any]:
             fail(f"managed target has drift: {', '.join(state['drift'])}")
         before = capture_managed_files(target)
         desired = restore_files_from_backup(envelope)
+        managed_transaction: ManagedStateTransaction | None = None
         try:
-            replace_managed_state(target, desired, before)
+            managed_transaction = begin_managed_state_transaction(target, desired, before)
+            managed_transaction.publish()
             final = inspect_target(target)
             if final["state"] != "managed" or final["drift"]:
                 fail("restore postcondition failed")
+            managed_transaction.commit()
         except BaseException:
-            replace_managed_state(target, before, None)
+            if managed_transaction is not None:
+                managed_transaction.rollback()
             raise
     return {
         "schema_version": 2,
@@ -2418,8 +2590,13 @@ def restore_slot(target: Path, slot: int) -> dict[str, Any]:
     }
 
 
-@bootstrap_locked
 def remove_setup(target: Path) -> dict[str, Any]:
+    require_current_host_supported()
+    return _remove_setup_locked(target)
+
+
+@bootstrap_locked
+def _remove_setup_locked(target: Path) -> dict[str, Any]:
     prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target):
         state = inspect_target(target)
@@ -2427,10 +2604,14 @@ def remove_setup(target: Path) -> dict[str, Any]:
             fail(f"target is not managed (state={state['state']})")
         before = capture_managed_files(target)
         desired = desired_for_remove(target)
+        managed_transaction: ManagedStateTransaction | None = None
         try:
-            replace_managed_state(target, desired, before)
+            managed_transaction = begin_managed_state_transaction(target, desired, before)
+            managed_transaction.publish()
+            managed_transaction.commit()
         except BaseException:
-            replace_managed_state(target, before, None)
+            if managed_transaction is not None:
+                managed_transaction.rollback()
             raise
     return {
         "schema_version": 2,
@@ -3208,8 +3389,94 @@ def restore_optional_software_file(path: Path, content: bytes | None, mode: int 
         atomic_write_with_mode(path, content, mode or OWNER_FILE_MODE)
 
 
-@bootstrap_locked
+def software_file_object_identity(path: Path, label: str) -> dict[str, Any] | None:
+    if not (path.exists() or path.is_symlink()):
+        return None
+    info = require_regular_file(path, label, max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES)
+    content = read_regular_file(path, label, max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES)
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "mtime_ns": info.st_mtime_ns,
+        "sha256": sha256_bytes(content),
+        "size": len(content),
+    }
+
+
+def software_file_object_matches(path: Path, identity: dict[str, Any] | None, label: str) -> bool:
+    try:
+        return software_file_object_identity(path, label) == identity
+    except CursorSetupError:
+        return False
+
+
+def software_tree_object_identity(root: Path, label: str) -> list[dict[str, Any]] | None:
+    if not (root.exists() or root.is_symlink()):
+        return None
+    info = root.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} must be a real directory")
+    records: list[dict[str, Any]] = [
+        {
+            "type": "dir",
+            "path": ".",
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "mode": stat.S_IMODE(info.st_mode),
+            "mtime_ns": info.st_mtime_ns,
+        }
+    ]
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        entry_info = path.lstat()
+        if stat.S_ISLNK(entry_info.st_mode):
+            fail(f"{label} must not contain symlinks: {relative}")
+        if stat.S_ISDIR(entry_info.st_mode):
+            records.append(
+                {
+                    "type": "dir",
+                    "path": relative,
+                    "device": entry_info.st_dev,
+                    "inode": entry_info.st_ino,
+                    "mode": stat.S_IMODE(entry_info.st_mode),
+                    "mtime_ns": entry_info.st_mtime_ns,
+                }
+            )
+            continue
+        if not stat.S_ISREG(entry_info.st_mode):
+            fail(f"{label} must contain only regular files: {relative}")
+        if entry_info.st_nlink != 1:
+            fail(f"{label} file must not have hard-link aliases: {relative}")
+        content = read_regular_file(
+            path, f"{label} file {relative}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
+        )
+        records.append(
+            {
+                "type": "file",
+                "path": relative,
+                "device": entry_info.st_dev,
+                "inode": entry_info.st_ino,
+                "mode": stat.S_IMODE(entry_info.st_mode),
+                "mtime_ns": entry_info.st_mtime_ns,
+                "sha256": sha256_bytes(content),
+                "size": len(content),
+            }
+        )
+    return records
+
+
+def software_tree_object_matches(
+    path: Path, identity: list[dict[str, Any]] | None, label: str
+) -> bool:
+    try:
+        return software_tree_object_identity(path, label) == identity
+    except CursorSetupError:
+        return False
+
+
 def software_status(target: Path) -> dict[str, Any]:
+    require_current_host_supported()
     if not target.exists() and not target.is_symlink():
         return {
             "schema_version": 1,
@@ -3661,57 +3928,86 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
         before_root_exists = root.exists() or root.is_symlink()
         before_versions_exists = versions.exists() or versions.is_symlink()
         before_bin_dir_exists = binary_path.parent.exists() or binary_path.parent.is_symlink()
-        before_version_signature = path_tree_signature(version_dir, "Cursor software version tree")
-        before_launch_signature = path_tree_signature(launch_root, "Cursor launch images tree")
-        before_binary, before_binary_mode = snapshot_optional_software_file(
+        before_version_identity = software_tree_object_identity(
+            version_dir, "Cursor software version tree"
+        )
+        before_launch_identity = software_tree_object_identity(
+            launch_root, "Cursor launch images tree"
+        )
+        before_binary_identity = software_file_object_identity(
             binary_path, f"Cursor managed binary {binary_path}"
         )
-        before_stamp, before_stamp_mode = snapshot_optional_software_file(
+        before_stamp_identity = software_file_object_identity(
             stamp_path, f"Cursor software stamp {stamp_path}"
         )
-        before_marker, before_marker_mode = snapshot_optional_software_file(
+        before_marker_identity = software_file_object_identity(
             marker_path, f"Cursor software transaction marker {marker_path}"
         )
         rollback_parent: Path | None = None
         rollback_version: Path | None = None
         rollback_launch: Path | None = None
+        rollback_binary: Path | None = None
+        rollback_stamp: Path | None = None
+        rollback_marker: Path | None = None
 
         def matches_before() -> bool:
             return (
-                software_tree_matches(
-                    version_dir, before_version_signature, "Cursor software version tree"
+                software_tree_object_matches(
+                    version_dir, before_version_identity, "Cursor software version tree"
                 )
-                and software_tree_matches(
-                    launch_root, before_launch_signature, "Cursor launch images tree"
+                and software_tree_object_matches(
+                    launch_root, before_launch_identity, "Cursor launch images tree"
                 )
-                and optional_software_file_matches(binary_path, before_binary, before_binary_mode)
-                and optional_software_file_matches(stamp_path, before_stamp, before_stamp_mode)
-                and optional_software_file_matches(marker_path, before_marker, before_marker_mode)
+                and software_file_object_matches(
+                    binary_path, before_binary_identity, f"Cursor managed binary {binary_path}"
+                )
+                and software_file_object_matches(
+                    stamp_path, before_stamp_identity, f"Cursor software stamp {stamp_path}"
+                )
+                and software_file_object_matches(
+                    marker_path,
+                    before_marker_identity,
+                    f"Cursor software transaction marker {marker_path}",
+                )
             )
 
         try:
             ensure_real_directory_path(container, "Cursor software container")
             ensure_real_directory_path(root, "Cursor software root")
-            write_software_transaction_marker(target, "remove-cli")
             rollback_parent = Path(
                 tempfile.mkdtemp(prefix=SOFTWARE_REMOVE_ROLLBACK_PREFIX, dir=str(root))
             )
             rollback_parent.chmod(OWNER_DIRECTORY_MODE)
             fsync_directory(root)
-            if before_version_signature is not None:
+            if before_version_identity is not None:
                 ensure_real_directory_path(versions, "Cursor software versions directory")
                 rollback_version = rollback_parent / "version"
                 os.rename(version_dir, rollback_version)
                 fsync_directory(versions)
-            if before_launch_signature is not None:
+            if before_launch_identity is not None:
                 rollback_launch = rollback_parent / LAUNCH_IMAGES_NAME
                 os.rename(launch_root, rollback_launch)
                 fsync_directory(root)
-            remove_software_path(binary_path)
-            remove_software_path(stamp_path)
+            if before_binary_identity is not None:
+                rollback_binary = rollback_parent / "agent"
+                os.rename(binary_path, rollback_binary)
+                fsync_existing_parent(binary_path)
+            if before_stamp_identity is not None:
+                rollback_stamp = rollback_parent / SOFTWARE_STAMP_NAME
+                os.rename(stamp_path, rollback_stamp)
+                fsync_existing_parent(stamp_path)
+            if before_marker_identity is not None:
+                rollback_marker = rollback_parent / SOFTWARE_TRANSACTION_NAME
+                os.rename(marker_path, rollback_marker)
+                fsync_existing_parent(marker_path)
+            write_software_transaction_marker(target, "remove-cli")
             clear_software_transaction_marker(target)
-            if (version_dir.exists() or version_dir.is_symlink()) or (
-                launch_root.exists() or launch_root.is_symlink()
+            if (
+                (version_dir.exists() or version_dir.is_symlink())
+                or (launch_root.exists() or launch_root.is_symlink())
+                or (binary_path.exists() or binary_path.is_symlink())
+                or (stamp_path.exists() or stamp_path.is_symlink())
+                or (marker_path.exists() or marker_path.is_symlink())
             ):
                 fail("remove-cli software tree postcondition failed")
             shutil.rmtree(rollback_parent)
@@ -3725,44 +4021,64 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
             rollback_exact = False
             for _ in range(4):
                 try:
-                    if not software_tree_matches(
-                        version_dir, before_version_signature, "Cursor software version tree"
+                    if not software_tree_object_matches(
+                        version_dir, before_version_identity, "Cursor software version tree"
                     ):
                         remove_software_path(version_dir)
                         if (
-                            before_version_signature is not None
+                            before_version_identity is not None
                             and rollback_version is not None
                             and (rollback_version.exists() or rollback_version.is_symlink())
                         ):
                             os.rename(rollback_version, version_dir)
                             fsync_directory(versions)
-                    if not software_tree_matches(
-                        launch_root, before_launch_signature, "Cursor launch images tree"
+                    if not software_tree_object_matches(
+                        launch_root, before_launch_identity, "Cursor launch images tree"
                     ):
                         remove_software_path(launch_root)
                         if (
-                            before_launch_signature is not None
+                            before_launch_identity is not None
                             and rollback_launch is not None
                             and (rollback_launch.exists() or rollback_launch.is_symlink())
                         ):
                             os.rename(rollback_launch, launch_root)
                             fsync_directory(root)
-                    if not optional_software_file_matches(
-                        binary_path, before_binary, before_binary_mode
+                    if not software_file_object_matches(
+                        binary_path,
+                        before_binary_identity,
+                        f"Cursor managed binary {binary_path}",
                     ):
-                        restore_optional_software_file(
-                            binary_path, before_binary, before_binary_mode
-                        )
-                    if not optional_software_file_matches(
-                        stamp_path, before_stamp, before_stamp_mode
+                        remove_software_path(binary_path)
+                        if rollback_binary is not None and (
+                            rollback_binary.exists() or rollback_binary.is_symlink()
+                        ):
+                            ensure_real_directory_path(
+                                binary_path.parent, "Cursor managed command directory"
+                            )
+                            os.rename(rollback_binary, binary_path)
+                            fsync_existing_parent(binary_path)
+                    if not software_file_object_matches(
+                        stamp_path,
+                        before_stamp_identity,
+                        f"Cursor software stamp {stamp_path}",
                     ):
-                        restore_optional_software_file(stamp_path, before_stamp, before_stamp_mode)
-                    if not optional_software_file_matches(
-                        marker_path, before_marker, before_marker_mode
+                        remove_software_path(stamp_path)
+                        if rollback_stamp is not None and (
+                            rollback_stamp.exists() or rollback_stamp.is_symlink()
+                        ):
+                            os.rename(rollback_stamp, stamp_path)
+                            fsync_existing_parent(stamp_path)
+                    if not software_file_object_matches(
+                        marker_path,
+                        before_marker_identity,
+                        f"Cursor software transaction marker {marker_path}",
                     ):
-                        restore_optional_software_file(
-                            marker_path, before_marker, before_marker_mode
-                        )
+                        remove_software_path(marker_path)
+                        if rollback_marker is not None and (
+                            rollback_marker.exists() or rollback_marker.is_symlink()
+                        ):
+                            os.rename(rollback_marker, marker_path)
+                            fsync_existing_parent(marker_path)
                     if matches_before():
                         rollback_exact = True
                         break
@@ -4148,7 +4464,7 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Inspect an explicit target.")
     add_target(status_parser)
 
-    for command in ("plan", "install", "switch"):
+    for command in ("plan", "install", "update", "switch"):
         command_parser = subparsers.add_parser(command, help=f"{command.title()} a setup.")
         add_setup_profile(command_parser)
         add_target(command_parser)
@@ -4199,6 +4515,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
             "default_setup": DEFAULT_CONTENT_SETUP_ID,
             "default_profile": DEFAULT_PROFILE_ID,
         }
+    if args.command in TARGET_COMMANDS:
+        require_current_host_supported()
     target = resolve_target(args.target)
     if args.command == "status":
         return {
@@ -4209,7 +4527,7 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
         }
     if args.command == "plan":
         return plan_setup(target, args.setup, args.profile)
-    if args.command in {"install", "switch"}:
+    if args.command in {"install", "update", "switch"}:
         return mutate_setup(target, args.setup, args.profile, args.command)
     if args.command == "migrate":
         return migrate_setup(target, args.setup, args.profile)

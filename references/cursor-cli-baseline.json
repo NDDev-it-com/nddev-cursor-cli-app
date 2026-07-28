@@ -105,9 +105,63 @@
     "documentation": "https://cursor.com/docs/cli/reference/configuration"
   },
   "native_capability_surfaces": {
-    "rules": "https://cursor.com/docs/rules",
-    "skills": "https://cursor.com/docs/skills",
-    "agents": "https://cursor.com/docs/subagents",
-    "plugins": "https://cursor.com/docs/reference/plugins"
+    "commands": {
+      "official_documentation": "https://cursor.com/docs/reference/plugins",
+      "plugin_manifest_key": "commands",
+      "product_projection": "installed"
+    },
+    "hooks": {
+      "official_documentation": "https://cursor.com/docs/hooks",
+      "plugin_manifest_key": "hooks",
+      "product_projection": "not-installed"
+    },
+    "mcpServers": {
+      "official_documentation": "https://cursor.com/docs/mcp",
+      "config_key": "mcpServers",
+      "plugin_manifest_key": "mcpServers",
+      "product_projection": "not-installed"
+    },
+    "marketplace_manifests": {
+      "official_documentation": "https://cursor.com/docs/plugins",
+      "plugin_manifest": ".cursor-plugin/plugin.json",
+      "product_projection": "local-plugin-only"
+    },
+    "plugins": {
+      "official_documentation": "https://cursor.com/docs/reference/plugins",
+      "plugin_manifest": ".cursor-plugin/plugin.json",
+      "product_projection": "installed"
+    },
+    "agents": {
+      "official_documentation": "https://cursor.com/docs/subagents",
+      "plugin_manifest_key": "agents",
+      "product_projection": "installed"
+    },
+    "skills": {
+      "official_documentation": "https://cursor.com/docs/skills",
+      "plugin_manifest_key": "skills",
+      "product_projection": "installed"
+    },
+    "rules_instructions": {
+      "official_documentation": "https://cursor.com/docs/rules",
+      "plugin_manifest_key": "rules",
+      "workspace_instruction_file": "AGENTS.md",
+      "product_projection": "installed"
+    },
+    "permissions_config": {
+      "official_documentation": "https://cursor.com/docs/cli/reference/configuration",
+      "config_file": "cli-config.json",
+      "managed_keys": "profiles/<id>/cli-config.json",
+      "product_projection": "installed"
+    },
+    "auth": {
+      "official_documentation": "https://cursor.com/docs/cli/reference/configuration",
+      "product_projection": "preserved-unmanaged"
+    },
+    "status": {
+      "official_documentation": "https://cursor.com/docs/cli/reference/parameters",
+      "manager_command": "status --target <absolute-target> --json",
+      "software_command": "software-status --target <absolute-target> --json",
+      "product_projection": "observed-by-manager"
+    }
   }
 }

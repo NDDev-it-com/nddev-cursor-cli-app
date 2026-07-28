@@ -6,6 +6,10 @@ caller home, system prefix, npm global prefix, or pip environment.
 
 ## Commands
 
+Setup `update --target <absolute-target>` refreshes the selected setup/profile
+identity. It is intentionally separate from the Cursor Agent software command
+`update-cli`.
+
 - `software-status --target <absolute-target>` is read-only and reports
   target-owned software state without executing Cursor.
 - `install-cli --target <absolute-target>` installs only when managed software

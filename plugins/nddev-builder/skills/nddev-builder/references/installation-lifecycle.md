@@ -10,6 +10,9 @@ migration, restore, or removal.
   read-only change plan.
 - `install --target <absolute-target> [--setup <id>] [--profile <id>] [--json]`:
   write current setup/profile into an empty or missing target.
+- `update --target <absolute-target> [--setup <id>] [--profile <id>] [--json]`:
+  refresh an existing target whose installed setup/profile identity matches the
+  selected identity.
 - `switch --target <absolute-target> [--setup <id>] [--profile <id>] [--json]`:
   switch an existing current managed target.
 - `migrate --target <absolute-target> [--setup <id>] [--profile <id>] [--json]`:
@@ -19,8 +22,8 @@ migration, restore, or removal.
   target-bound backup.
 - `remove --target <absolute-target> [--json]`: remove managed setup files and
   preserve unmanaged config keys.
-- `software-status`, `install-cli`, `update-cli`: manage target-owned Cursor
-  Agent software.
+- `software-status`, `install-cli`, `update-cli`, `remove-cli`: manage
+  target-owned Cursor Agent software.
 - `launch --target <absolute-target> -- ...`: run only target-owned `bin/agent`.
 
 Use `cli-tools/nddev_cursor_cli.py` as the source of truth for exact arguments,

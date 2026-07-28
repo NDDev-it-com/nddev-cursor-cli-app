@@ -71,6 +71,66 @@ OBSERVED_VENDOR_ASSETS = {
         },
     }
 }
+EXPECTED_NATIVE_CAPABILITY_SURFACES = {
+    "commands": {
+        "official_documentation": "https://cursor.com/docs/reference/plugins",
+        "plugin_manifest_key": "commands",
+        "product_projection": "installed",
+    },
+    "hooks": {
+        "official_documentation": "https://cursor.com/docs/hooks",
+        "plugin_manifest_key": "hooks",
+        "product_projection": "not-installed",
+    },
+    "mcpServers": {
+        "official_documentation": "https://cursor.com/docs/mcp",
+        "config_key": "mcpServers",
+        "plugin_manifest_key": "mcpServers",
+        "product_projection": "not-installed",
+    },
+    "marketplace_manifests": {
+        "official_documentation": "https://cursor.com/docs/plugins",
+        "plugin_manifest": ".cursor-plugin/plugin.json",
+        "product_projection": "local-plugin-only",
+    },
+    "plugins": {
+        "official_documentation": "https://cursor.com/docs/reference/plugins",
+        "plugin_manifest": ".cursor-plugin/plugin.json",
+        "product_projection": "installed",
+    },
+    "agents": {
+        "official_documentation": "https://cursor.com/docs/subagents",
+        "plugin_manifest_key": "agents",
+        "product_projection": "installed",
+    },
+    "skills": {
+        "official_documentation": "https://cursor.com/docs/skills",
+        "plugin_manifest_key": "skills",
+        "product_projection": "installed",
+    },
+    "rules_instructions": {
+        "official_documentation": "https://cursor.com/docs/rules",
+        "plugin_manifest_key": "rules",
+        "workspace_instruction_file": "AGENTS.md",
+        "product_projection": "installed",
+    },
+    "permissions_config": {
+        "official_documentation": "https://cursor.com/docs/cli/reference/configuration",
+        "config_file": "cli-config.json",
+        "managed_keys": "profiles/<id>/cli-config.json",
+        "product_projection": "installed",
+    },
+    "auth": {
+        "official_documentation": "https://cursor.com/docs/cli/reference/configuration",
+        "product_projection": "preserved-unmanaged",
+    },
+    "status": {
+        "official_documentation": "https://cursor.com/docs/cli/reference/parameters",
+        "manager_command": "status --target <absolute-target> --json",
+        "software_command": "software-status --target <absolute-target> --json",
+        "product_projection": "observed-by-manager",
+    },
+}
 SOFTWARE_KEYS = {
     "artifact_reader",
     "command",
@@ -1393,6 +1453,25 @@ def managed_snapshot(module: Any, target: Path) -> dict[str, tuple[bytes | None,
     return snapshot
 
 
+def managed_object_snapshot(module: Any, target: Path) -> dict[str, tuple[Any, ...]]:
+    snapshot: dict[str, tuple[Any, ...]] = {}
+    for relative in module.managed_paths():
+        path = target / relative
+        if not (path.exists() or path.is_symlink()):
+            snapshot[relative.as_posix()] = ("absent",)
+            continue
+        info = path.lstat()
+        snapshot[relative.as_posix()] = (
+            "file",
+            info.st_dev,
+            info.st_ino,
+            stat.S_IMODE(info.st_mode),
+            info.st_mtime_ns,
+            module.sha256_bytes(path.read_bytes()),
+        )
+    return snapshot
+
+
 def hidden_residue_names(root: Path, prefixes: tuple[str, ...]) -> list[str]:
     if not root.exists() or root.is_symlink():
         return []
@@ -1403,26 +1482,26 @@ def validate_managed_transaction_rollback_fault_smoke(module: Any, errors: list[
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-managed-txn-smoke-") as tmp:
         target = Path(tmp) / "target"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
-        before = managed_snapshot(module, target)
-        real_replace = module.os.replace
-        calls = {"count": 0}
+        before = managed_object_snapshot(module, target)
+        real_rename = module.os.rename
+        injected = {"done": False}
 
-        def flaky_replace(source: Any, destination: Any) -> None:
-            calls["count"] += 1
-            if calls["count"] in {2, 3}:
-                raise OSError("injected managed replace fault")
-            real_replace(source, destination)
+        def flaky_rename(source: Any, destination: Any) -> None:
+            if Path(destination) == target / module.CONFIG_NAME and not injected["done"]:
+                injected["done"] = True
+                raise OSError("injected managed rename fault")
+            real_rename(source, destination)
 
-        with with_restored_attr(module.os, "replace", flaky_replace):
+        with with_restored_attr(module.os, "rename", flaky_rename):
             try:
                 module.mutate_setup(target, "nddev-builder", "safe", "switch")
             except (module.CursorSetupError, OSError):
                 pass
             else:
                 errors.append("managed transaction smoke did not inject a failure")
-        after = managed_snapshot(module, target)
+        after = managed_object_snapshot(module, target)
         if after != before:
-            errors.append("managed transaction rollback did not restore exact prior files")
+            errors.append("managed transaction rollback did not restore exact prior objects")
         control = module.control_root(target)
         residue = hidden_residue_names(control, (module.MANAGED_TRANSACTION_PREFIX,))
         if residue:
@@ -1460,6 +1539,45 @@ def validate_managed_transaction_stale_expected_smoke(module: Any, errors: list[
         residue = hidden_residue_names(control, (module.MANAGED_TRANSACTION_PREFIX,))
         if residue:
             errors.append(f"managed stale smoke created transaction residue: {residue}")
+
+
+def validate_setup_update_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-setup-update-smoke-") as tmp:
+        root = Path(tmp)
+        missing = root / "missing"
+        try:
+            module.mutate_setup(missing, "nddev-builder", "full-auto", "update")
+        except module.CursorSetupError as exc:
+            if "update requires an existing managed target" not in str(exc):
+                errors.append(f"setup update missing target failed unexpectedly: {exc}")
+        else:
+            errors.append("setup update accepted a missing target")
+        if missing.exists() or missing.is_symlink():
+            errors.append("setup update created a missing target")
+
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        wrong_profile = module.mutate_setup(target, "nddev-builder", "full-auto", "update")
+        if wrong_profile.get("command") != "update" or wrong_profile.get("changed") != []:
+            errors.append(
+                f"setup update current no-op returned unexpected payload: {wrong_profile}"
+            )
+        try:
+            module.mutate_setup(target, "nddev-builder", "safe", "update")
+        except module.CursorSetupError as exc:
+            if "match the installed identity" not in str(exc):
+                errors.append(f"setup update wrong identity failed unexpectedly: {exc}")
+        else:
+            errors.append("setup update accepted a different selected identity")
+
+        builder_readme = target / module.BUILDER_TARGET_ROOT / "README.md"
+        builder_readme.write_bytes(b"stale builder projection\n")
+        refreshed = module.mutate_setup(target, "nddev-builder", "full-auto", "update")
+        if builder_readme.relative_to(target).as_posix() not in refreshed["changed"]:
+            errors.append("setup update did not report refreshed builder projection")
+        state = module.inspect_target(target)
+        if state["state"] != "managed" or state["drift"] or state["profile_id"] != "full-auto":
+            errors.append(f"setup update did not restore clean installed identity: {state}")
 
 
 def fake_runtime(module: Any, seed: bytes) -> dict[str, Any]:
@@ -1559,6 +1677,36 @@ def backup_slot_bytes(module: Any, target: Path) -> dict[str, bytes]:
     }
 
 
+def backup_pool_object_snapshot(module: Any, target: Path) -> dict[str, tuple[Any, ...]]:
+    pool = module.backup_pool(target)
+    if not (pool.exists() or pool.is_symlink()):
+        return {"__pool__": ("absent",)}
+    snapshot: dict[str, tuple[Any, ...]] = {}
+    for path in sorted(pool.rglob("*"), key=lambda item: item.relative_to(pool).as_posix()):
+        relative = path.relative_to(pool).as_posix()
+        info = path.lstat()
+        if path.is_symlink():
+            snapshot[relative] = ("symlink", info.st_mode, info.st_mtime_ns)
+        elif path.is_dir():
+            snapshot[relative] = (
+                "dir",
+                info.st_dev,
+                info.st_ino,
+                stat.S_IMODE(info.st_mode),
+                info.st_mtime_ns,
+            )
+        else:
+            snapshot[relative] = (
+                "file",
+                info.st_dev,
+                info.st_ino,
+                stat.S_IMODE(info.st_mode),
+                info.st_mtime_ns,
+                module.sha256_bytes(path.read_bytes()),
+            )
+    return snapshot
+
+
 def backup_residue(module: Any, target: Path) -> list[str]:
     pool = module.backup_pool(target)
     return hidden_residue_names(
@@ -1575,7 +1723,7 @@ def validate_backup_publication_transaction_smoke(module: Any, errors: list[str]
         for _ in range(10):
             module.mutate_setup(target, "nddev-builder", profile, "switch")
             profile = "full-auto" if profile == "safe" else "safe"
-        before_slots = backup_slot_bytes(module, target)
+        before_slots = backup_pool_object_snapshot(module, target)
         real_write_exclusive = module.write_exclusive_file
 
         def failing_backup_write(path: Path, content: bytes) -> None:
@@ -1590,29 +1738,29 @@ def validate_backup_publication_transaction_smoke(module: Any, errors: list[str]
                 pass
             else:
                 errors.append("backup publication smoke did not inject envelope failure")
-        if backup_slot_bytes(module, target) != before_slots:
+        if backup_pool_object_snapshot(module, target) != before_slots:
             errors.append("backup envelope failure changed published backup slots")
         residue = backup_residue(module, target)
         if residue:
             errors.append(f"backup envelope failure left staging residue: {residue}")
 
-        real_replace = module.os.replace
-        calls = {"count": 0}
+        real_rename = module.os.rename
+        injected = {"done": False}
 
-        def flaky_replace(source: Any, destination: Any) -> None:
-            calls["count"] += 1
-            if calls["count"] == 2:
+        def flaky_rename(source: Any, destination: Any) -> None:
+            if Path(destination) == target / module.CONFIG_NAME and not injected["done"]:
+                injected["done"] = True
                 raise OSError("injected managed failure after backup publish")
-            real_replace(source, destination)
+            real_rename(source, destination)
 
-        with with_restored_attr(module.os, "replace", flaky_replace):
+        with with_restored_attr(module.os, "rename", flaky_rename):
             try:
                 module.mutate_setup(target, "nddev-builder", profile, "switch")
             except (module.CursorSetupError, OSError):
                 pass
             else:
                 errors.append("backup rollback smoke did not inject lifecycle failure")
-        if backup_slot_bytes(module, target) != before_slots:
+        if backup_pool_object_snapshot(module, target) != before_slots:
             errors.append("lifecycle failure did not restore prior backup slots")
         residue = backup_residue(module, target)
         if residue:
@@ -1743,6 +1891,12 @@ def validate_target_mode_smokes(module: Any, errors: list[str]) -> None:
                     "install",
                     lambda target=target: module.mutate_setup(
                         target, "nddev-builder", "full-auto", "install"
+                    ),
+                ),
+                (
+                    "update",
+                    lambda target=target: module.mutate_setup(
+                        target, "nddev-builder", "full-auto", "update"
                     ),
                 ),
                 (
@@ -2196,18 +2350,18 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
         if (first["device"], first["inode"]) != (second["device"], second["inode"]):
             errors.append("bootstrap handover did not reuse the persistent lock inode")
         assert_concurrent_command_denied(
-            lambda: run_concurrent_status(module, target),
+            lambda: run_concurrent_switch(module, target, "safe"),
             errors,
             "bootstrap handover smoke",
-            "status",
+            "switch",
         )
         release_b.write_text("release\n", encoding="utf-8")
         if not wait_for_holder_exit(holder_b, error_b, errors, "bootstrap handover B"):
             return
-        result = run_concurrent_status(module, target)
+        result = run_concurrent_switch(module, target, "safe")
         if result.returncode != 0:
             errors.append(
-                "bootstrap handover status after release failed: "
+                "bootstrap handover switch after release failed: "
                 f"stdout={result.stdout} stderr={result.stderr}"
             )
         final_info = lock_path.lstat()
@@ -2228,7 +2382,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
             + "\n",
             encoding="utf-8",
         )
-        result = run_concurrent_status(module, target)
+        result = run_concurrent_switch(module, target, "full-auto")
         if result.returncode == 0:
             errors.append("bootstrap handover accepted mismatched persistent binding")
         elif "bootstrap lock target binding mismatch" not in (f"{result.stdout}\n{result.stderr}"):
@@ -2381,17 +2535,9 @@ def validate_target_local_parent_symlink_smokes(module: Any, errors: list[str]) 
 def validate_unsupported_host_preflight_no_touch_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-host-preflight-smoke-") as tmp:
         root = Path(tmp)
-        target = root / "target"
         bootstrap_root = root / "system-tmp"
         bootstrap_root.mkdir(mode=0o700)
         bootstrap_root.chmod(0o1777)
-        calls: list[str] = []
-
-        def unsupported_uname() -> Any:
-            class Uname:
-                machine = "x86_64"
-
-            return Uname()
 
         def forbidden(name: str) -> Any:
             def fail_forbidden(*args: Any, **kwargs: Any) -> Any:
@@ -2401,42 +2547,104 @@ def validate_unsupported_host_preflight_no_touch_smoke(module: Any, errors: list
 
             return fail_forbidden
 
-        actions: tuple[tuple[str, Any], ...] = (
-            ("install-cli", lambda: module.install_cursor_cli(target, "install-cli")),
-            ("update-cli", lambda: module.install_cursor_cli(target, "update-cli")),
-            ("remove-cli", lambda: module.remove_cursor_cli(target)),
-            ("launch", lambda: module.launch_cursor(target, ["--help"])),
+        command_argvs: tuple[tuple[str, list[str], list[str]], ...] = (
+            ("status", ["status"], []),
+            ("plan", ["plan"], []),
+            ("install", ["install"], []),
+            ("update", ["update"], []),
+            ("switch", ["switch"], []),
+            ("migrate", ["migrate", "--profile", "safe"], []),
+            ("restore", ["restore", "--backup", "0"], []),
+            ("remove", ["remove"], []),
+            ("software-status", ["software-status"], []),
+            ("install-cli", ["install-cli"], []),
+            ("update-cli", ["update-cli"], []),
+            ("remove-cli", ["remove-cli"], []),
+            ("launch", ["launch"], ["--", "--help"]),
         )
-        with (
-            with_restored_attr(module, "bootstrap_lock_system_root", lambda: bootstrap_root),
-            with_restored_attr(module.sys, "platform", "linux"),
-            with_restored_attr(module.os, "uname", unsupported_uname),
-            with_restored_attr(module, "read_linux_os_release", lambda: {"ID": "debian"}),
-            with_restored_attr(module, "detect_linux_libc", lambda: "glibc"),
-            with_restored_attr(module, "read_artifact", forbidden("network")),
-            with_restored_attr(module, "prepare_cursor_artifact", forbidden("stage")),
-            with_restored_attr(module, "target_lock", forbidden("target lock")),
-            with_restored_attr(module, "run_cursor_child", forbidden("child")),
-        ):
-            for name, action in actions:
-                try:
-                    action()
-                except module.CursorSetupError as exc:
-                    if "unsupported Cursor CLI Linux distribution" not in str(exc):
+        unsupported_hosts: tuple[tuple[str, str, str, dict[str, str], str, str], ...] = (
+            (
+                "windows",
+                "win32",
+                "x86_64",
+                {"ID": "ubuntu"},
+                "glibc",
+                "unsupported Cursor CLI host category windows",
+            ),
+            (
+                "non-ubuntu-linux",
+                "linux",
+                "x86_64",
+                {"ID": "debian"},
+                "glibc",
+                "unsupported Cursor CLI Linux distribution",
+            ),
+            (
+                "linux-musl",
+                "linux",
+                "x86_64",
+                {"ID": "ubuntu"},
+                "musl",
+                "unsupported Cursor CLI Linux libc",
+            ),
+            (
+                "unsupported-architecture",
+                "darwin",
+                "sparc64",
+                {"ID": "ubuntu"},
+                "glibc",
+                "unsupported Cursor CLI host category unsupported-architecture",
+            ),
+        )
+        for category, platform_name, machine, os_release, libc, expected in unsupported_hosts:
+            target = root / f"target-{category}"
+            calls: list[str] = []
+
+            def unsupported_uname(machine: str = machine) -> Any:
+                class Uname:
+                    pass
+
+                result = Uname()
+                result.machine = machine
+                return result
+
+            with (
+                with_restored_attr(module, "bootstrap_lock_system_root", lambda: bootstrap_root),
+                with_restored_attr(module.sys, "platform", platform_name),
+                with_restored_attr(module.os, "uname", unsupported_uname),
+                with_restored_attr(module, "read_linux_os_release", lambda: os_release),
+                with_restored_attr(module, "detect_linux_libc", lambda: libc),
+                with_restored_attr(module, "resolve_target", forbidden("resolve target")),
+                with_restored_attr(module, "prepare_lifecycle_target", forbidden("target")),
+                with_restored_attr(module, "target_lock", forbidden("target lock")),
+                with_restored_attr(module, "read_artifact", forbidden("network")),
+                with_restored_attr(module, "prepare_cursor_artifact", forbidden("stage")),
+                with_restored_attr(module, "run_cursor_child", forbidden("child")),
+            ):
+                for name, argv_prefix, argv_suffix in command_argvs:
+                    argv = [*argv_prefix, "--target", str(target), *argv_suffix]
+                    try:
+                        module.run(module.parse_args(argv))
+                    except module.CursorSetupError as exc:
+                        if expected not in str(exc):
+                            errors.append(f"{category}/{name} failed with unexpected error: {exc}")
+                    except AssertionError as exc:
                         errors.append(
-                            f"{name} unsupported host failed with unexpected error: {exc}"
+                            f"{category}/{name} touched forbidden path before host preflight: {exc}"
                         )
-                except AssertionError as exc:
-                    errors.append(f"{name} touched forbidden path before host preflight: {exc}")
-                else:
-                    errors.append(f"{name} accepted unsupported host")
-        product_roots = list(bootstrap_root.iterdir()) if bootstrap_root.exists() else []
-        if product_roots:
-            errors.append(f"unsupported host preflight touched bootstrap root: {product_roots}")
-        if target.exists() or target.is_symlink():
-            errors.append("unsupported host preflight touched target")
-        if calls:
-            errors.append(f"unsupported host preflight touched forbidden operations: {calls}")
+                    else:
+                        errors.append(f"{category}/{name} accepted unsupported host")
+            product_roots = list(bootstrap_root.iterdir()) if bootstrap_root.exists() else []
+            if product_roots:
+                errors.append(
+                    f"{category} unsupported preflight touched bootstrap root: {product_roots}"
+                )
+            if target.exists() or target.is_symlink():
+                errors.append(f"{category} unsupported preflight touched target")
+            if calls:
+                errors.append(
+                    f"{category} unsupported preflight touched forbidden operations: {calls}"
+                )
 
 
 def validate_parser_json_error_smoke(errors: list[str]) -> None:
@@ -2450,8 +2658,12 @@ def validate_parser_json_error_smoke(errors: list[str]) -> None:
         close_fds=True,
         timeout=10,
     )
-    if help_completed.returncode != 0 or "remove-cli" not in help_completed.stdout:
-        errors.append("parser help smoke did not expose remove-cli")
+    if (
+        help_completed.returncode != 0
+        or " update " not in help_completed.stdout
+        or "remove-cli" not in help_completed.stdout
+    ):
+        errors.append("parser help smoke did not expose update/remove-cli")
     completed = subprocess.run(
         [sys.executable, str(ROOT / "cli-tools" / "nddev_cursor_cli.py"), "status", "--json"],
         cwd=ROOT,
@@ -2519,6 +2731,10 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                 (
                     "managed transaction stale expected",
                     lambda: validate_managed_transaction_stale_expected_smoke(module, errors),
+                ),
+                (
+                    "setup update",
+                    lambda: validate_setup_update_smoke(module, errors),
                 ),
                 (
                     "software transaction rollback fault",
@@ -2796,6 +3012,7 @@ def main() -> int:
             "status",
             "plan",
             "install",
+            "update",
             "switch",
             "migrate",
             "restore",
@@ -2809,6 +3026,7 @@ def main() -> int:
             "status",
             "plan",
             "install",
+            "update",
             "switch",
             "migrate",
             "restore",
@@ -2841,6 +3059,8 @@ def main() -> int:
             errors.append("config/nddev-contract.json: content_setup_ids mismatch")
         if setup_system.get("profile_ids") != PROFILE_IDS:
             errors.append("config/nddev-contract.json: profile_ids mismatch")
+        if " update " not in f" {setup_system.get('update_command', '')} ":
+            errors.append("config/nddev-contract.json: setup update_command mismatch")
         validate_runtime_compatibility(
             "config/nddev-contract.json", contract.get("runtime_compatibility", {}), errors
         )
@@ -2994,6 +3214,10 @@ def main() -> int:
         if install.get("npm") is not None or install.get("pip") is not None:
             errors.append(
                 "references/cursor-cli-baseline.json: software_install must not use npm/pip"
+            )
+        if baseline.get("native_capability_surfaces") != EXPECTED_NATIVE_CAPABILITY_SURFACES:
+            errors.append(
+                "references/cursor-cli-baseline.json: native capability surfaces mismatch"
             )
 
     validate_profiles(errors)

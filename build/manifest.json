@@ -16,10 +16,10 @@
     "NDDEV-CURSOR-CLI-SETUP.json"
   ],
   "command_policy": {
-    "json_supported": ["list", "status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "remove-cli"],
+    "json_supported": ["list", "status", "plan", "install", "update", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "remove-cli"],
     "plan_mutates": false,
     "restore_backup_option": "--backup <0..9>",
-    "target_required": ["status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "remove-cli", "launch"]
+    "target_required": ["status", "plan", "install", "update", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "remove-cli", "launch"]
   },
   "backup_policy": {
     "canonical_target_bound": true,
