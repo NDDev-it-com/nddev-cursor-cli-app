@@ -56,6 +56,7 @@ CLEANUP_TOMBSTONES_NAME = "tombstones"
 CLEANUP_SCHEMA_VERSION = 1
 CLEANUP_MAX_TOMBSTONES = 8
 CLEANUP_MAX_ENTRIES = 20000
+CLEANUP_JOURNAL_MAX_BYTES = 2 * 1024 * 1024
 BOOTSTRAP_LOCK_ROOT_PREFIX = "nddev-cursor-cli-app-locks"
 BOOTSTRAP_PRODUCT_LOCK_NAME = "global.lock"
 BOOTSTRAP_LOCK_MAX_BYTES = 4096
@@ -96,7 +97,13 @@ CURSOR_RELEASE_BASE_URL = f"https://downloads.cursor.com/lab/{CURSOR_VERSION}"
 CURSOR_RUNTIME_ROOT = Path("dist-package")
 CURSOR_RUNTIME_ENTRYPOINT = Path("cursor-agent")
 LAUNCH_IMAGES_NAME = "launch-images"
+LAUNCH_IMAGE_PREFIX = ".launch-"
 LAUNCH_IMAGE_AGENT_NAME = "agent"
+LAUNCH_IMAGE_LEASE_NAME = ".lease.lock"
+LAUNCH_IMAGE_METADATA_NAME = "NDDEV-CURSOR-CLI-LAUNCH.json"
+LAUNCH_IMAGE_SCHEMA_VERSION = 1
+LAUNCH_IMAGE_MAX_COUNT = 8
+LAUNCH_IMAGE_MAX_TOTAL_SIZE = SOFTWARE_ARTIFACT_MAX_BYTES
 CURSOR_RUNTIME_REQUIRED_FILES = frozenset(
     {CURSOR_RUNTIME_ENTRYPOINT, Path("node"), Path("index.js")}
 )
@@ -187,6 +194,36 @@ READ_ONLY_TARGET_COMMANDS = frozenset({"status", "plan", "software-status"})
 _PARSER_JSON_ERROR_REQUESTED = False
 SETUP_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 CLEANUP_NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}\Z")
+LAUNCH_IMAGE_NAME_PATTERN = re.compile(r"\.launch-[A-Za-z0-9._-]{1,96}\Z")
+LAUNCH_IMAGE_LEASE_KEYS_V1 = frozenset(
+    {
+        "schema_version",
+        "product_name",
+        "build_version",
+        "canonical_target",
+        "image_name",
+        "lease_name",
+        "created_at",
+    }
+)
+LAUNCH_IMAGE_METADATA_KEYS_V1 = frozenset(
+    {
+        "schema_version",
+        "product_name",
+        "build_version",
+        "canonical_target",
+        "image_name",
+        "lease_name",
+        "lease_sha256",
+        "lease_device",
+        "lease_inode",
+        "entrypoint_sha256",
+        "runtime_tree_sha256",
+        "runtime_size",
+        "runtime_file_count",
+        "created_at",
+    }
+)
 MANAGED_CONFIG_KEYS = (
     "version",
     "editor",
@@ -395,6 +432,39 @@ def read_regular_file(
     return b"".join(blocks)
 
 
+def read_snapshot_file(
+    path: Path, label: str, *, max_bytes: int, allow_hardlinks: bool = False
+) -> bytes:
+    if not allow_hardlinks:
+        return read_regular_file(path, label, max_bytes=max_bytes)
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        fail(f"{label} must be a regular non-symlink file")
+    require_bounded_size(before, label, max_bytes)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            fail(f"{label} changed while it was being opened")
+        if not stat.S_ISREG(opened.st_mode):
+            fail(f"{label} changed to an unsafe file")
+        require_bounded_size(opened, label, max_bytes)
+        content = os.read(descriptor, max_bytes + 1)
+        if len(content) > max_bytes:
+            fail(f"{label} exceeds the {max_bytes}-byte size limit")
+    finally:
+        os.close(descriptor)
+    final = path.lstat()
+    if (final.st_dev, final.st_ino) != (before.st_dev, before.st_ino):
+        fail(f"{label} changed while it was being read")
+    return content
+
+
 def path_exists_no_follow_local(path: Path) -> bool:
     try:
         path.lstat()
@@ -403,7 +473,9 @@ def path_exists_no_follow_local(path: Path) -> bool:
     return True
 
 
-def capture_exact_tree_snapshot(root: Path, label: str) -> dict[str, dict[str, Any]]:
+def capture_exact_tree_snapshot(
+    root: Path, label: str, *, allow_file_hardlinks: bool = False
+) -> dict[str, dict[str, Any]]:
     snapshot: dict[str, dict[str, Any]] = {}
     if not path_exists_no_follow_local(root):
         snapshot["."] = {"kind": "absent"}
@@ -424,11 +496,20 @@ def capture_exact_tree_snapshot(root: Path, label: str) -> dict[str, dict[str, A
         elif stat.S_ISDIR(info.st_mode):
             record["kind"] = "dir"
         elif stat.S_ISREG(info.st_mode):
-            content = read_regular_file(
-                path,
-                f"{label} snapshot file {relative}",
-                max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
-            )
+            snapshot_label = f"{label} snapshot file {relative}"
+            if allow_file_hardlinks:
+                content = read_snapshot_file(
+                    path,
+                    snapshot_label,
+                    max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+                    allow_hardlinks=True,
+                )
+            else:
+                content = read_regular_file(
+                    path,
+                    snapshot_label,
+                    max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+                )
             record["kind"] = "file"
             record["size"] = len(content)
             record["sha256"] = sha256_bytes(content)
@@ -548,7 +629,11 @@ def current_snapshot_paths(root: Path) -> set[str]:
 
 
 def restore_exact_tree_snapshot(
-    root: Path, snapshot: dict[str, dict[str, Any]], label: str
+    root: Path,
+    snapshot: dict[str, dict[str, Any]],
+    label: str,
+    *,
+    allow_file_hardlinks: bool = False,
 ) -> None:
     if snapshot.get(".", {}).get("kind") == "absent":
         if path_exists_no_follow_local(root):
@@ -575,11 +660,20 @@ def restore_exact_tree_snapshot(
                 info = path.lstat()
                 kind = record["kind"]
                 if kind == "file":
-                    content = read_regular_file(
-                        path,
-                        f"{label} rollback file {relative}",
-                        max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
-                    )
+                    rollback_label = f"{label} rollback file {relative}"
+                    if allow_file_hardlinks:
+                        content = read_snapshot_file(
+                            path,
+                            rollback_label,
+                            max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+                            allow_hardlinks=True,
+                        )
+                    else:
+                        content = read_regular_file(
+                            path,
+                            rollback_label,
+                            max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+                        )
                     if content != record["content"] or stat.S_IMODE(info.st_mode) != record["mode"]:
                         restore_snapshot_file_content(
                             path, record, f"{label} rollback file {relative}"
@@ -593,7 +687,14 @@ def restore_exact_tree_snapshot(
                 else:
                     fail(f"{label} rollback snapshot has invalid kind: {relative}")
                 restore_snapshot_metadata(path, record, f"{label} rollback path {relative}")
-            if capture_exact_tree_snapshot(root, label) == snapshot:
+            if (
+                capture_exact_tree_snapshot(
+                    root,
+                    label,
+                    allow_file_hardlinks=allow_file_hardlinks,
+                )
+                == snapshot
+            ):
                 return
         except BaseException as exc:  # noqa: BLE001 - retry exact restoration.
             errors.append(str(exc))
@@ -988,14 +1089,30 @@ def bootstrap_anchor_creation_guard() -> Iterator[None]:
 def capture_bootstrap_lock_envelope(root: Path) -> dict[str, Any]:
     return {
         "parent": capture_existing_directory_object(root.parent, "bootstrap lock parent"),
-        "root": capture_exact_tree_snapshot(root, "bootstrap lock root"),
+        "root": capture_exact_tree_snapshot(
+            root,
+            "bootstrap lock root",
+            allow_file_hardlinks=True,
+        ),
     }
 
 
 def restore_bootstrap_lock_envelope(root: Path, envelope: dict[str, Any]) -> None:
-    restore_exact_tree_snapshot(root, envelope["root"], "bootstrap lock root")
+    restore_exact_tree_snapshot(
+        root,
+        envelope["root"],
+        "bootstrap lock root",
+        allow_file_hardlinks=True,
+    )
     restore_existing_directory_object(root.parent, envelope["parent"], "bootstrap lock parent")
-    if capture_exact_tree_snapshot(root, "bootstrap lock root") != envelope["root"]:
+    if (
+        capture_exact_tree_snapshot(
+            root,
+            "bootstrap lock root",
+            allow_file_hardlinks=True,
+        )
+        != envelope["root"]
+    ):
         fail("bootstrap lock root exact rollback verification failed")
     if capture_existing_directory_object(root.parent, "bootstrap lock parent") != envelope["parent"]:
         fail("bootstrap lock parent exact rollback verification failed")
@@ -1397,7 +1514,9 @@ def bootstrap_anchor_lock(
             path, descriptor, "bootstrap lock", allowed_nlinks={1, 2}
         )
         needs_alias_recovery = lock_info.st_nlink == 2
-        lock_mode = fcntl.LOCK_EX if exclusive or needs_alias_recovery else fcntl.LOCK_SH
+        if needs_alias_recovery and not exclusive:
+            fail("bootstrap lock publication is incomplete")
+        lock_mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         if not locked:
             try:
                 fcntl.flock(descriptor, lock_mode | fcntl.LOCK_NB)
@@ -1646,6 +1765,8 @@ def with_mutation_bootstrap_target(
         product_context.__exit__(None, None, None)
         product_context = None
         cleanup_drained = drain_cleanup_pending(target, fail_closed=True)
+        launch_images_drained = drain_launch_image_residue(target, fail_closed=True)
+        cleanup_drained = cleanup_drained or launch_images_drained
         result = function(target, *args, **kwargs)
         if isinstance(result, dict):
             result.setdefault("cleanup_drained", cleanup_drained)
@@ -2002,10 +2123,14 @@ def _inspect_target_locked(target: Path) -> dict[str, Any]:
             "launchable": False,
             "cleanup_pending": False,
             "cleanup": None,
+            "launch_image_residue_pending": False,
+            "launch_image_residue": None,
         }
     if target.is_symlink() or not target.is_dir():
         fail("--target must be a real directory")
     cleanup = cleanup_pending_result(target)
+    launch_residue = launch_image_residue_result(target)
+    launch_drift = launch_image_drift_findings(launch_residue)
     target_safety = target_safety_findings(target)
     stamp = load_stamp(target)
     config_exists = (target / CONFIG_NAME).exists() or (target / CONFIG_NAME).is_symlink()
@@ -2013,7 +2138,13 @@ def _inspect_target_locked(target: Path) -> dict[str, Any]:
         builder_findings = builder_parent_findings(target)
         runtime_findings = target_local_parent_findings(target, runtime_parent_directories(target))
         control_findings = control_state_findings(target, require_persistent_lock=False)
-        drift = [*target_safety, *builder_findings, *runtime_findings, *control_findings]
+        drift = [
+            *target_safety,
+            *builder_findings,
+            *runtime_findings,
+            *control_findings,
+            *launch_drift,
+        ]
         return {
             "state": "unmanaged" if config_exists else "empty",
             "setup_id": None,
@@ -2031,12 +2162,14 @@ def _inspect_target_locked(target: Path) -> dict[str, Any]:
             ),
             "launchable": False,
             **cleanup,
+            **launch_residue,
         }
     drift = [
         *target_safety,
         *control_state_findings(target, require_persistent_lock=True),
         *drift_for_target(target, stamp),
         *target_local_parent_findings(target, runtime_parent_directories(target)),
+        *launch_drift,
     ]
     drift = list(dict.fromkeys(drift))
     if stamp_is_legacy(stamp):
@@ -2068,6 +2201,7 @@ def _inspect_target_locked(target: Path) -> dict[str, Any]:
         "builder_projection": builder_state,
         "launchable": not stamp_is_legacy(stamp) and not drift,
         **cleanup,
+        **launch_residue,
     }
 
 
@@ -2276,7 +2410,7 @@ def cleanup_journal_bytes(target: Path, tombstones: list[dict[str, Any]]) -> byt
     total_size = sum(int(tombstone["total_size"]) for tombstone in tombstones)
     if entry_count > CLEANUP_MAX_ENTRIES or total_size > CLEANUP_MAX_TOTAL_SIZE:
         cleanup_metadata_error("cleanup journal exceeds declared bounds")
-    return canonical_json(
+    content = canonical_json(
         {
             "schema_version": CLEANUP_SCHEMA_VERSION,
             "product_name": PRODUCT_NAME,
@@ -2290,6 +2424,9 @@ def cleanup_journal_bytes(target: Path, tombstones: list[dict[str, Any]]) -> byt
             "tombstones": tombstones,
         }
     )
+    if len(content) > CLEANUP_JOURNAL_MAX_BYTES:
+        cleanup_metadata_error("cleanup journal exceeds serialized size bound")
+    return content
 
 
 def publish_cleanup_journal_no_replace(journal: Path, content: bytes) -> bool:
@@ -2327,7 +2464,11 @@ def publish_cleanup_journal_no_replace(journal: Path, content: bytes) -> bool:
         try:
             temporary.unlink()
             fsync_directory(journal.parent)
-            require_regular_file(journal, "cleanup journal", max_bytes=METADATA_MAX_BYTES)
+            require_regular_file(
+                journal,
+                "cleanup journal",
+                max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+            )
         except BaseException:
             return True
     except FileExistsError:
@@ -2366,7 +2507,7 @@ def recover_cleanup_journal_publication_alias(journal: Path) -> None:
         cleanup_metadata_error("cleanup journal must be owned by the current user")
     if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
         cleanup_metadata_error("cleanup journal must have mode 0600")
-    require_bounded_size(info, "cleanup journal", METADATA_MAX_BYTES)
+    require_bounded_size(info, "cleanup journal", CLEANUP_JOURNAL_MAX_BYTES)
     if info.st_nlink == 1:
         return
     if info.st_nlink != 2:
@@ -2392,7 +2533,11 @@ def recover_cleanup_journal_publication_alias(journal: Path) -> None:
         cleanup_metadata_error("cleanup journal has an unknown publication alias")
     alias.unlink()
     fsync_directory(journal.parent)
-    final = require_regular_file(journal, "cleanup journal", max_bytes=METADATA_MAX_BYTES)
+    final = require_regular_file(
+        journal,
+        "cleanup journal",
+        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+    )
     if final.st_nlink != 1:
         cleanup_metadata_error("cleanup journal alias recovery did not restore nlink=1")
 
@@ -2402,10 +2547,21 @@ def load_cleanup_journal(target: Path, *, recover_alias: bool) -> dict[str, Any]
     journal = cleanup_journal_path(target)
     if recover_alias:
         recover_cleanup_journal_publication_alias(journal)
-    info = require_regular_file(journal, "cleanup journal", max_bytes=METADATA_MAX_BYTES)
+    info = require_regular_file(
+        journal,
+        "cleanup journal",
+        max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+    )
     if info.st_nlink != 1:
         cleanup_metadata_error("cleanup journal publication is incomplete")
-    loaded = load_json_object(journal, "cleanup journal")
+    loaded = parse_json_object(
+        read_regular_file(
+            journal,
+            "cleanup journal",
+            max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
+        ),
+        "cleanup journal",
+    )
     require_exact_keys(loaded, CLEANUP_JOURNAL_KEYS_V1, "cleanup journal")
     if (
         loaded["schema_version"] != CLEANUP_SCHEMA_VERSION
@@ -2709,6 +2865,11 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
     pending = cleanup_pending_root(target)
     if path_exists_no_follow(pending):
         cleanup_metadata_error("cleanup-pending state already exists")
+    tombstones = [
+        cleanup_tree_manifest(source, name, "cleanup tombstone")
+        for source, name in active_sources
+    ]
+    journal_content = cleanup_journal_bytes(target, tombstones)
     stage: Path | None = None
     pending_visible = False
     moved: list[tuple[Path, Path]] = []
@@ -2722,7 +2883,6 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
         tombstones_root.mkdir(mode=OWNER_DIRECTORY_MODE)
         tombstones_root.chmod(OWNER_DIRECTORY_MODE)
         fsync_directory(stage)
-        tombstones: list[dict[str, Any]] = []
         for source, name in active_sources:
             destination = tombstones_root / name
             if destination.exists() or destination.is_symlink():
@@ -2731,8 +2891,6 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
             fsync_directory(source.parent)
             fsync_directory(tombstones_root)
             moved.append((destination, source))
-            tombstones.append(cleanup_tree_manifest(destination, name, "cleanup tombstone"))
-        journal_content = cleanup_journal_bytes(target, tombstones)
         if publish_cleanup_journal_no_replace(stage / CLEANUP_JOURNAL_NAME, journal_content):
             fail("cleanup journal stage publication is incomplete")
         if path_exists_no_follow(pending):
@@ -4172,6 +4330,385 @@ def launch_images_root(target: Path) -> Path:
     return software_root(target) / LAUNCH_IMAGES_NAME
 
 
+def launch_image_metadata_path(image_root: Path) -> Path:
+    return image_root / LAUNCH_IMAGE_METADATA_NAME
+
+
+def launch_image_lease_path(image_root: Path) -> Path:
+    return image_root / LAUNCH_IMAGE_LEASE_NAME
+
+
+def require_launch_image_name(name: str) -> str:
+    if not LAUNCH_IMAGE_NAME_PATTERN.fullmatch(name):
+        fail("Cursor launch image residue is malformed: image name is not bounded")
+    return name
+
+
+def launch_image_tombstone_name(image_root: Path) -> str:
+    digest = sha256_bytes(image_root.name.encode("utf-8"))
+    return f"launch-image-{digest[:16]}"
+
+
+def launch_image_lease_record(target: Path, image_root: Path, created_at: int) -> dict[str, Any]:
+    return {
+        "schema_version": LAUNCH_IMAGE_SCHEMA_VERSION,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "canonical_target": str(target.resolve(strict=False)),
+        "image_name": image_root.name,
+        "lease_name": LAUNCH_IMAGE_LEASE_NAME,
+        "created_at": created_at,
+    }
+
+
+def launch_image_metadata_record(
+    target: Path,
+    image_root: Path,
+    *,
+    lease_content: bytes,
+    lease_info: os.stat_result,
+    entrypoint_sha256: str,
+    runtime_tree_sha256: str,
+    runtime_size: int,
+    runtime_file_count: int,
+    created_at: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": LAUNCH_IMAGE_SCHEMA_VERSION,
+        "product_name": PRODUCT_NAME,
+        "build_version": VERSION,
+        "canonical_target": str(target.resolve(strict=False)),
+        "image_name": image_root.name,
+        "lease_name": LAUNCH_IMAGE_LEASE_NAME,
+        "lease_sha256": sha256_bytes(lease_content),
+        "lease_device": lease_info.st_dev,
+        "lease_inode": lease_info.st_ino,
+        "entrypoint_sha256": entrypoint_sha256,
+        "runtime_tree_sha256": runtime_tree_sha256,
+        "runtime_size": runtime_size,
+        "runtime_file_count": runtime_file_count,
+        "created_at": created_at,
+    }
+
+
+def launch_image_runtime_payload_from_disk(root: Path) -> dict[str, tuple[bytes, int]]:
+    files: dict[str, tuple[bytes, int]] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if not relative.parts:
+            continue
+        if Path(relative.parts[0]) in CURSOR_RUNTIME_EPHEMERAL_ROOTS:
+            continue
+        if relative == Path(LAUNCH_IMAGE_AGENT_NAME):
+            continue
+        if relative == Path(LAUNCH_IMAGE_LEASE_NAME):
+            continue
+        if relative == Path(LAUNCH_IMAGE_METADATA_NAME):
+            continue
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"Cursor launch image residue is malformed: symlink {relative.as_posix()}")
+        if stat.S_ISDIR(info.st_mode):
+            if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+                fail(
+                    "Cursor launch image residue is malformed: runtime directory mode "
+                    f"{relative.as_posix()}"
+                )
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            fail(
+                "Cursor launch image residue is malformed: unsupported runtime object "
+                f"{relative.as_posix()}"
+            )
+        if info.st_nlink != 1:
+            fail(
+                "Cursor launch image residue is malformed: runtime file has hard-link aliases "
+                f"{relative.as_posix()}"
+            )
+        mode = stat.S_IMODE(info.st_mode)
+        if mode not in {OWNER_FILE_MODE, OWNER_EXEC_MODE}:
+            fail(
+                "Cursor launch image residue is malformed: runtime file mode "
+                f"{relative.as_posix()}"
+            )
+        files[relative.as_posix()] = (
+            read_regular_file(
+                path,
+                f"Cursor launch image runtime file {relative.as_posix()}",
+                max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+            ),
+            mode,
+        )
+    missing = sorted(
+        path.as_posix() for path in CURSOR_RUNTIME_REQUIRED_FILES - {Path(name) for name in files}
+    )
+    if missing:
+        fail(f"Cursor launch image residue is malformed: runtime is missing {missing}")
+    return files
+
+
+def validate_launch_image_tree_bounds(root: Path) -> dict[str, int]:
+    uid = current_user_id()
+    entry_count = 1
+    total_size = 0
+    for path in sorted(root.rglob("*")):
+        entry_count += 1
+        if entry_count > CLEANUP_MAX_ENTRIES:
+            fail("Cursor launch image residue is malformed: image entry count exceeds bound")
+        info = path.lstat()
+        if uid is not None and info.st_uid != uid:
+            fail("Cursor launch image residue is malformed: image owner mismatch")
+        if stat.S_ISLNK(info.st_mode):
+            fail("Cursor launch image residue is malformed: image contains a symlink")
+        if stat.S_ISDIR(info.st_mode):
+            mode = stat.S_IMODE(info.st_mode)
+            if mode not in {OWNER_DIRECTORY_MODE, LOCK_HELD_DIRECTORY_MODE}:
+                fail("Cursor launch image residue is malformed: image directory mode")
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            fail("Cursor launch image residue is malformed: image contains unsupported object")
+        if info.st_nlink != 1:
+            fail("Cursor launch image residue is malformed: image file has hard-link aliases")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode not in {OWNER_FILE_MODE, OWNER_EXEC_MODE}:
+            fail("Cursor launch image residue is malformed: image file mode")
+        require_bounded_size(info, "Cursor launch image file", SOFTWARE_ARTIFACT_MAX_BYTES)
+        total_size += info.st_size
+        if total_size > LAUNCH_IMAGE_MAX_TOTAL_SIZE:
+            fail("Cursor launch image residue is malformed: image bytes exceed bound")
+    return {"entry_count": entry_count, "total_size": total_size}
+
+
+def validate_launch_image_record(target: Path, image_root: Path) -> dict[str, Any]:
+    require_launch_image_name(image_root.name)
+    root_info = require_owner_directory_mode(
+        image_root,
+        "Cursor launch image",
+        {OWNER_DIRECTORY_MODE, LOCK_HELD_DIRECTORY_MODE},
+    )
+    metadata_path = launch_image_metadata_path(image_root)
+    metadata = load_json_object(metadata_path, "Cursor launch image metadata")
+    require_exact_keys(metadata, LAUNCH_IMAGE_METADATA_KEYS_V1, "Cursor launch image metadata")
+    lease_path = launch_image_lease_path(image_root)
+    lease_content = read_regular_file(
+        lease_path,
+        "Cursor launch image lease",
+        max_bytes=METADATA_MAX_BYTES,
+    )
+    lease = parse_json_object(lease_content, "Cursor launch image lease")
+    require_exact_keys(lease, LAUNCH_IMAGE_LEASE_KEYS_V1, "Cursor launch image lease")
+    lease_info = require_regular_file(
+        lease_path,
+        "Cursor launch image lease",
+        max_bytes=METADATA_MAX_BYTES,
+    )
+    if (
+        metadata["schema_version"] != LAUNCH_IMAGE_SCHEMA_VERSION
+        or metadata["product_name"] != PRODUCT_NAME
+        or metadata["build_version"] != VERSION
+        or metadata["canonical_target"] != str(target.resolve(strict=False))
+        or metadata["image_name"] != image_root.name
+        or metadata["lease_name"] != LAUNCH_IMAGE_LEASE_NAME
+        or metadata["lease_sha256"] != sha256_bytes(lease_content)
+        or metadata["lease_device"] != lease_info.st_dev
+        or metadata["lease_inode"] != lease_info.st_ino
+    ):
+        fail("Cursor launch image residue is malformed: metadata binding mismatch")
+    if (
+        lease["schema_version"] != LAUNCH_IMAGE_SCHEMA_VERSION
+        or lease["product_name"] != PRODUCT_NAME
+        or lease["build_version"] != VERSION
+        or lease["canonical_target"] != str(target.resolve(strict=False))
+        or lease["image_name"] != image_root.name
+        or lease["lease_name"] != LAUNCH_IMAGE_LEASE_NAME
+        or lease["created_at"] != metadata["created_at"]
+    ):
+        fail("Cursor launch image residue is malformed: lease binding mismatch")
+    for key in ("lease_device", "lease_inode", "runtime_size", "runtime_file_count", "created_at"):
+        if not isinstance(metadata[key], int) or metadata[key] < 0:
+            fail(f"Cursor launch image residue is malformed: metadata {key}")
+    for key in ("lease_sha256", "entrypoint_sha256", "runtime_tree_sha256"):
+        if not isinstance(metadata[key], str) or not SHA256_HEX_PATTERN.fullmatch(metadata[key]):
+            fail(f"Cursor launch image residue is malformed: metadata {key}")
+    executable = image_root / LAUNCH_IMAGE_AGENT_NAME
+    executable_content = read_regular_file(
+        executable,
+        "Cursor launch image executable",
+        max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+    )
+    executable_info = require_regular_file(
+        executable,
+        "Cursor launch image executable",
+        max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES,
+    )
+    if stat.S_IMODE(executable_info.st_mode) != OWNER_EXEC_MODE:
+        fail("Cursor launch image residue is malformed: executable mode")
+    if sha256_bytes(executable_content) != metadata["entrypoint_sha256"]:
+        fail("Cursor launch image residue is malformed: executable digest")
+    runtime_files = launch_image_runtime_payload_from_disk(image_root)
+    runtime_tree_sha256, runtime_size, runtime_file_count = runtime_tree_digest(runtime_files)
+    if (
+        runtime_tree_sha256 != metadata["runtime_tree_sha256"]
+        or runtime_size != metadata["runtime_size"]
+        or runtime_file_count != metadata["runtime_file_count"]
+    ):
+        fail("Cursor launch image residue is malformed: runtime binding mismatch")
+    bounds = validate_launch_image_tree_bounds(image_root)
+    return {
+        "path": image_root,
+        "name": image_root.name,
+        "lease_path": lease_path,
+        "root_mode": stat.S_IMODE(root_info.st_mode),
+        "entry_count": bounds["entry_count"],
+        "total_size": bounds["total_size"],
+        "created_at": metadata["created_at"],
+    }
+
+
+def launch_image_lease_is_active(lease_path: Path) -> bool:
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lease_path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("Cursor launch image residue is malformed: lease path is unsafe")
+        raise
+    try:
+        require_lock_file_matches_fd(lease_path, descriptor, "Cursor launch image lease")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            fail(f"Cursor launch image lease could not be probed: {exc}")
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return False
+    finally:
+        os.close(descriptor)
+
+
+def launch_image_residue_metadata(
+    target: Path, *, require_stale_exact: bool
+) -> dict[str, Any]:
+    root = launch_images_root(target)
+    if not path_exists_no_follow(root):
+        return {"pending": False, "metadata": None, "records": []}
+    require_owner_private_directory(root, "Cursor launch images root")
+    children = sorted(root.iterdir(), key=lambda item: item.name)
+    if len(children) > LAUNCH_IMAGE_MAX_COUNT:
+        fail("Cursor launch image residue is malformed: image count exceeds bound")
+    records: list[dict[str, Any]] = []
+    active = 0
+    stale = 0
+    total_size = 0
+    total_entries = 0
+    for child in children:
+        if child.is_symlink() or not child.is_dir():
+            fail("Cursor launch image residue is malformed: root contains unknown entries")
+        record = validate_launch_image_record(target, child)
+        is_active = launch_image_lease_is_active(Path(record["lease_path"]))
+        if is_active:
+            active += 1
+            state = "active"
+        else:
+            stale += 1
+            state = "stale"
+            if require_stale_exact:
+                if record["root_mode"] != OWNER_DIRECTORY_MODE:
+                    set_owner_directory_mode(
+                        child,
+                        f"Cursor stale launch image {child}",
+                        OWNER_DIRECTORY_MODE,
+                    )
+                    record = validate_launch_image_record(target, child)
+                cleanup_tree_manifest(
+                    child,
+                    launch_image_tombstone_name(child),
+                    "Cursor stale launch image",
+                )
+        total_size += int(record["total_size"])
+        total_entries += int(record["entry_count"])
+        if total_size > LAUNCH_IMAGE_MAX_TOTAL_SIZE:
+            fail("Cursor launch image residue is malformed: total image bytes exceed bound")
+        records.append(
+            {
+                "name": record["name"],
+                "path": record["path"],
+                "state": state,
+                "entry_count": record["entry_count"],
+                "total_size": record["total_size"],
+                "created_at": record["created_at"],
+            }
+        )
+    if not records:
+        return {"pending": False, "metadata": None, "records": []}
+    return {
+        "pending": True,
+        "metadata": {
+            "schema_version": LAUNCH_IMAGE_SCHEMA_VERSION,
+            "count": len(records),
+            "active_count": active,
+            "stale_count": stale,
+            "entry_count": total_entries,
+            "total_size": total_size,
+            "max_count": LAUNCH_IMAGE_MAX_COUNT,
+            "max_total_size": LAUNCH_IMAGE_MAX_TOTAL_SIZE,
+        },
+        "records": records,
+    }
+
+
+def launch_image_residue_result(target: Path) -> dict[str, Any]:
+    state = launch_image_residue_metadata(target, require_stale_exact=False)
+    return {
+        "launch_image_residue_pending": bool(state["pending"]),
+        "launch_image_residue": state["metadata"],
+    }
+
+
+def launch_image_drift_findings(result: dict[str, Any]) -> list[str]:
+    metadata = result.get("launch_image_residue")
+    if not metadata:
+        return []
+    findings: list[str] = []
+    if int(metadata.get("active_count", 0)):
+        findings.append("launch-images:active")
+    if int(metadata.get("stale_count", 0)):
+        findings.append("launch-images:stale")
+    return findings
+
+
+def drain_launch_image_residue(target: Path, *, fail_closed: bool) -> bool:
+    try:
+        state = launch_image_residue_metadata(target, require_stale_exact=True)
+        if not state["pending"]:
+            return False
+        active = int(state["metadata"]["active_count"])
+        if active:
+            fail("Cursor launch image residue is still active")
+        sources = [
+            (Path(record["path"]), launch_image_tombstone_name(Path(record["path"])))
+            for record in state["records"]
+            if record["state"] == "stale"
+        ]
+        if not sources:
+            return False
+        publish_cleanup_pending(target, sources)
+        if cleanup_pending_metadata(target, recover_alias=False)["pending"]:
+            fail("Cursor launch image cleanup is still pending")
+        remove_empty_directory(launch_images_root(target))
+        return True
+    except BaseException:
+        if fail_closed:
+            raise
+        return True
+
+
 def mutable_runtime_tmp_dir(target: Path) -> Path:
     return target / MUTABLE_RUNTIME_TMP_ROOT
 
@@ -4223,6 +4760,7 @@ def software_presence(target: Path) -> list[str]:
     directory_labels = (
         (software_container(target), ".nddev-software"),
         (software_root(target), ".nddev-software/cursor-cli"),
+        (launch_images_root(target), ".nddev-software/cursor-cli/launch-images"),
         (
             software_version_dir(target),
             ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
@@ -5033,13 +5571,17 @@ def _software_status_locked(target: Path) -> dict[str, Any]:
             "drift": [],
             "cleanup_pending": False,
             "cleanup": None,
+            "launch_image_residue_pending": False,
+            "launch_image_residue": None,
         }
     resolve_target(str(target))
     cleanup = cleanup_pending_result(target)
+    launch_residue = launch_image_residue_result(target)
     binary = managed_agent_path(target)
     version_binary = software_tree_binary(target)
     installed = False
     drift: list[str] = target_safety_findings(target)
+    drift.extend(launch_image_drift_findings(launch_residue))
     runtime_findings = target_local_parent_findings(target, runtime_parent_directories(target))
     drift.extend(runtime_findings)
     presence = [] if runtime_findings else software_presence(target)
@@ -5057,6 +5599,7 @@ def _software_status_locked(target: Path) -> dict[str, Any]:
             "managed_command": str(binary),
             "drift": drift,
             **cleanup,
+            **launch_residue,
         }
     directory_mode_drift = False
     for directory, label in (
@@ -5177,6 +5720,7 @@ def _software_status_locked(target: Path) -> dict[str, Any]:
         "managed_command": str(binary.resolve(strict=False)),
         "drift": drift,
         **cleanup,
+        **launch_residue,
     }
 
 
@@ -5821,9 +6365,18 @@ def revalidate_executable_identity(
 
 
 def run_cursor_child(
-    executable: Path, forwarded: list[str], environment: dict[str, str]
+    executable: Path,
+    forwarded: list[str],
+    environment: dict[str, str],
+    *,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[Any]:
-    return subprocess.run([str(executable), *forwarded], env=environment, check=False)
+    return subprocess.run(
+        [str(executable), *forwarded],
+        env=environment,
+        check=False,
+        pass_fds=pass_fds,
+    )
 
 
 def report_cleanup_failure_after_child_exception(
@@ -5865,15 +6418,57 @@ def cleanup_launch_image(path: Path | None) -> None:
     with contextlib.suppress(FileNotFoundError):
         make_tree_owner_writable(path)
         shutil.rmtree(path)
+        fsync_directory(path.parent)
+
+
+def close_launch_image_lease(lease_fd: int | None) -> None:
+    if lease_fd is None:
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(lease_fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(lease_fd)
+
+
+def create_launch_image_lease(target: Path, image_root: Path, created_at: int) -> tuple[int, bytes]:
+    lease = launch_image_lease_path(image_root)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lease, flags, OWNER_FILE_MODE)
+    try:
+        content = canonical_json(launch_image_lease_record(target, image_root, created_at))
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                fail("Cursor launch image lease write made no progress")
+            view = view[written:]
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        os.fsync(descriptor)
+        require_lock_file_matches_fd(lease, descriptor, "Cursor launch image lease")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fsync_directory(image_root)
+        return descriptor, content
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
 
 
 def create_launch_image(target: Path) -> dict[str, Any]:
     images_root = launch_images_root(target)
     ensure_real_directory_path(images_root, "Cursor launch images root")
-    image_root = Path(tempfile.mkdtemp(prefix=".launch-", dir=str(images_root)))
+    image_root = Path(tempfile.mkdtemp(prefix=LAUNCH_IMAGE_PREFIX, dir=str(images_root)))
     image_root.chmod(OWNER_DIRECTORY_MODE)
+    lease_fd: int | None = None
     try:
         files = snapshot_runtime_payload(software_version_dir(target))
+        runtime_tree_sha256, runtime_size, runtime_file_count = runtime_tree_digest(files)
+        created_at = int(time.time())
+        lease_fd, lease_content = create_launch_image_lease(target, image_root, created_at)
         write_cursor_runtime_tree(image_root, files)
         running = image_root / ".running"
         running.mkdir(mode=OWNER_DIRECTORY_MODE)
@@ -5881,12 +6476,33 @@ def create_launch_image(target: Path) -> dict[str, Any]:
         launcher = agent_launcher_bytes_for_runtime_dir(image_root)
         executable = image_root / LAUNCH_IMAGE_AGENT_NAME
         atomic_write_executable(executable, launcher)
+        lease_info = require_lock_file_matches_fd(
+            launch_image_lease_path(image_root),
+            lease_fd,
+            "Cursor launch image lease",
+        )
+        metadata = launch_image_metadata_record(
+            target,
+            image_root,
+            lease_content=lease_content,
+            lease_info=lease_info,
+            entrypoint_sha256=sha256_bytes(launcher),
+            runtime_tree_sha256=runtime_tree_sha256,
+            runtime_size=runtime_size,
+            runtime_file_count=runtime_file_count,
+            created_at=created_at,
+        )
+        atomic_write(launch_image_metadata_path(image_root), canonical_json(metadata))
+        fsync_directory(image_root)
+        validate_launch_image_record(target, image_root)
         return {
             "root": image_root,
             "executable": executable,
+            "lease_fd": lease_fd,
             "entrypoint_sha256": sha256_bytes(launcher),
         }
     except BaseException:
+        close_launch_image_lease(lease_fd)
         cleanup_launch_image(image_root)
         raise
 
@@ -5984,7 +6600,12 @@ def _launch_cursor_locked(target: Path, cursor_args: list[str]) -> int:
                         str(launch_image["entrypoint_sha256"]),
                         "Cursor launch image executable",
                     )
-                    completed = run_cursor_child(executable, forwarded, environment)
+                    completed = run_cursor_child(
+                        executable,
+                        forwarded,
+                        environment,
+                        pass_fds=(int(launch_image["lease_fd"]),),
+                    )
                 except BaseException as exc:
                     child_error = exc
                     raise
@@ -5997,6 +6618,9 @@ def _launch_cursor_locked(target: Path, cursor_args: list[str]) -> int:
                         else:
                             raise
         finally:
+            close_launch_image_lease(
+                None if launch_image is None else int(launch_image["lease_fd"])
+            )
             try:
                 cleanup_launch_image(None if launch_image is None else launch_image["root"])
             except BaseException as cleanup_error:

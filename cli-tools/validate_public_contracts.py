@@ -46,11 +46,39 @@ BOOTSTRAP_PUBLICATION = (
 READ_ONLY_ANCHOR_COMMANDS = ["status", "plan", "software-status"]
 CLEANUP_PENDING_PATH = ".nddev-cursor-cli/cleanup-pending"
 CLEANUP_PENDING_JOURNAL = ".nddev-cursor-cli/cleanup-pending/journal.json"
+CLEANUP_JOURNAL_MAX_BYTES = 2 * 1024 * 1024
 CLEANUP_PENDING_SEMANTICS = (
     "immutable schema-1 cleanup journal with identity-bound relative tombstones; "
     "read-only validates and reports cleanup_pending without mutation; mutations drain before "
     "active changes; malformed or orphaned cleanup state fails closed"
 )
+LAUNCH_IMAGE_PATH = ".nddev-software/cursor-cli/launch-images/.launch-<bounded>"
+LAUNCH_IMAGE_LEASE = f"{LAUNCH_IMAGE_PATH}/.lease.lock"
+LAUNCH_IMAGE_METADATA = f"{LAUNCH_IMAGE_PATH}/NDDEV-CURSOR-CLI-LAUNCH.json"
+LAUNCH_IMAGE_MAX_COUNT = 8
+LAUNCH_IMAGE_MAX_TOTAL_SIZE = 300 * 1024 * 1024
+LAUNCH_IMAGE_RESIDUE_SEMANTICS = (
+    "read-only status validates and exposes active/stale lease-bound images without mutation; "
+    "mutations drain stale images through cleanup-pending before active work and fail closed "
+    "while a lease is active"
+)
+SOFTWARE_PRESENCE_SIGNAL = (
+    "software-status JSON exposes present=true and presence entries for "
+    "NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, "
+    ".nddev-software/cursor-cli/launch-images, "
+    ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent"
+)
+SOFTWARE_STATUS_FIELDS = [
+    "installed",
+    "current",
+    "present",
+    "presence",
+    "drift",
+    "cleanup_pending",
+    "cleanup",
+    "launch_image_residue_pending",
+    "launch_image_residue",
+]
 CONTENT_SETUP_IDS = ["nddev-builder"]
 PROFILE_IDS = ["full-auto", "safe"]
 BUILDER_TARGET_PATH = ".nddev-cursor-home/.cursor/plugins/local/nddev-builder"
@@ -204,12 +232,13 @@ SOFTWARE_LIFECYCLE_KEYS = {
     "stamp_schema",
     "status_command",
     "status_executes_binary",
+    "status_fields",
     "target_owned",
     "transaction_marker",
     "update_command",
     "update_precondition",
 }
-STATUS_FIELDS = ["installed", "current", "present", "presence", "drift", "cleanup_pending", "cleanup"]
+STATUS_FIELDS = SOFTWARE_STATUS_FIELDS
 SUPPORTED_HOST_IDS = [
     "macos-arm64",
     "macos-x64",
@@ -450,13 +479,23 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch lock parent mode mismatch")
     if (
         launch.get("protected_directory_scope")
-        != "dedicated lock parent and ephemeral verified launch image only; control root, backup pool, target root, isolated HOME, TMPDIR, config/session paths, and installed runtime tree remain writable"
+        != "dedicated lock parent and lease-bound verified launch image only; control root, backup pool, target root, isolated HOME, TMPDIR, config/session paths, and installed runtime tree remain writable"
     ):
         errors.append(f"{owner}: runtime_launch protected directory scope mismatch")
-    if launch.get("launch_image") != ".nddev-software/cursor-cli/launch-images/<ephemeral>":
+    if launch.get("launch_image") != LAUNCH_IMAGE_PATH:
         errors.append(f"{owner}: runtime_launch launch image mismatch")
+    if launch.get("launch_image_lease") != LAUNCH_IMAGE_LEASE:
+        errors.append(f"{owner}: runtime_launch launch image lease mismatch")
+    if launch.get("launch_image_metadata") != LAUNCH_IMAGE_METADATA:
+        errors.append(f"{owner}: runtime_launch launch image metadata mismatch")
     if launch.get("launch_image_mode_while_launching") != "0500":
         errors.append(f"{owner}: runtime_launch launch image mode mismatch")
+    if launch.get("launch_image_max_count") != LAUNCH_IMAGE_MAX_COUNT:
+        errors.append(f"{owner}: runtime_launch launch image count bound mismatch")
+    if launch.get("launch_image_max_total_size") != LAUNCH_IMAGE_MAX_TOTAL_SIZE:
+        errors.append(f"{owner}: runtime_launch launch image size bound mismatch")
+    if launch.get("launch_image_residue_semantics") != LAUNCH_IMAGE_RESIDUE_SEMANTICS:
+        errors.append(f"{owner}: runtime_launch launch image residue semantics mismatch")
     if (
         launch.get("exec_handoff_revalidation")
         != "verified launch-image executable inode and digest immediately before subprocess"
@@ -464,7 +503,7 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch exec handoff revalidation mismatch")
     if (
         launch.get("exec_handoff_boundary")
-        != "write-protected verified-path handoff under no-sandbox same-UID limits; no portable fd execution claimed"
+        != "write-protected verified-path handoff with child-held launch-image lease fd under no-sandbox same-UID limits; no portable fd execution claimed"
     ):
         errors.append(f"{owner}: runtime_launch exec handoff boundary mismatch")
 
@@ -484,7 +523,7 @@ def validate_software(owner: str, software: dict, errors: list[str]) -> None:
             errors.append(f"{owner}: software_install.{command_key} mismatch")
     if software.get("npm") is not None or software.get("pip") is not None:
         errors.append(f"{owner}: software_install must not declare npm/pip install")
-    if "present=true" not in str(software.get("presence_signal", "")):
+    if software.get("presence_signal") != SOFTWARE_PRESENCE_SIGNAL:
         errors.append(f"{owner}: software_install.presence_signal mismatch")
     if software.get("status_fields") != STATUS_FIELDS:
         errors.append(f"{owner}: software_install.status_fields mismatch")
@@ -1145,10 +1184,17 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         "fail_if_orphaned_canonical_anchor",
         "cleanup_pending_root",
         "cleanup_journal_path",
+        "CLEANUP_JOURNAL_MAX_BYTES",
         "publish_cleanup_pending",
         "drain_cleanup_pending",
         "recover_cleanup_journal_publication_alias",
         "cleanup_tombstone_progress",
+        "LAUNCH_IMAGE_LEASE_NAME",
+        "LAUNCH_IMAGE_METADATA_NAME",
+        "LAUNCH_IMAGE_MAX_COUNT",
+        "launch_image_residue_result",
+        "drain_launch_image_residue",
+        "pass_fds=(int(launch_image[\"lease_fd\"]),)",
         'os.link(temporary, path)',
         'os.link(temporary, journal)',
         "allowed_nlinks={1, 2}",
@@ -1893,11 +1939,8 @@ def validate_remove_cli_smoke(module: Any, errors: list[str]) -> None:
         bin_keep.parent.mkdir(mode=module.OWNER_DIRECTORY_MODE, exist_ok=True)
         bin_keep.write_text("preserve\n", encoding="utf-8")
         install_smoke_current_software(module, target)
-        launch_root = module.launch_images_root(target)
-        module.ensure_real_directory_path(launch_root, "smoke launch images root")
-        image_file = launch_root / "image"
-        image_file.write_text("ephemeral\n", encoding="utf-8")
-        image_file.chmod(module.OWNER_FILE_MODE)
+        image = module.create_launch_image(target)
+        module.close_launch_image_lease(int(image["lease_fd"]))
         removed = module.remove_cursor_cli(target)
         if removed.get("command") != "remove-cli" or removed.get("operation") != "remove":
             errors.append(f"remove-cli smoke returned unexpected payload: {removed}")
@@ -2038,7 +2081,10 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
         )
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path,
+            forwarded: list[str],
+            environment: dict[str, str],
+            **kwargs: Any,
         ) -> Any:
             del executable, forwarded
             seen_environment.update(environment)
@@ -2108,7 +2154,10 @@ def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
             return image
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path,
+            forwarded: list[str],
+            environment: dict[str, str],
+            **kwargs: Any,
         ) -> Any:
             nonlocal child_ran
             del executable, forwarded, environment
@@ -2172,7 +2221,10 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
         )
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path,
+            forwarded: list[str],
+            environment: dict[str, str],
+            **kwargs: Any,
         ) -> Any:
             nonlocal seen_image_root
             del forwarded
@@ -2300,7 +2352,10 @@ def validate_external_bootstrap_lock_smoke(module: Any, errors: list[str]) -> No
         )
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path,
+            forwarded: list[str],
+            environment: dict[str, str],
+            **kwargs: Any,
         ) -> Any:
             del executable, forwarded
             if any(module.BOOTSTRAP_LOCK_ROOT_PREFIX in value for value in environment.values()):
@@ -2425,13 +2480,28 @@ def validate_read_only_bootstrap_namespace_smoke(module: Any, errors: list[str])
                 )
                 return
 
-            def assert_alias_recovered(anchor: Path, label: str) -> None:
+            def assert_alias_rejected_then_recovered(anchor: Path, label: str) -> None:
                 alias = anchor.with_name(f".{anchor.name}.nddev-anchor-tmp.123.456")
                 os.link(anchor, alias)
                 fsync_existing_parent = getattr(module, "fsync_existing_parent")
                 fsync_existing_parent(anchor)
+                before_alias_reads = injected_bootstrap_namespace(module, bootstrap_root)
+                for action in (
+                    lambda: module.inspect_target(seeded),
+                    lambda: module.plan_setup(seeded, "nddev-builder", "full-auto"),
+                    lambda: module.software_status(seeded),
+                ):
+                    try:
+                        action()
+                    except module.CursorSetupError as exc:
+                        if "publication is incomplete" not in str(exc):
+                            errors.append(f"{label} read-only alias error mismatch: {exc}")
+                    else:
+                        errors.append(f"{label} read-only alias was accepted")
+                    if injected_bootstrap_namespace(module, bootstrap_root) != before_alias_reads:
+                        errors.append(f"{label} read-only alias changed bootstrap namespace")
                 try:
-                    module.inspect_target(seeded)
+                    module.mutate_setup(seeded, "nddev-builder", "full-auto", "update")
                 except Exception as exc:  # noqa: BLE001 - public validator reports context.
                     errors.append(f"{label} alias recovery raised unexpectedly: {exc}")
                     return
@@ -2440,12 +2510,12 @@ def validate_read_only_bootstrap_namespace_smoke(module: Any, errors: list[str])
                 if anchor.lstat().st_nlink != 1:
                     errors.append(f"{label} anchor link count was not restored")
 
-            assert_alias_recovered(product_anchor, "product anchor")
-            assert_alias_recovered(canonical_anchors[0], "canonical anchor")
+            assert_alias_rejected_then_recovered(product_anchor, "product anchor")
+            assert_alias_rejected_then_recovered(canonical_anchors[0], "canonical anchor")
             unknown = product_anchor.with_name(f".{product_anchor.name}.unknown-hardlink")
             os.link(product_anchor, unknown)
             try:
-                module.inspect_target(seeded)
+                module.mutate_setup(seeded, "nddev-builder", "full-auto", "update")
             except module.CursorSetupError as exc:
                 if "unknown" not in str(exc):
                     errors.append(f"unknown hardlink failed with unexpected error: {exc}")
@@ -2475,7 +2545,10 @@ def validate_launch_separator_argv_smoke(module: Any, errors: list[str]) -> None
         seen: list[str] = []
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path,
+            forwarded: list[str],
+            environment: dict[str, str],
+            **kwargs: Any,
         ) -> Any:
             del executable, environment
             seen.extend(forwarded)
@@ -2626,7 +2699,10 @@ def expect_launch_blocked_without_child(
     child_ran = False
 
     def fake_run_cursor_child(
-        executable: Path, forwarded: list[str], environment: dict[str, str]
+        executable: Path,
+        forwarded: list[str],
+        environment: dict[str, str],
+        **kwargs: Any,
     ) -> Any:
         nonlocal child_ran
         del executable, forwarded, environment
@@ -3437,6 +3513,8 @@ def main() -> int:
             errors.append("build/manifest.json: cleanup pending path mismatch")
         if transaction.get("cleanup_pending_journal") != CLEANUP_PENDING_JOURNAL:
             errors.append("build/manifest.json: cleanup pending journal mismatch")
+        if transaction.get("cleanup_journal_max_bytes") != CLEANUP_JOURNAL_MAX_BYTES:
+            errors.append("build/manifest.json: cleanup journal max bytes mismatch")
         if transaction.get("cleanup_pending_semantics") != CLEANUP_PENDING_SEMANTICS:
             errors.append("build/manifest.json: cleanup pending semantics mismatch")
         if transaction.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
@@ -3564,6 +3642,8 @@ def main() -> int:
             errors.append("config/nddev-contract.json: cleanup pending path mismatch")
         if safety.get("cleanup_pending_journal") != CLEANUP_PENDING_JOURNAL:
             errors.append("config/nddev-contract.json: cleanup pending journal mismatch")
+        if safety.get("cleanup_journal_max_bytes") != CLEANUP_JOURNAL_MAX_BYTES:
+            errors.append("config/nddev-contract.json: cleanup journal max bytes mismatch")
         if safety.get("cleanup_pending_semantics") != CLEANUP_PENDING_SEMANTICS:
             errors.append("config/nddev-contract.json: cleanup pending semantics mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
@@ -3616,6 +3696,14 @@ def main() -> int:
                 errors.append("config/nddev-contract.json: software_lifecycle stamp mismatch")
             if lifecycle.get("entrypoint") != "bin/agent":
                 errors.append("config/nddev-contract.json: software_lifecycle entrypoint mismatch")
+            if lifecycle.get("presence_signal") != SOFTWARE_PRESENCE_SIGNAL:
+                errors.append(
+                    "config/nddev-contract.json: software_lifecycle presence signal mismatch"
+                )
+            if lifecycle.get("status_fields") != STATUS_FIELDS:
+                errors.append(
+                    "config/nddev-contract.json: software_lifecycle status fields mismatch"
+                )
             if "remove-cli" not in str(lifecycle.get("remove_command", "")):
                 errors.append(
                     "config/nddev-contract.json: software_lifecycle remove command mismatch"
