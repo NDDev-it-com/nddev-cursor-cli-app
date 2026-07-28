@@ -50,6 +50,7 @@ BACKUP_STAGE_PREFIX = ".slot-stage-"
 BACKUP_RETIRED_PREFIX = ".slot-retired-"
 BACKUP_CLEANUP_PREFIX = ".slot-cleanup-"
 BOOTSTRAP_LOCK_ROOT_PREFIX = "nddev-cursor-cli-app-locks"
+BOOTSTRAP_PRODUCT_LOCK_NAME = "global.lock"
 BOOTSTRAP_LOCK_MAX_BYTES = 4096
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
@@ -174,6 +175,7 @@ BLOCKED_LAUNCH_COMMANDS = {
     "worker",
 }
 PRODUCT_LIFECYCLE_LOCK_KEY = f"/__{PRODUCT_NAME}_product_lifecycle__"
+READ_ONLY_TARGET_COMMANDS = frozenset({"status", "plan", "software-status"})
 _PARSER_JSON_ERROR_REQUESTED = False
 SETUP_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 MANAGED_CONFIG_KEYS = (
@@ -896,6 +898,53 @@ def bootstrap_lock_system_root() -> Path:
     return Path("/tmp").resolve(strict=True)
 
 
+def require_bootstrap_lock_system_root() -> Path:
+    parent = bootstrap_lock_system_root()
+    try:
+        parent_info = parent.lstat()
+    except FileNotFoundError:
+        fail("system temp root must exist")
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        fail("system temp root must be a real directory")
+    if not (parent_info.st_mode & stat.S_ISVTX):
+        fail("system temp root must be sticky")
+    return parent
+
+
+@contextlib.contextmanager
+def bootstrap_anchor_creation_guard() -> Iterator[None]:
+    parent = require_bootstrap_lock_system_root()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(parent, flags)
+    locked = False
+    try:
+        path_info = parent.lstat()
+        fd_info = os.fstat(descriptor)
+        if (path_info.st_dev, path_info.st_ino) != (fd_info.st_dev, fd_info.st_ino):
+            fail("system temp root changed while it was being opened")
+        if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISDIR(fd_info.st_mode):
+            fail("system temp root must be a real directory")
+        if not (fd_info.st_mode & stat.S_ISVTX):
+            fail("system temp root must be sticky")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                fail("target is already locked")
+            fail(f"bootstrap anchor creation guard could not be acquired: {exc}")
+        locked = True
+        yield
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def capture_bootstrap_lock_envelope(root: Path) -> dict[str, Any]:
     return {
         "parent": capture_existing_directory_object(root.parent, "bootstrap lock parent"),
@@ -916,15 +965,7 @@ def prepare_bootstrap_lock_root() -> tuple[Path, dict[str, Any]]:
     uid = current_user_id()
     if uid is None:
         fail("bootstrap lifecycle locks require POSIX current-user identity")
-    parent = bootstrap_lock_system_root()
-    try:
-        parent_info = parent.lstat()
-    except FileNotFoundError:
-        fail("system temp root must exist")
-    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
-        fail("system temp root must be a real directory")
-    if not (parent_info.st_mode & stat.S_ISVTX):
-        fail("system temp root must be sticky")
+    parent = require_bootstrap_lock_system_root()
     root = parent / f"{BOOTSTRAP_LOCK_ROOT_PREFIX}-{uid}"
     envelope = capture_bootstrap_lock_envelope(root)
     created_root = False
@@ -954,49 +995,74 @@ def bootstrap_lock_root() -> Path:
     return root
 
 
+def bootstrap_lock_root_path() -> Path:
+    uid = current_user_id()
+    if uid is None:
+        fail("bootstrap lifecycle locks require POSIX current-user identity")
+    return require_bootstrap_lock_system_root() / f"{BOOTSTRAP_LOCK_ROOT_PREFIX}-{uid}"
+
+
+def bootstrap_lock_digest(lock_key: str) -> str:
+    return sha256_bytes(PRODUCT_NAME.encode("utf-8") + b"\0" + lock_key.encode("utf-8"))
+
+
+def bootstrap_lock_path_without_create(target: Any) -> tuple[Path, str, str]:
+    lexical = lexical_target_text(target)
+    digest = bootstrap_lock_digest(lexical)
+    return bootstrap_lock_root_path() / f"{PRODUCT_NAME}-{digest}.lock", lexical, digest
+
+
 def bootstrap_lock_path(target: Any) -> tuple[Path, str, str]:
     lexical = lexical_target_text(target)
-    digest = sha256_bytes(PRODUCT_NAME.encode("utf-8") + b"\0" + lexical.encode("utf-8"))
+    digest = bootstrap_lock_digest(lexical)
     return bootstrap_lock_root() / f"{PRODUCT_NAME}-{digest}.lock", lexical, digest
 
 
 def bootstrap_lock_path_for_acquire(target: Any) -> tuple[Path, str, str, dict[str, Any]]:
     lexical = lexical_target_text(target)
-    digest = sha256_bytes(PRODUCT_NAME.encode("utf-8") + b"\0" + lexical.encode("utf-8"))
+    digest = bootstrap_lock_digest(lexical)
     root, envelope = prepare_bootstrap_lock_root()
     return root / f"{PRODUCT_NAME}-{digest}.lock", lexical, digest, envelope
 
 
-def open_bootstrap_lock_file(path: Path) -> int:
+def product_lock_path_without_create() -> tuple[Path, str, str]:
+    digest = bootstrap_lock_digest(PRODUCT_LIFECYCLE_LOCK_KEY)
+    return bootstrap_lock_root_path() / BOOTSTRAP_PRODUCT_LOCK_NAME, PRODUCT_LIFECYCLE_LOCK_KEY, digest
+
+
+def product_lock_path_for_acquire() -> tuple[Path, str, str, dict[str, Any]]:
+    digest = bootstrap_lock_digest(PRODUCT_LIFECYCLE_LOCK_KEY)
+    root, envelope = prepare_bootstrap_lock_root()
+    return root / BOOTSTRAP_PRODUCT_LOCK_NAME, PRODUCT_LIFECYCLE_LOCK_KEY, digest, envelope
+
+
+def open_existing_bootstrap_lock_file(path: Path) -> int:
     require_owner_private_directory(path.parent, "bootstrap lock root")
     flags = os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    created = False
     try:
-        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, OWNER_FILE_MODE)
-        created = True
-    except FileExistsError:
-        try:
-            descriptor = os.open(path, flags)
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                fail("bootstrap lock path is unsafe")
-            raise
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             fail("bootstrap lock path is unsafe")
         fail(f"bootstrap lock could not be opened: {exc}")
     try:
-        if created:
-            os.fchmod(descriptor, OWNER_FILE_MODE)
-        require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+        require_lock_file_matches_fd(
+            path, descriptor, "bootstrap lock", allowed_nlinks={1, 2}
+        )
     except BaseException:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def open_bootstrap_lock_file(path: Path) -> int:
+    return open_existing_bootstrap_lock_file(path)
 
 
 def fd_read_bounded(descriptor: int, label: str, max_bytes: int) -> bytes:
@@ -1007,14 +1073,13 @@ def fd_read_bounded(descriptor: int, label: str, max_bytes: int) -> bytes:
     return content
 
 
-def fd_write_all(descriptor: int, content: bytes) -> None:
-    os.ftruncate(descriptor, 0)
+def fd_write_new_all(descriptor: int, content: bytes, label: str) -> None:
     os.lseek(descriptor, 0, os.SEEK_SET)
     view = memoryview(content)
     while view:
         written = os.write(descriptor, view)
         if written == 0:
-            fail("bootstrap lock write made no progress")
+            fail(f"{label} write made no progress")
         view = view[written:]
     os.fsync(descriptor)
 
@@ -1046,8 +1111,11 @@ def read_valid_bootstrap_binding(
 def validate_or_write_bootstrap_binding(
     descriptor: int, path: Path, lock_key: str, digest: str
 ) -> None:
-    if read_valid_bootstrap_binding(descriptor, path, lock_key, digest) is not None:
-        return
+    if read_valid_bootstrap_binding(descriptor, path, lock_key, digest) is None:
+        fail("bootstrap lock binding is missing")
+
+
+def bootstrap_binding_bytes(lock_key: str, digest: str) -> bytes:
     binding = canonical_json(
         {
             "schema_version": 1,
@@ -1058,19 +1126,182 @@ def validate_or_write_bootstrap_binding(
     )
     if len(binding) > BOOTSTRAP_LOCK_MAX_BYTES:
         fail("bootstrap lock binding exceeds the size limit")
-    fd_write_all(descriptor, binding)
+    return binding
+
+
+def write_complete_bootstrap_binding_file(
+    descriptor: int, path: Path, lock_key: str, digest: str
+) -> None:
+    binding = bootstrap_binding_bytes(lock_key, digest)
+    fd_write_new_all(descriptor, binding, "bootstrap lock")
+    os.fchmod(descriptor, OWNER_FILE_MODE)
+    os.fsync(descriptor)
     require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
-    if read_valid_bootstrap_binding(descriptor, path, lock_key, digest) is None:
-        fail("bootstrap lock binding was not persisted")
+
+
+def bootstrap_anchor_temp_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.nddev-anchor-tmp.{os.getpid()}.{time.time_ns()}")
+
+
+def is_bootstrap_publication_alias(candidate: Path, final: Path) -> bool:
+    name = candidate.name
+    prefix = f".{final.name}.nddev-anchor-tmp."
+    if not name.startswith(prefix):
+        return False
+    suffix = name[len(prefix) :]
+    parts = suffix.split(".")
+    if len(parts) != 2:
+        return False
+    return all(part.isdecimal() and 1 <= len(part) <= 32 for part in parts)
+
+
+def recover_bootstrap_publication_alias(
+    path: Path, descriptor: int, lock_key: str, digest: str
+) -> None:
+    info = require_lock_file_matches_fd(
+        path, descriptor, "bootstrap lock", allowed_nlinks={1, 2}
+    )
+    if info.st_nlink == 1:
+        return
+    same_inode: list[Path] = []
+    try:
+        children = list(path.parent.iterdir())
+    except OSError as exc:
+        fail(f"bootstrap lock parent could not be inspected for recovery: {exc}")
+    for child in children:
+        if child.name == path.name:
+            continue
+        try:
+            child_info = child.lstat()
+        except FileNotFoundError:
+            continue
+        if (child_info.st_dev, child_info.st_ino) == (info.st_dev, info.st_ino):
+            same_inode.append(child)
+    if len(same_inode) != 1:
+        fail("bootstrap lock has unknown hard-link aliases")
+    alias = same_inode[0]
+    if not is_bootstrap_publication_alias(alias, path):
+        fail("bootstrap lock has an unknown publication alias")
+    alias.unlink()
+    fsync_existing_parent(path)
+    require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+    validate_or_write_bootstrap_binding(descriptor, path, lock_key, digest)
+
+
+def open_new_bootstrap_anchor_temp(path: Path) -> tuple[Path, int]:
+    require_owner_private_directory(path.parent, "bootstrap lock root")
+    temporary = bootstrap_anchor_temp_path(path)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(temporary, flags, OWNER_FILE_MODE)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("bootstrap lock temporary path is unsafe")
+        fail(f"bootstrap lock temporary file could not be opened: {exc}")
+    try:
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        require_lock_file_matches_fd(temporary, descriptor, "bootstrap lock")
+    except BaseException:
+        os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+        raise
+    return temporary, descriptor
+
+
+def publish_bootstrap_anchor_no_replace(
+    path: Path, temporary: Path, descriptor: int
+) -> None:
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.EEXIST}:
+            raise FileExistsError(str(path)) from exc
+        fail(f"bootstrap lock could not be published atomically: {exc}")
+    require_lock_file_matches_fd(path, descriptor, "bootstrap lock", allowed_nlinks={2})
+
+
+def open_or_publish_bootstrap_anchor(
+    path: Path,
+    lock_key: str,
+    digest: str,
+    envelope: dict[str, Any],
+) -> int:
+    try:
+        descriptor = open_existing_bootstrap_lock_file(path)
+    except FileNotFoundError:
+        descriptor = None
+    else:
+        return descriptor
+
+    temporary: Path | None = None
+    final_visible = False
+    try:
+        temporary, descriptor = open_new_bootstrap_anchor_temp(path)
+        write_complete_bootstrap_binding_file(descriptor, temporary, lock_key, digest)
+        try:
+            publish_bootstrap_anchor_no_replace(path, temporary, descriptor)
+            final_visible = True
+            temporary.unlink()
+            temporary = None
+            fsync_existing_parent(path)
+            require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+        except FileExistsError:
+            os.close(descriptor)
+            descriptor = None
+            if temporary is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    temporary.unlink()
+                fsync_existing_parent(path)
+                temporary = None
+            descriptor = open_existing_bootstrap_lock_file(path)
+            return descriptor
+        os.close(descriptor)
+        descriptor = open_existing_bootstrap_lock_file(path)
+        return descriptor
+    except BaseException:
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        if temporary is not None:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+        if not final_visible:
+            restore_bootstrap_lock_envelope(path.parent, envelope)
+        raise
+
+
+def record_bootstrap_lock_handoff(
+    lock_key: str, descriptor: int, path: Path, owner: tuple[int, int]
+) -> None:
+    with _BOOTSTRAP_STATE_LOCK:
+        held = _BOOTSTRAP_LOCKS.get(lock_key)
+        if held is None or held.get("owner") != owner:
+            fail("bootstrap lock owner changed while acquiring")
+        held["depth"] = 1
+        held["descriptor"] = descriptor
+        held["path"] = path
 
 
 @contextlib.contextmanager
-def bootstrap_lifecycle_lock(target: Any) -> Iterator[None]:
-    path, lexical, digest, envelope = bootstrap_lock_path_for_acquire(target)
+def bootstrap_anchor_lock(
+    path: Path,
+    lock_key: str,
+    digest: str,
+    *,
+    create: bool,
+    exclusive: bool,
+    envelope: dict[str, Any] | None = None,
+) -> Iterator[None]:
     owner = (os.getpid(), threading.get_ident())
     descriptor: int | None = None
     locked = False
-    published = False
     reentrant = False
     with _BOOTSTRAP_STATE_LOCK:
         for key, held in list(_BOOTSTRAP_LOCKS.items()):
@@ -1081,7 +1312,7 @@ def bootstrap_lifecycle_lock(target: Any) -> Iterator[None]:
                     with contextlib.suppress(OSError):
                         os.close(int(inherited_descriptor))
                 del _BOOTSTRAP_LOCKS[key]
-        held = _BOOTSTRAP_LOCKS.get(lexical)
+        held = _BOOTSTRAP_LOCKS.get(lock_key)
         if held is not None:
             if held.get("owner") == owner and held.get("descriptor") is not None:
                 held["depth"] += 1
@@ -1089,7 +1320,7 @@ def bootstrap_lifecycle_lock(target: Any) -> Iterator[None]:
             else:
                 fail("target is already locked")
         else:
-            _BOOTSTRAP_LOCKS[lexical] = {
+            _BOOTSTRAP_LOCKS[lock_key] = {
                 "depth": 0,
                 "descriptor": None,
                 "owner": owner,
@@ -1100,51 +1331,83 @@ def bootstrap_lifecycle_lock(target: Any) -> Iterator[None]:
             yield
         finally:
             with _BOOTSTRAP_STATE_LOCK:
-                held = _BOOTSTRAP_LOCKS.get(lexical)
+                held = _BOOTSTRAP_LOCKS.get(lock_key)
                 if held is not None and held.get("owner") == owner:
                     held["depth"] -= 1
         return
     try:
-        descriptor = open_bootstrap_lock_file(path)
+        if create:
+            if envelope is None:
+                fail("bootstrap lock creation requires a rollback envelope")
+            descriptor = open_or_publish_bootstrap_anchor(path, lock_key, digest, envelope)
+        else:
+            descriptor = open_existing_bootstrap_lock_file(path)
+        lock_info = require_lock_file_matches_fd(
+            path, descriptor, "bootstrap lock", allowed_nlinks={1, 2}
+        )
+        needs_alias_recovery = lock_info.st_nlink == 2
+        lock_mode = fcntl.LOCK_EX if exclusive or needs_alias_recovery else fcntl.LOCK_SH
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, lock_mode | fcntl.LOCK_NB)
         except OSError as exc:
             if exc.errno in {errno.EACCES, errno.EAGAIN}:
                 fail("target is already locked")
             fail(f"bootstrap lock could not be acquired: {exc}")
         locked = True
-        validate_or_write_bootstrap_binding(descriptor, path, lexical, digest)
-        with _BOOTSTRAP_STATE_LOCK:
-            held = _BOOTSTRAP_LOCKS.get(lexical)
-            if held is None or held.get("owner") != owner:
-                fail("bootstrap lock owner changed while acquiring")
-            held["depth"] = 1
-            held["descriptor"] = descriptor
-            held["path"] = path
-            published = True
+        if needs_alias_recovery:
+            recover_bootstrap_publication_alias(path, descriptor, lock_key, digest)
+            if not exclusive:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except OSError as exc:
+                    if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                        fail("target is already locked")
+                    fail(f"bootstrap lock could not be downgraded after recovery: {exc}")
+        validate_or_write_bootstrap_binding(descriptor, path, lock_key, digest)
+        record_bootstrap_lock_handoff(lock_key, descriptor, path, owner)
         try:
             yield
         finally:
             with _BOOTSTRAP_STATE_LOCK:
-                held = _BOOTSTRAP_LOCKS.get(lexical)
+                held = _BOOTSTRAP_LOCKS.get(lock_key)
                 if held is not None and held.get("owner") == owner:
                     held["depth"] -= 1
                     if held["depth"] == 0:
-                        del _BOOTSTRAP_LOCKS[lexical]
+                        del _BOOTSTRAP_LOCKS[lock_key]
     finally:
-        if locked:
+        if locked and descriptor is not None:
             with contextlib.suppress(OSError):
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
         if descriptor is not None:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
-            descriptor = None
         with _BOOTSTRAP_STATE_LOCK:
-            held = _BOOTSTRAP_LOCKS.get(lexical)
+            held = _BOOTSTRAP_LOCKS.get(lock_key)
             if held is not None and held.get("owner") == owner and held["depth"] == 0:
-                del _BOOTSTRAP_LOCKS[lexical]
-        if not published:
-            restore_bootstrap_lock_envelope(path.parent, envelope)
+                del _BOOTSTRAP_LOCKS[lock_key]
+
+
+@contextlib.contextmanager
+def bootstrap_lifecycle_lock(target: Any) -> Iterator[None]:
+    target_context: Any = None
+    with product_lifecycle_lock(create=True, exclusive=True):
+        path, lexical, digest, envelope = bootstrap_lock_path_for_acquire(target)
+        target_context = bootstrap_anchor_lock(
+            path,
+            lexical,
+            digest,
+            create=True,
+            exclusive=True,
+            envelope=envelope,
+        )
+        target_context.__enter__()
+    try:
+        yield
+    except BaseException:
+        target_context.__exit__(*sys.exc_info())
+        raise
+    else:
+        target_context.__exit__(None, None, None)
 
 
 def bootstrap_locked(function: Any) -> Any:
@@ -1156,18 +1419,168 @@ def bootstrap_locked(function: Any) -> Any:
 
 
 @contextlib.contextmanager
-def product_lifecycle_lock() -> Iterator[None]:
-    with bootstrap_lifecycle_lock(PRODUCT_LIFECYCLE_LOCK_KEY):
-        yield
+def product_lifecycle_lock(*, create: bool, exclusive: bool) -> Iterator[bool]:
+    if create:
+        with bootstrap_anchor_creation_guard():
+            path, lock_key, digest, envelope = product_lock_path_for_acquire()
+            with bootstrap_anchor_lock(
+                path,
+                lock_key,
+                digest,
+                create=True,
+                exclusive=exclusive,
+                envelope=envelope,
+            ):
+                yield True
+        return
+    path, lock_key, digest = product_lock_path_without_create()
+    try:
+        path.parent.lstat()
+    except FileNotFoundError:
+        yield False
+        return
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        yield False
+        return
+    with bootstrap_anchor_lock(
+        path,
+        lock_key,
+        digest,
+        create=False,
+        exclusive=exclusive,
+    ):
+        yield True
+
+
+def product_anchor_present_no_create() -> bool:
+    path, _lock_key, _digest = product_lock_path_without_create()
+    try:
+        path.parent.lstat()
+    except FileNotFoundError:
+        return False
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def existing_bootstrap_lifecycle_lock(target: Any) -> Iterator[bool]:
+    path, lexical, digest = bootstrap_lock_path_without_create(target)
+    try:
+        path.parent.lstat()
+    except FileNotFoundError:
+        yield False
+        return
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        yield False
+        return
+    with bootstrap_anchor_lock(
+        path,
+        lexical,
+        digest,
+        create=False,
+        exclusive=False,
+    ):
+        yield True
+
+
+def with_read_bootstrap_target(target_input: Any, function: Any, *args: Any, **kwargs: Any) -> Any:
+    require_current_host_supported()
+    lexical = lexical_target_text(target_input)
+    if not product_anchor_present_no_create():
+        target = resolve_target(lexical)
+        result = function(target, *args, **kwargs)
+        if not product_anchor_present_no_create():
+            return result
+
+    product_context = product_lifecycle_lock(create=False, exclusive=False)
+    product_locked = product_context.__enter__()
+    if not product_locked:
+        try:
+            target = resolve_target(lexical)
+            result = function(target, *args, **kwargs)
+            if product_anchor_present_no_create():
+                retry = True
+            else:
+                retry = False
+        except BaseException:
+            product_context.__exit__(*sys.exc_info())
+            raise
+        else:
+            product_context.__exit__(None, None, None)
+            if retry:
+                return with_read_bootstrap_target(target_input, function, *args, **kwargs)
+            return result
+    target_context: Any = None
+    target_entered = False
+    try:
+        target = resolve_target(lexical)
+        target_context = existing_bootstrap_lifecycle_lock(str(target))
+        target_locked = target_context.__enter__()
+        target_entered = True
+        if target_locked:
+            product_context.__exit__(None, None, None)
+            product_context = None
+        result = function(target, *args, **kwargs)
+    except BaseException:
+        if target_context is not None and target_entered:
+            target_context.__exit__(*sys.exc_info())
+        if product_context is not None:
+            product_context.__exit__(*sys.exc_info())
+        raise
+    else:
+        if target_context is not None and target_entered:
+            target_context.__exit__(None, None, None)
+        if product_context is not None:
+            product_context.__exit__(None, None, None)
+        return result
+
+
+def with_mutation_bootstrap_target(
+    target_input: Any, function: Any, *args: Any, **kwargs: Any
+) -> Any:
+    require_current_host_supported()
+    lexical = lexical_target_text(target_input)
+    product_context = product_lifecycle_lock(create=True, exclusive=True)
+    product_context.__enter__()
+    target_context: Any = None
+    target_entered = False
+    try:
+        target = resolve_target(lexical)
+        path, canonical, digest, envelope = bootstrap_lock_path_for_acquire(str(target))
+        target_context = bootstrap_anchor_lock(
+            path,
+            canonical,
+            digest,
+            create=True,
+            exclusive=True,
+            envelope=envelope,
+        )
+        target_context.__enter__()
+        target_entered = True
+        product_context.__exit__(None, None, None)
+        product_context = None
+        result = function(target, *args, **kwargs)
+    except BaseException:
+        if target_context is not None and target_entered:
+            target_context.__exit__(*sys.exc_info())
+        if product_context is not None:
+            product_context.__exit__(*sys.exc_info())
+        raise
+    else:
+        if target_context is not None and target_entered:
+            target_context.__exit__(None, None, None)
+        return result
 
 
 def with_bootstrap_target(target_input: Any, function: Any, *args: Any, **kwargs: Any) -> Any:
-    require_current_host_supported()
-    lexical = lexical_target_text(target_input)
-    with product_lifecycle_lock():
-        target = resolve_target(lexical)
-        with bootstrap_lifecycle_lock(str(target)):
-            return function(target, *args, **kwargs)
+    return with_mutation_bootstrap_target(target_input, function, *args, **kwargs)
 
 
 @contextlib.contextmanager
@@ -1486,7 +1899,7 @@ def drift_for_target(target: Path, stamp: dict[str, Any]) -> list[str]:
 
 
 def inspect_target(target: Path) -> dict[str, Any]:
-    return with_bootstrap_target(target, _inspect_target_locked)
+    return with_read_bootstrap_target(target, _inspect_target_locked)
 
 
 def _inspect_target_locked(target: Path) -> dict[str, Any]:
@@ -1747,7 +2160,11 @@ def set_owner_directory_fd_mode(path: Path, descriptor: int, label: str, mode: i
     require_directory_matches_fd(path, descriptor, label, {mode})
 
 
-def require_lock_file_matches_fd(path: Path, descriptor: int, label: str) -> os.stat_result:
+def require_lock_file_matches_fd(
+    path: Path, descriptor: int, label: str, *, allowed_nlinks: set[int] | None = None
+) -> os.stat_result:
+    if allowed_nlinks is None:
+        allowed_nlinks = {1}
     try:
         path_info = path.lstat()
     except FileNotFoundError:
@@ -1757,7 +2174,7 @@ def require_lock_file_matches_fd(path: Path, descriptor: int, label: str) -> os.
         fail(f"{label} changed while it was being opened")
     if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISREG(fd_info.st_mode):
         fail(f"{label} path is unsafe")
-    if fd_info.st_nlink != 1:
+    if fd_info.st_nlink not in allowed_nlinks:
         fail(f"{label} must not have hard-link aliases")
     uid = current_user_id()
     if uid is not None and fd_info.st_uid != uid:
@@ -2660,7 +3077,7 @@ def restore_files_from_backup(envelope: dict[str, Any]) -> dict[str, bytes | Non
 
 
 def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str, Any]:
-    return with_bootstrap_target(target, _plan_setup_locked, content_setup_id, profile_id)
+    return with_read_bootstrap_target(target, _plan_setup_locked, content_setup_id, profile_id)
 
 
 def _plan_setup_locked(target: Path, content_setup_id: str, profile_id: str) -> dict[str, Any]:
@@ -3834,7 +4251,7 @@ def software_tree_object_matches(
 
 
 def software_status(target: Path) -> dict[str, Any]:
-    return with_bootstrap_target(target, _software_status_locked)
+    return with_read_bootstrap_target(target, _software_status_locked)
 
 
 def _software_status_locked(target: Path) -> dict[str, Any]:
@@ -4015,7 +4432,7 @@ def prepare_cursor_artifact() -> dict[str, Any]:
 def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
     if command not in {"install-cli", "update-cli"}:
         fail(f"unsupported Cursor software command: {command}")
-    return with_bootstrap_target(target, _install_cursor_cli_locked, command)
+    return with_mutation_bootstrap_target(target, _install_cursor_cli_locked, command)
 
 
 def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
@@ -4273,7 +4690,7 @@ def cleanup_software_remove_empty_parents(target: Path) -> None:
 
 
 def remove_cursor_cli(target: Path) -> dict[str, Any]:
-    return with_bootstrap_target(target, _remove_cursor_cli_locked)
+    return with_mutation_bootstrap_target(target, _remove_cursor_cli_locked)
 
 
 def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
@@ -4732,7 +5149,7 @@ def launch_write_protection(launch_image_root: Path) -> Iterator[None]:
 
 
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
-    return with_bootstrap_target(target, _launch_cursor_locked, cursor_args)
+    return with_mutation_bootstrap_target(target, _launch_cursor_locked, cursor_args)
 
 
 def _launch_cursor_locked(target: Path, cursor_args: list[str]) -> int:
@@ -4950,7 +5367,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
             "default_profile": DEFAULT_PROFILE_ID,
         }
     if args.command in TARGET_COMMANDS:
-        return with_bootstrap_target(args.target, run_target_command, args)
+        if args.command in READ_ONLY_TARGET_COMMANDS:
+            return with_read_bootstrap_target(args.target, run_target_command, args)
+        return with_mutation_bootstrap_target(args.target, run_target_command, args)
     fail(f"unsupported command: {args.command}")
 
 

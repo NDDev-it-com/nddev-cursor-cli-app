@@ -23,14 +23,27 @@ ROOT = Path(__file__).resolve().parent.parent
 CURSOR_RELEASE_ID = "2026.07.23-e383d2b"
 PYTHON_REQUIRES = ">=3.9"
 BOOTSTRAP_LOCK_SCOPE = (
-    "external product-wide coordination before target observation, then canonical-target flock "
-    "before any read, mutation, runtime handoff, or child cleanup"
+    "mutations publish or open the product anchor before target observation, then hand off to "
+    "the canonical mutation anchor; read-only commands create no anchors and use cold no-anchor "
+    "double-check or shared product/canonical coordination"
 )
-BOOTSTRAP_LOCK_PATH = (
+BOOTSTRAP_PRODUCT_ANCHOR = (
+    "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/global.lock"
+)
+BOOTSTRAP_CANONICAL_ANCHOR = (
     "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/"
-    "nddev-cursor-cli-app-<sha256(product-name NUL product-or-canonical-target-key)>.lock"
+    "nddev-cursor-cli-app-<sha256(product-name NUL canonical-target-key)>.lock"
 )
 BOOTSTRAP_LOCK_BINDING = "schema/product/lock-key/product-target-sha256 JSON"
+BOOTSTRAP_PUBLICATION = (
+    "atomic no-replace final-path publication of a complete fsynced binding; final anchor "
+    "is monotonic immediately when visible, parent sync or handoff failure leaves it in "
+    "place and removes only unpublished temporary aliases; existing anchors open "
+    "no-create/no-follow and are never truncated, rebound, replaced, or unlinked; a "
+    "crashed hard-link publication alias is recovered only after locking final and proving "
+    "one bounded machine-named same-inode alias in the same private parent"
+)
+READ_ONLY_ANCHOR_COMMANDS = ["status", "plan", "software-status"]
 CONTENT_SETUP_IDS = ["nddev-builder"]
 PROFILE_IDS = ["full-auto", "safe"]
 BUILDER_TARGET_PATH = ".nddev-cursor-home/.cursor/plugins/local/nddev-builder"
@@ -423,7 +436,7 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch bootstrap lock must not be exposed to child")
     if (
         launch.get("lock_mechanism")
-        != "persistent 0600 file opened with O_NOFOLLOW and held by nonblocking fcntl.flock"
+        != "persistent 0600 monotonic anchors opened with O_NOFOLLOW and held by nonblocking fcntl.flock; product anchor uses exclusive/shared coordination and canonical target anchors use exclusive mutation/shared read coordination"
     ):
         errors.append(f"{owner}: runtime_launch lock mechanism mismatch")
     if launch.get("lock_parent_mode_while_launching") != "0500":
@@ -1113,18 +1126,36 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         "set_owner_directory_fd_mode",
         "validate_or_write_bootstrap_binding",
         "read_valid_bootstrap_binding",
+        "publish_bootstrap_anchor_no_replace",
+        "recover_bootstrap_publication_alias",
+        "is_bootstrap_publication_alias",
+        "open_or_publish_bootstrap_anchor",
+        "product_anchor_present_no_create",
+        "with_read_bootstrap_target",
+        "existing_bootstrap_lifecycle_lock",
+        "BOOTSTRAP_PRODUCT_LOCK_NAME",
+        'os.link(temporary, path)',
+        "allowed_nlinks={1, 2}",
         'require_lock_file_matches_fd(path, descriptor, "bootstrap lock")',
         "require_directory_matches_fd",
         "threading.get_ident()",
-        'PRODUCT_NAME.encode("utf-8") + b"\\0" + lexical.encode("utf-8")',
+        'PRODUCT_NAME.encode("utf-8") + b"\\0" + lock_key.encode("utf-8")',
         'Path("/tmp").resolve(strict=True)',
         "stat.S_ISVTX",
         'f"{PRODUCT_NAME}-{digest}.lock"',
     ):
         if needle not in manager_source:
             errors.append(f"nddev_cursor_cli.py must keep bootstrap lock evidence: {needle}")
-    if re.search(r"bootstrap.*unlink|unlink.*bootstrap", manager_source, re.IGNORECASE):
-        errors.append("nddev_cursor_cli.py must not unlink bootstrap lock files")
+    publish_match = re.search(
+        r"def publish_bootstrap_anchor_no_replace\(.*?(?=\ndef |\Z)",
+        manager_source,
+        re.DOTALL,
+    )
+    publish_source = "" if publish_match is None else publish_match.group(0)
+    if "os.replace(" in publish_source or "os.rename(" in publish_source:
+        errors.append("nddev_cursor_cli.py must not rename/replace bootstrap anchors")
+    if "os.ftruncate(descriptor, 0)" in publish_source:
+        errors.append("nddev_cursor_cli.py must not truncate bootstrap anchor descriptors")
     if re.search(r"os\.environ[^\n]*BOOTSTRAP|BOOTSTRAP[^\n]*os\.environ", manager_source):
         errors.append("nddev_cursor_cli.py must not expose a bootstrap lock env override")
 
@@ -2288,6 +2319,124 @@ def validate_external_bootstrap_lock_smoke(module: Any, errors: list[str]) -> No
             errors.append(f"external bootstrap lock smoke left setup drift: {state['drift']}")
 
 
+def injected_bootstrap_namespace(module: Any, bootstrap_root: Path) -> tuple[tuple, ...]:
+    uid = module.current_user_id()
+    if uid is None:
+        return tuple()
+    product_root = bootstrap_root / f"{module.BOOTSTRAP_LOCK_ROOT_PREFIX}-{uid}"
+    if not product_root.exists() and not product_root.is_symlink():
+        return tuple()
+    records: list[tuple] = []
+    for path in [product_root, *sorted(product_root.rglob("*"))]:
+        info = path.lstat()
+        relative = path.relative_to(bootstrap_root).as_posix()
+        records.append(
+            (
+                relative,
+                stat.S_IMODE(info.st_mode),
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                "link" if stat.S_ISLNK(info.st_mode) else "dir" if stat.S_ISDIR(info.st_mode) else "file",
+            )
+        )
+    return tuple(records)
+
+
+def validate_read_only_bootstrap_namespace_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-read-bootstrap-smoke-") as tmp:
+        root = Path(tmp)
+        bootstrap_root = root / "bootstrap"
+        bootstrap_root.mkdir(mode=0o700)
+        bootstrap_root.chmod(0o1777)
+        parent = root / "targets"
+        parent.mkdir(mode=0o700)
+        cold = parent / "cold"
+        seeded = parent / "seeded"
+        with with_restored_attr(module, "bootstrap_lock_system_root", lambda: bootstrap_root):
+            before_cold = injected_bootstrap_namespace(module, bootstrap_root)
+            for action in (
+                lambda: module.inspect_target(cold),
+                lambda: module.plan_setup(cold, "nddev-builder", "full-auto"),
+                lambda: module.software_status(cold),
+            ):
+                result = action()
+                if not isinstance(result, dict):
+                    errors.append("read-only cold bootstrap smoke returned non-dict result")
+            after_cold = injected_bootstrap_namespace(module, bootstrap_root)
+            if after_cold != before_cold:
+                errors.append(
+                    "read-only cold commands created bootstrap namespace residue: "
+                    f"before={before_cold!r} after={after_cold!r}"
+                )
+
+            module.mutate_setup(seeded, "nddev-builder", "full-auto", "install")
+            seeded_before = injected_bootstrap_namespace(module, bootstrap_root)
+            names = [record[0].split("/")[-1] for record in seeded_before]
+            if module.BOOTSTRAP_PRODUCT_LOCK_NAME not in names:
+                errors.append("seeded bootstrap smoke did not publish the product anchor")
+            canonical_count = sum(
+                1 for record in seeded_before
+                if record[5] == "file" and record[0].split("/")[-1].startswith(f"{module.PRODUCT_NAME}-")
+            )
+            if canonical_count != 1:
+                errors.append(f"seeded bootstrap smoke canonical anchor count={canonical_count}")
+            for action in (
+                lambda: module.inspect_target(seeded),
+                lambda: module.plan_setup(seeded, "nddev-builder", "full-auto"),
+                lambda: module.software_status(seeded),
+            ):
+                result = action()
+                if not isinstance(result, dict):
+                    errors.append("read-only seeded bootstrap smoke returned non-dict result")
+            seeded_after = injected_bootstrap_namespace(module, bootstrap_root)
+            if seeded_after != seeded_before:
+                errors.append(
+                    "read-only seeded commands changed bootstrap namespace: "
+                    f"before={seeded_before!r} after={seeded_after!r}"
+                )
+
+            product_root = bootstrap_root / f"{module.BOOTSTRAP_LOCK_ROOT_PREFIX}-{module.current_user_id()}"
+            product_anchor = product_root / module.BOOTSTRAP_PRODUCT_LOCK_NAME
+            canonical_anchors = sorted(
+                path
+                for path in product_root.iterdir()
+                if path.name.startswith(f"{module.PRODUCT_NAME}-")
+            )
+            if len(canonical_anchors) != 1:
+                errors.append(
+                    f"bootstrap alias recovery smoke canonical anchors={canonical_anchors}"
+                )
+                return
+
+            def assert_alias_recovered(anchor: Path, label: str) -> None:
+                alias = anchor.with_name(f".{anchor.name}.nddev-anchor-tmp.123.456")
+                os.link(anchor, alias)
+                fsync_existing_parent = getattr(module, "fsync_existing_parent")
+                fsync_existing_parent(anchor)
+                try:
+                    module.inspect_target(seeded)
+                except Exception as exc:  # noqa: BLE001 - public validator reports context.
+                    errors.append(f"{label} alias recovery raised unexpectedly: {exc}")
+                    return
+                if alias.exists() or alias.is_symlink():
+                    errors.append(f"{label} publication alias was not recovered")
+                if anchor.lstat().st_nlink != 1:
+                    errors.append(f"{label} anchor link count was not restored")
+
+            assert_alias_recovered(product_anchor, "product anchor")
+            assert_alias_recovered(canonical_anchors[0], "canonical anchor")
+            unknown = product_anchor.with_name(f".{product_anchor.name}.unknown-hardlink")
+            os.link(product_anchor, unknown)
+            try:
+                module.inspect_target(seeded)
+            except module.CursorSetupError as exc:
+                if "unknown" not in str(exc):
+                    errors.append(f"unknown hardlink failed with unexpected error: {exc}")
+            else:
+                errors.append("unknown bootstrap hardlink was accepted")
+
+
 def validate_launch_separator_argv_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-launch-argv-smoke-") as tmp:
         root = Path(tmp)
@@ -2726,6 +2875,7 @@ def validate_target_command_external_lock_order_smoke(module: Any, errors: list[
             events: list[str] = []
             product_locked = {"value": False}
             canonical_locked = {"value": False}
+            read_command = command in READ_ONLY_ANCHOR_COMMANDS
 
             def fake_host() -> None:
                 events.append("host")
@@ -2739,22 +2889,44 @@ def validate_target_command_external_lock_order_smoke(module: Any, errors: list[
                 return os.fspath(raw)
 
             @contextlib.contextmanager
-            def fake_product() -> Any:
+            def fake_product(*, create: bool, exclusive: bool) -> Any:
                 if events != ["host", "lexical"]:
                     errors.append(f"{command}: product lock ran out of order: {events}")
+                if create == read_command:
+                    errors.append(f"{command}: product create flag mismatch: {create}")
+                if exclusive == read_command:
+                    errors.append(f"{command}: product exclusive flag mismatch: {exclusive}")
                 events.append("product-enter")
                 product_locked["value"] = True
                 try:
-                    yield
+                    yield True
                 finally:
                     product_locked["value"] = False
                     events.append("product-exit")
 
             @contextlib.contextmanager
-            def fake_bootstrap(raw: Any) -> Any:
-                del raw
+            def fake_existing_bootstrap(raw: Any) -> Any:
+                if not read_command:
+                    errors.append(f"{command}: mutation used read-only canonical handoff")
                 if events != ["host", "lexical", "product-enter", "resolve"]:
-                    errors.append(f"{command}: canonical lock ran out of order: {events}")
+                    errors.append(f"{command}: read canonical lock ran out of order: {events}")
+                events.append("canonical-enter")
+                canonical_locked["value"] = True
+                try:
+                    yield True
+                finally:
+                    canonical_locked["value"] = False
+                    events.append("canonical-exit")
+
+            @contextlib.contextmanager
+            def fake_bootstrap_anchor(path: Path, lock_key: str, digest: str, **kwargs: Any) -> Any:
+                del path, lock_key, digest
+                if read_command:
+                    errors.append(f"{command}: read-only command created a canonical anchor")
+                if kwargs.get("create") is not True or kwargs.get("exclusive") is not True:
+                    errors.append(f"{command}: mutation canonical lock flags mismatch: {kwargs}")
+                if events != ["host", "lexical", "product-enter", "resolve"]:
+                    errors.append(f"{command}: mutation canonical lock ran out of order: {events}")
                 events.append("canonical-enter")
                 canonical_locked["value"] = True
                 try:
@@ -2770,6 +2942,13 @@ def validate_target_command_external_lock_order_smoke(module: Any, errors: list[
                     raise AssertionError("resolve_target ran inside canonical lock")
                 events.append("resolve")
                 return Path(raw)
+
+            def fake_bootstrap_path_for_acquire(raw: Any) -> tuple[Path, str, str, dict[str, Any]]:
+                if events != ["host", "lexical", "product-enter", "resolve"]:
+                    errors.append(
+                        f"{command}: canonical path derivation ran out of order: {events}"
+                    )
+                return root / f"{command}.lock", os.fspath(raw), "0" * 64, {}
 
             def fake_work(*args: Any, **kwargs: Any) -> Any:
                 del args, kwargs
@@ -2794,7 +2973,14 @@ def validate_target_command_external_lock_order_smoke(module: Any, errors: list[
                 with_restored_attr(module, "require_current_host_supported", fake_host),
                 with_restored_attr(module, "lexical_target_text", fake_lexical),
                 with_restored_attr(module, "product_lifecycle_lock", fake_product),
-                with_restored_attr(module, "bootstrap_lifecycle_lock", fake_bootstrap),
+                with_restored_attr(module, "product_anchor_present_no_create", lambda: True),
+                with_restored_attr(
+                    module, "existing_bootstrap_lifecycle_lock", fake_existing_bootstrap
+                ),
+                with_restored_attr(module, "bootstrap_anchor_lock", fake_bootstrap_anchor),
+                with_restored_attr(
+                    module, "bootstrap_lock_path_for_acquire", fake_bootstrap_path_for_acquire
+                ),
                 with_restored_attr(module, "resolve_target", fake_resolve),
                 with_restored_attr(module, work_attr, fake_work),
             ):
@@ -2807,16 +2993,28 @@ def validate_target_command_external_lock_order_smoke(module: Any, errors: list[
                     errors.append(f"{command}: {exc}")
                 except BaseException as exc:  # noqa: BLE001 - public smoke serializes failures.
                     errors.append(f"{command}: lock-order trace raised unexpectedly: {exc}")
-            expected_events = [
-                "host",
-                "lexical",
-                "product-enter",
-                "resolve",
-                "canonical-enter",
-                work_attr,
-                "canonical-exit",
-                "product-exit",
-            ]
+            if read_command:
+                expected_events = [
+                    "host",
+                    "lexical",
+                    "product-enter",
+                    "resolve",
+                    "canonical-enter",
+                    "product-exit",
+                    work_attr,
+                    "canonical-exit",
+                ]
+            else:
+                expected_events = [
+                    "host",
+                    "lexical",
+                    "product-enter",
+                    "resolve",
+                    "canonical-enter",
+                    "product-exit",
+                    work_attr,
+                    "canonical-exit",
+                ]
             if events != expected_events:
                 errors.append(f"{command}: target command lock order mismatch: {events}")
 
@@ -2978,6 +3176,10 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                 (
                     "external bootstrap lock",
                     lambda: validate_external_bootstrap_lock_smoke(module, errors),
+                ),
+                (
+                    "read-only bootstrap namespace",
+                    lambda: validate_read_only_bootstrap_namespace_smoke(module, errors),
                 ),
                 (
                     "launch separator argv",
@@ -3197,12 +3399,22 @@ def main() -> int:
             errors.append("build/manifest.json: lock parent locked mode mismatch")
         if "lock_parent_mode_while_launching" in transaction:
             errors.append("build/manifest.json: transaction lock mode must not be launch-only")
-        if transaction.get("bootstrap_lock") != BOOTSTRAP_LOCK_PATH:
-            errors.append("build/manifest.json: bootstrap lock path mismatch")
+        if transaction.get("bootstrap_product_anchor") != BOOTSTRAP_PRODUCT_ANCHOR:
+            errors.append("build/manifest.json: bootstrap product anchor mismatch")
+        if transaction.get("bootstrap_canonical_mutation_anchor") != BOOTSTRAP_CANONICAL_ANCHOR:
+            errors.append("build/manifest.json: bootstrap canonical anchor mismatch")
         if transaction.get("bootstrap_lock_file_mode") != "0600":
             errors.append("build/manifest.json: bootstrap lock mode mismatch")
         if transaction.get("bootstrap_lock_binding") != BOOTSTRAP_LOCK_BINDING:
             errors.append("build/manifest.json: bootstrap lock binding mismatch")
+        if transaction.get("bootstrap_anchor_publication") != BOOTSTRAP_PUBLICATION:
+            errors.append("build/manifest.json: bootstrap anchor publication mismatch")
+        if transaction.get("read_only_anchor_creation") is not False:
+            errors.append("build/manifest.json: read-only anchor creation policy mismatch")
+        if transaction.get("read_only_anchor_commands") != READ_ONLY_ANCHOR_COMMANDS:
+            errors.append("build/manifest.json: read-only anchor commands mismatch")
+        if transaction.get("read_only_cold_no_anchor_double_check") is not True:
+            errors.append("build/manifest.json: read-only cold double-check mismatch")
         if transaction.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
             errors.append("build/manifest.json: mutable runtime TMPDIR mismatch")
         if (
@@ -3306,12 +3518,22 @@ def main() -> int:
             errors.append("config/nddev-contract.json: lock parent locked mode mismatch")
         if "lock_parent_mode_while_launching" in safety:
             errors.append("config/nddev-contract.json: safety lock mode must not be launch-only")
-        if safety.get("bootstrap_lock") != BOOTSTRAP_LOCK_PATH:
-            errors.append("config/nddev-contract.json: bootstrap lock path mismatch")
+        if safety.get("bootstrap_product_anchor") != BOOTSTRAP_PRODUCT_ANCHOR:
+            errors.append("config/nddev-contract.json: bootstrap product anchor mismatch")
+        if safety.get("bootstrap_canonical_mutation_anchor") != BOOTSTRAP_CANONICAL_ANCHOR:
+            errors.append("config/nddev-contract.json: bootstrap canonical anchor mismatch")
         if safety.get("bootstrap_lock_file_mode") != "0600":
             errors.append("config/nddev-contract.json: bootstrap lock mode mismatch")
         if safety.get("bootstrap_lock_binding") != BOOTSTRAP_LOCK_BINDING:
             errors.append("config/nddev-contract.json: bootstrap lock binding mismatch")
+        if safety.get("bootstrap_anchor_publication") != BOOTSTRAP_PUBLICATION:
+            errors.append("config/nddev-contract.json: bootstrap anchor publication mismatch")
+        if safety.get("read_only_anchor_creation") is not False:
+            errors.append("config/nddev-contract.json: read-only anchor creation policy mismatch")
+        if safety.get("read_only_anchor_commands") != READ_ONLY_ANCHOR_COMMANDS:
+            errors.append("config/nddev-contract.json: read-only anchor commands mismatch")
+        if safety.get("read_only_cold_no_anchor_double_check") is not True:
+            errors.append("config/nddev-contract.json: read-only cold double-check mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
             errors.append("config/nddev-contract.json: backup path mismatch")
         if safety.get("backup_envelope_schema") != 3:
