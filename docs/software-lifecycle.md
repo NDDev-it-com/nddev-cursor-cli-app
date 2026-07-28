@@ -13,6 +13,8 @@ caller home, system prefix, npm global prefix, or pip environment.
 - `update-cli --target <absolute-target>` requires existing target-owned
   software presence. It can repair safe partial state and is an idempotent
   no-op when the target is already current.
+- `remove-cli --target <absolute-target>` removes only manager-owned Cursor
+  Agent software state while preserving setup, auth, and unrelated target state.
 - `launch --target <absolute-target> -- ...` requires both a clean setup stamp
   and current target-owned software, then executes the managed runtime with
   isolated child state.
@@ -41,6 +43,14 @@ Production installs use only the pinned official Cursor artifact described by
 release id, artifact URLs, supported platform artifact map, sizes, and SHA-256
 digests. `build/manifest.json` owns the runtime closure published with this
 module version.
+
+The supported NDDev host IDs are `macos-arm64`, `macos-x64`,
+`ubuntu-glibc-arm64`, and `ubuntu-glibc-x64`. Ubuntu desktop and server hosts
+share the same `ID=ubuntu` plus glibc preflight, and Cursor publishes no
+official Ubuntu/glibc version floor for this agent release. Upstream artifact
+paths remain Cursor's own vendor names, including `darwin/*` and `linux/*`;
+`windows`, `non-ubuntu-linux`, `linux-musl`, and `unsupported-architecture`
+hosts fail closed before locks, target creation, download, staging, or launch.
 
 ## Archive safety and rollback
 

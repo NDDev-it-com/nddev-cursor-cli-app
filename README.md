@@ -36,20 +36,30 @@ deliberate same-UID tampering without a sandbox.
 ## Software lifecycle
 
 The Cursor setup lifecycle and Cursor Agent runtime lifecycle are separate.
-`software-status`, `install-cli`, and `update-cli` manage a target-owned copy
-of the pinned official Cursor Agent runtime package:
+`software-status`, `install-cli`, `update-cli`, and `remove-cli` manage a
+target-owned copy of the pinned official Cursor Agent runtime package:
 
 ```bash
 python3 cli-tools/nddev_cursor_cli.py software-status --target /absolute/cursor-config --json
 python3 cli-tools/nddev_cursor_cli.py install-cli --target /absolute/cursor-config --json
 python3 cli-tools/nddev_cursor_cli.py update-cli --target /absolute/cursor-config --json
+python3 cli-tools/nddev_cursor_cli.py remove-cli --target /absolute/cursor-config --json
 ```
 
 Production installs use only the official pinned artifact described by
 `references/cursor-cli-baseline.json`, with release/runtime closure owned by
 `build/manifest.json` and enforced by `cli-tools/nddev_cursor_cli.py`. npm and
 pip install paths are not supported. Use `software-status --json` for the exact
-local software state, drift, and current/repair/no-op outcomes.
+local software state, drift, and current/repair/remove/no-op outcomes.
+
+The supported NDDev host IDs are `macos-arm64`, `macos-x64`,
+`ubuntu-glibc-arm64`, and `ubuntu-glibc-x64`. Ubuntu desktop and server hosts
+share the same `ID=ubuntu` plus glibc preflight, and Cursor publishes no
+official Ubuntu/glibc version floor for this agent release. The public baseline
+keeps those host IDs separate from Cursor's upstream vendor artifact names such
+as `darwin/*` and `linux/*`; `windows`, `non-ubuntu-linux`, `linux-musl`, and
+`unsupported-architecture` hosts fail before locks, target creation, download,
+staging, or launch.
 
 `launch` runs Cursor Agent from the managed target with isolated runtime state
 scoped only to the child process:

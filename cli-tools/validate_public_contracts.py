@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import importlib.util
 import json
@@ -52,9 +53,28 @@ EXPECTED_ARTIFACTS = {
         "size": 82521188,
     },
 }
+OBSERVED_VENDOR_ASSETS = {
+    "unsupported_windows": {
+        "product_support": False,
+        "unsupported_host_category": "windows",
+        "source_template": (
+            "https://downloads.cursor.com/lab/2026.07.23-e383d2b/{os}/{arch}/agent-cli-package.zip"
+        ),
+        "provenance": (
+            "official Cursor current-release asset observation only; "
+            "not part of supported NDDev product hosts"
+        ),
+        "verified_date": "2026-07-28",
+        "assets": {
+            "windows/x64/agent-cli-package.zip": {"size": 63067629},
+            "windows/arm64/agent-cli-package.zip": {"size": 58461383},
+        },
+    }
+}
 SOFTWARE_KEYS = {
     "artifact_reader",
     "command",
+    "host_platform_preflight",
     "install_command",
     "install_precondition",
     "managed_command",
@@ -64,6 +84,8 @@ SOFTWARE_KEYS = {
     "official_source",
     "pip",
     "presence_signal",
+    "remove_command",
+    "remove_precondition",
     "rollback_on_failure",
     "stage_and_atomic_swap",
     "status_command",
@@ -77,10 +99,13 @@ SOFTWARE_KEYS = {
 SOFTWARE_LIFECYCLE_KEYS = {
     "credential_inheritance",
     "entrypoint",
+    "failure_current_behavior",
     "install_command",
     "install_precondition",
     "presence_signal",
     "private_modes",
+    "remove_command",
+    "remove_precondition",
     "rollback_on_swap_failure",
     "software_root",
     "stage_and_atomic_swap",
@@ -89,10 +114,75 @@ SOFTWARE_LIFECYCLE_KEYS = {
     "status_command",
     "status_executes_binary",
     "target_owned",
+    "transaction_marker",
     "update_command",
     "update_precondition",
 }
 STATUS_FIELDS = ["installed", "current", "present", "presence", "drift"]
+SUPPORTED_HOST_IDS = [
+    "macos-arm64",
+    "macos-x64",
+    "ubuntu-glibc-arm64",
+    "ubuntu-glibc-x64",
+]
+UNSUPPORTED_HOST_CATEGORIES = [
+    "windows",
+    "non-ubuntu-linux",
+    "linux-musl",
+    "unsupported-architecture",
+]
+VENDOR_ASSET_MAPPING = {
+    "macos-arm64": {
+        "vendor_os": "darwin",
+        "vendor_arch": "arm64",
+        "asset_path": "darwin/arm64/agent-cli-package.tar.gz",
+    },
+    "macos-x64": {
+        "vendor_os": "darwin",
+        "vendor_arch": "x64",
+        "asset_path": "darwin/x64/agent-cli-package.tar.gz",
+    },
+    "ubuntu-glibc-arm64": {
+        "vendor_os": "linux",
+        "vendor_arch": "arm64",
+        "asset_path": "linux/arm64/agent-cli-package.tar.gz",
+    },
+    "ubuntu-glibc-x64": {
+        "vendor_os": "linux",
+        "vendor_arch": "x64",
+        "asset_path": "linux/x64/agent-cli-package.tar.gz",
+    },
+}
+PLATFORM_SCOPE = {
+    "supported_host_ids": SUPPORTED_HOST_IDS,
+    "ubuntu_distribution_id": "ubuntu",
+    "ubuntu_libc": "glibc",
+    "ubuntu_glibc_version_floor": None,
+    "ubuntu_glibc_version_floor_status": "no-official-floor",
+    "ubuntu_systems": ["desktop", "server"],
+    "unsupported_host_categories": UNSUPPORTED_HOST_CATEGORIES,
+    "vendor_asset_mapping": VENDOR_ASSET_MAPPING,
+}
+BASELINE_PLATFORM_SCOPE = {
+    "supported_host_ids": SUPPORTED_HOST_IDS,
+    "ubuntu": {
+        "distribution_id": "ubuntu",
+        "libc": "glibc",
+        "glibc_version_floor": None,
+        "glibc_version_floor_status": "no-official-floor",
+        "systems": ["desktop", "server"],
+    },
+    "unsupported_host_categories": UNSUPPORTED_HOST_CATEGORIES,
+    "vendor_asset_mapping": VENDOR_ASSET_MAPPING,
+}
+HOST_PLATFORM_PREFLIGHT = (
+    "Supported NDDev host IDs are macos-arm64, macos-x64, ubuntu-glibc-arm64, "
+    "and ubuntu-glibc-x64. Ubuntu desktop/server hosts must report ID=ubuntu "
+    "and glibc; Cursor publishes no official Ubuntu/glibc version floor. "
+    "Upstream darwin/* and linux/* artifact paths remain vendor IDs. windows, "
+    "non-ubuntu-linux, linux-musl, and unsupported-architecture fail before "
+    "bootstrap lock, target lock, target creation, download, stage, or launch"
+)
 BLOCKED_LAUNCH_OVERRIDES = [
     "--approve-mcps",
     "--force",
@@ -276,12 +366,35 @@ def validate_software(owner: str, software: dict, errors: list[str]) -> None:
         errors.append(f"{owner}: software_install.version mismatch")
     if software.get("command") != "agent" or software.get("managed_command") != "bin/agent":
         errors.append(f"{owner}: software_install must manage bin/agent")
+    for command_key, command_name in (
+        ("status_command", "software-status"),
+        ("install_command", "install-cli"),
+        ("update_command", "update-cli"),
+        ("remove_command", "remove-cli"),
+    ):
+        if command_name not in str(software.get(command_key, "")):
+            errors.append(f"{owner}: software_install.{command_key} mismatch")
     if software.get("npm") is not None or software.get("pip") is not None:
         errors.append(f"{owner}: software_install must not declare npm/pip install")
     if "present=true" not in str(software.get("presence_signal", "")):
         errors.append(f"{owner}: software_install.presence_signal mismatch")
     if software.get("status_fields") != STATUS_FIELDS:
         errors.append(f"{owner}: software_install.status_fields mismatch")
+    if software.get("host_platform_preflight") != HOST_PLATFORM_PREFLIGHT:
+        errors.append(f"{owner}: software_install host platform preflight mismatch")
+
+
+def validate_runtime_compatibility(owner: str, compatibility: dict, errors: list[str]) -> None:
+    expected_keys = {"baseline_ref", "version_ref", *PLATFORM_SCOPE}
+    if set(compatibility) != expected_keys:
+        errors.append(f"{owner}: runtime_compatibility keys mismatch")
+    if compatibility.get("baseline_ref") != "references/cursor-cli-baseline.json":
+        errors.append(f"{owner}: runtime_compatibility baseline mismatch")
+    if compatibility.get("version_ref") != "build/version.json":
+        errors.append(f"{owner}: runtime_compatibility version ref mismatch")
+    for key, expected in PLATFORM_SCOPE.items():
+        if compatibility.get(key) != expected:
+            errors.append(f"{owner}: runtime_compatibility {key} mismatch")
 
 
 def validate_profiles(errors: list[str]) -> None:
@@ -345,9 +458,7 @@ def validate_profiles(errors: list[str]) -> None:
                 errors.append(f"profiles/{profile_id}/cli-config.json: unsupported approvalMode")
 
 
-def validate_builder_toolkit(
-    version: dict | None, build_version: str, errors: list[str]
-) -> None:
+def validate_builder_toolkit(version: dict | None, build_version: str, errors: list[str]) -> None:
     plugin = load_json("plugins/nddev-builder/.cursor-plugin/plugin.json", errors)
     if plugin is not None:
         if plugin.get("name") != "nddev-builder":
@@ -839,9 +950,7 @@ def wait_for_holder_ready(
     return False
 
 
-def wait_for_holder_exit(
-    pid: int, error: Path, errors: list[str], label: str
-) -> bool:
+def wait_for_holder_exit(pid: int, error: Path, errors: list[str], label: str) -> bool:
     deadline = time.time() + 5
     while time.time() < deadline:
         exited, status = os.waitpid(pid, os.WNOHANG)
@@ -916,13 +1025,13 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         "set_owner_directory_fd_mode",
         "validate_or_write_bootstrap_binding",
         "read_valid_bootstrap_binding",
-        "require_lock_file_matches_fd(path, descriptor, \"bootstrap lock\")",
+        'require_lock_file_matches_fd(path, descriptor, "bootstrap lock")',
         "require_directory_matches_fd",
         "threading.get_ident()",
-        "PRODUCT_NAME.encode(\"utf-8\") + b\"\\0\" + canonical.encode(\"utf-8\")",
-        "Path(\"/tmp\").resolve(strict=True)",
+        'PRODUCT_NAME.encode("utf-8") + b"\\0" + canonical.encode("utf-8")',
+        'Path("/tmp").resolve(strict=True)',
         "stat.S_ISVTX",
-        "f\"{PRODUCT_NAME}-{digest}.lock\"",
+        'f"{PRODUCT_NAME}-{digest}.lock"',
     ):
         if needle not in manager_source:
             errors.append(f"nddev_cursor_cli.py must keep bootstrap lock evidence: {needle}")
@@ -1150,7 +1259,9 @@ def validate_backup_rotation_and_binding_smoke(module: Any, errors: list[str]) -
         pool = module.backup_pool(target)
         if pool.parent != module.control_root(target):
             errors.append("backup rotation smoke backup pool is not control-root internal")
-        real_slots = sorted(path.name for path in pool.iterdir() if path.is_dir() and not path.is_symlink())
+        real_slots = sorted(
+            path.name for path in pool.iterdir() if path.is_dir() and not path.is_symlink()
+        )
         if real_slots != [str(slot) for slot in range(10)]:
             errors.append(f"backup rotation smoke expected slots 0..9, got {real_slots}")
         if len(set(slots)) != 10 or len(slots) != 11:
@@ -1182,6 +1293,330 @@ def validate_backup_rotation_and_binding_smoke(module: Any, errors: list[str]) -
                 errors.append("backup canonical binding failed with unexpected error")
         else:
             errors.append("backup canonical binding accepted another target's backup")
+
+
+def validate_backup_digest_rejection_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-backup-digest-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        config_path = target / module.CONFIG_NAME
+        config = module.load_target_config(target)
+        if config is None:
+            errors.append("backup digest smoke could not load installed config")
+            return
+        config["model"] = "auditor-preserved-model"
+        config_path.write_bytes(module.canonical_json(config))
+        config_path.chmod(module.OWNER_FILE_MODE)
+        result = module.mutate_setup(target, "nddev-builder", "safe", "switch")
+        slot = result.get("backup_slot")
+        if not isinstance(slot, int):
+            errors.append("backup digest smoke did not create a backup slot")
+            return
+        envelope_path = module.backup_pool(target) / str(slot) / module.BACKUP_NAME
+        original_envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        before_bytes = config_path.read_bytes()
+        before_mode = stat.S_IMODE(config_path.lstat().st_mode)
+
+        def write_envelope(envelope: dict[str, Any]) -> None:
+            envelope_path.write_bytes(module.canonical_json(envelope))
+            envelope_path.chmod(module.OWNER_FILE_MODE)
+
+        def expect_rejected(label: str, mutate: Any) -> None:
+            envelope = json.loads(json.dumps(original_envelope))
+            mutate(envelope)
+            write_envelope(envelope)
+            try:
+                module.restore_slot(target, slot)
+            except module.CursorSetupError:
+                pass
+            else:
+                errors.append(f"backup digest smoke accepted {label}")
+            after_bytes = config_path.read_bytes()
+            after_mode = stat.S_IMODE(config_path.lstat().st_mode)
+            if after_bytes != before_bytes or after_mode != before_mode:
+                errors.append(f"backup digest smoke mutated target after rejecting {label}")
+
+        def tamper_payload(envelope: dict[str, Any]) -> None:
+            payload = envelope["files"][module.CONFIG_NAME]["payload"]
+            config_bytes = base64.b64decode(payload.encode("ascii"), validate=True)
+            restored_config = json.loads(config_bytes.decode("utf-8"))
+            restored_config["model"] = "tampered-model"
+            envelope["files"][module.CONFIG_NAME]["payload"] = base64.b64encode(
+                module.canonical_json(restored_config)
+            ).decode("ascii")
+
+        def remove_digest(envelope: dict[str, Any]) -> None:
+            del envelope["files"][module.CONFIG_NAME]["sha256"]
+
+        def remove_record(envelope: dict[str, Any]) -> None:
+            del envelope["files"][module.STAMP_NAME]
+
+        def add_extra_record(envelope: dict[str, Any]) -> None:
+            extra_path = "extra.json"
+            envelope["files"][extra_path] = module.backup_file_record(extra_path, b"extra\n")
+
+        for label, mutate in (
+            ("tampered payload", tamper_payload),
+            ("missing digest", remove_digest),
+            ("missing file record", remove_record),
+            ("extra file record", add_extra_record),
+        ):
+            expect_rejected(label, mutate)
+        write_envelope(original_envelope)
+        extra = envelope_path.parent / "unrecorded-extra.bin"
+        extra.write_bytes(b"unrecorded\n")
+        try:
+            module.restore_slot(target, slot)
+        except module.CursorSetupError:
+            pass
+        else:
+            errors.append("backup digest smoke accepted unrecorded slot sibling")
+        after_bytes = config_path.read_bytes()
+        after_mode = stat.S_IMODE(config_path.lstat().st_mode)
+        if after_bytes != before_bytes or after_mode != before_mode:
+            errors.append("backup digest smoke mutated target after rejecting slot sibling")
+        extra.unlink()
+
+
+def managed_snapshot(module: Any, target: Path) -> dict[str, tuple[bytes | None, int | None]]:
+    snapshot: dict[str, tuple[bytes | None, int | None]] = {}
+    for relative in module.managed_paths():
+        path = target / relative
+        if not (path.exists() or path.is_symlink()):
+            snapshot[relative.as_posix()] = (None, None)
+            continue
+        snapshot[relative.as_posix()] = (
+            path.read_bytes(),
+            stat.S_IMODE(path.lstat().st_mode),
+        )
+    return snapshot
+
+
+def hidden_residue_names(root: Path, prefixes: tuple[str, ...]) -> list[str]:
+    if not root.exists() or root.is_symlink():
+        return []
+    return sorted(path.name for path in root.iterdir() if path.name.startswith(prefixes))
+
+
+def validate_managed_transaction_rollback_fault_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-managed-txn-smoke-") as tmp:
+        target = Path(tmp) / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        before = managed_snapshot(module, target)
+        real_replace = module.os.replace
+        calls = {"count": 0}
+
+        def flaky_replace(source: Any, destination: Any) -> None:
+            calls["count"] += 1
+            if calls["count"] in {2, 3}:
+                raise OSError("injected managed replace fault")
+            real_replace(source, destination)
+
+        with with_restored_attr(module.os, "replace", flaky_replace):
+            try:
+                module.mutate_setup(target, "nddev-builder", "safe", "switch")
+            except (module.CursorSetupError, OSError):
+                pass
+            else:
+                errors.append("managed transaction smoke did not inject a failure")
+        after = managed_snapshot(module, target)
+        if after != before:
+            errors.append("managed transaction rollback did not restore exact prior files")
+        control = module.control_root(target)
+        residue = hidden_residue_names(control, (module.MANAGED_TRANSACTION_PREFIX,))
+        if residue:
+            errors.append(f"managed transaction rollback left residue: {residue}")
+        state = module.inspect_target(target)
+        if state["state"] != "managed" or state["profile_id"] != "full-auto" or state["drift"]:
+            errors.append("managed transaction rollback left target in an unexpected state")
+
+
+def validate_managed_transaction_stale_expected_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-managed-stale-smoke-") as tmp:
+        target = Path(tmp) / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        before = module.capture_managed_files(target)
+        config_path = target / module.CONFIG_NAME
+        config = module.load_target_config(target)
+        if config is None:
+            errors.append("managed stale smoke could not load config")
+            return
+        config["model"] = "concurrent-change"
+        changed_bytes = module.canonical_json(config)
+        config_path.write_bytes(changed_bytes)
+        config_path.chmod(module.OWNER_FILE_MODE)
+        desired = module.desired_for_selection(target, "nddev-builder", "safe", config)
+        try:
+            module.replace_managed_state(target, desired, before)
+        except module.CursorSetupError as exc:
+            if "pre-state changed before write" not in str(exc):
+                errors.append("managed stale smoke failed with unexpected error")
+        else:
+            errors.append("managed stale smoke accepted stale expected state")
+        if config_path.read_bytes() != changed_bytes:
+            errors.append("managed stale smoke mutated target after stale rejection")
+        control = module.control_root(target)
+        residue = hidden_residue_names(control, (module.MANAGED_TRANSACTION_PREFIX,))
+        if residue:
+            errors.append(f"managed stale smoke created transaction residue: {residue}")
+
+
+def fake_runtime(module: Any, seed: bytes) -> dict[str, Any]:
+    files = {
+        "cursor-agent": (b"agent-" + seed, module.OWNER_EXEC_MODE),
+        "node": (b"node-" + seed, module.OWNER_EXEC_MODE),
+        "index.js": (b"index-" + seed, module.OWNER_FILE_MODE),
+    }
+    runtime_sha256, runtime_size, runtime_file_count = module.runtime_tree_digest(files)
+    return {
+        "files": files,
+        "binary": files["cursor-agent"][0],
+        "binary_sha256": module.sha256_bytes(files["cursor-agent"][0]),
+        "runtime_tree_sha256": runtime_sha256,
+        "runtime_size": runtime_size,
+        "runtime_file_count": runtime_file_count,
+    }
+
+
+def validate_software_transaction_rollback_fault_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-software-txn-smoke-") as tmp:
+        target = Path(tmp) / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        binary_path = module.managed_agent_path(target)
+        stamp_path = module.software_stamp_path(target)
+        before_binary = binary_path.read_bytes()
+        before_stamp = stamp_path.read_bytes()
+        before_version = module.path_tree_signature(
+            module.software_version_dir(target), "smoke version tree"
+        )
+        artifact = b"new official artifact"
+        asset_path = "linux/x64/agent-cli-package.tar.gz"
+        expected_sha = module.sha256_bytes(artifact)
+        runtime = fake_runtime(module, b"new")
+        real_atomic_with_mode = module.atomic_write_with_mode
+        faults = {"stamp": True, "binary_restore": True}
+
+        def fake_current_platform_asset() -> tuple[str, str, int]:
+            return asset_path, expected_sha, len(artifact)
+
+        def fake_read_artifact(source: str) -> bytes:
+            del source
+            return artifact
+
+        def flaky_atomic(path: Path, content: bytes) -> None:
+            if Path(path) == stamp_path and faults["stamp"]:
+                faults["stamp"] = False
+                raise OSError("injected stamp write fault")
+            real_atomic_with_mode(path, content, module.OWNER_FILE_MODE)
+
+        def flaky_atomic_with_mode(path: Path, content: bytes, mode: int) -> None:
+            if Path(path) == binary_path and content == before_binary and faults["binary_restore"]:
+                faults["binary_restore"] = False
+                raise OSError("injected binary rollback fault")
+            real_atomic_with_mode(path, content, mode)
+
+        with (
+            with_restored_attr(module, "current_platform_asset", fake_current_platform_asset),
+            with_restored_attr(module, "read_artifact", fake_read_artifact),
+            with_restored_attr(module, "extract_cursor_runtime", lambda archive: runtime),
+            with_restored_attr(module, "atomic_write", flaky_atomic),
+            with_restored_attr(module, "atomic_write_with_mode", flaky_atomic_with_mode),
+        ):
+            try:
+                module.install_cursor_cli(target, "update-cli")
+            except (module.CursorSetupError, OSError):
+                pass
+            else:
+                errors.append("software transaction smoke did not inject a failure")
+        after_version = module.path_tree_signature(
+            module.software_version_dir(target), "smoke version tree"
+        )
+        if (
+            binary_path.read_bytes() != before_binary
+            or stamp_path.read_bytes() != before_stamp
+            or after_version != before_version
+        ):
+            errors.append("software transaction rollback did not restore exact prior state")
+        marker = module.software_transaction_path(target)
+        status = module.software_status(target)
+        if (marker.exists() or marker.is_symlink()) and status["current"]:
+            errors.append("software transaction marker did not force non-current status")
+        residue = hidden_residue_names(
+            module.software_root(target) / "versions", (".stage-", ".rollback-")
+        )
+        if residue:
+            errors.append(f"software transaction rollback left staging residue: {residue}")
+
+
+def backup_slot_bytes(module: Any, target: Path) -> dict[str, bytes]:
+    pool = module.backup_pool(target)
+    return {
+        path.name: (path / module.BACKUP_NAME).read_bytes()
+        for path in sorted(pool.iterdir(), key=lambda item: item.name)
+        if path.is_dir() and not path.is_symlink() and path.name.isdecimal()
+    }
+
+
+def backup_residue(module: Any, target: Path) -> list[str]:
+    pool = module.backup_pool(target)
+    return hidden_residue_names(
+        pool,
+        (module.BACKUP_STAGE_PREFIX, module.BACKUP_RETIRED_PREFIX),
+    )
+
+
+def validate_backup_publication_transaction_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-backup-publish-smoke-") as tmp:
+        target = Path(tmp) / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        profile = "safe"
+        for _ in range(10):
+            module.mutate_setup(target, "nddev-builder", profile, "switch")
+            profile = "full-auto" if profile == "safe" else "safe"
+        before_slots = backup_slot_bytes(module, target)
+        real_write_exclusive = module.write_exclusive_file
+
+        def failing_backup_write(path: Path, content: bytes) -> None:
+            if Path(path).name == module.BACKUP_NAME:
+                raise OSError("injected backup envelope write fault")
+            real_write_exclusive(path, content)
+
+        with with_restored_attr(module, "write_exclusive_file", failing_backup_write):
+            try:
+                module.mutate_setup(target, "nddev-builder", profile, "switch")
+            except (module.CursorSetupError, OSError):
+                pass
+            else:
+                errors.append("backup publication smoke did not inject envelope failure")
+        if backup_slot_bytes(module, target) != before_slots:
+            errors.append("backup envelope failure changed published backup slots")
+        residue = backup_residue(module, target)
+        if residue:
+            errors.append(f"backup envelope failure left staging residue: {residue}")
+
+        real_replace = module.os.replace
+        calls = {"count": 0}
+
+        def flaky_replace(source: Any, destination: Any) -> None:
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("injected managed failure after backup publish")
+            real_replace(source, destination)
+
+        with with_restored_attr(module.os, "replace", flaky_replace):
+            try:
+                module.mutate_setup(target, "nddev-builder", profile, "switch")
+            except (module.CursorSetupError, OSError):
+                pass
+            else:
+                errors.append("backup rollback smoke did not inject lifecycle failure")
+        if backup_slot_bytes(module, target) != before_slots:
+            errors.append("lifecycle failure did not restore prior backup slots")
+        residue = backup_residue(module, target)
+        if residue:
+            errors.append(f"backup lifecycle rollback left staging residue: {residue}")
 
 
 def install_smoke_current_software(module: Any, target: Path) -> None:
@@ -1218,6 +1653,78 @@ def install_smoke_current_software(module: Any, target: Path) -> None:
     module.atomic_write(module.software_stamp_path(target), stamp)
 
 
+def validate_remove_cli_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-remove-cli-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        auth = target / module.ISOLATED_HOME_ROOT / "auth.json"
+        auth.parent.mkdir(mode=module.OWNER_DIRECTORY_MODE, parents=True, exist_ok=True)
+        auth.write_text("auth\n", encoding="utf-8")
+        unrelated = target / "unrelated.txt"
+        unrelated.write_text("preserve\n", encoding="utf-8")
+        bin_keep = target / "bin" / "keep"
+        bin_keep.parent.mkdir(mode=module.OWNER_DIRECTORY_MODE, exist_ok=True)
+        bin_keep.write_text("preserve\n", encoding="utf-8")
+        install_smoke_current_software(module, target)
+        launch_root = module.launch_images_root(target)
+        module.ensure_real_directory_path(launch_root, "smoke launch images root")
+        image_file = launch_root / "image"
+        image_file.write_text("ephemeral\n", encoding="utf-8")
+        image_file.chmod(module.OWNER_FILE_MODE)
+        removed = module.remove_cursor_cli(target)
+        if removed.get("command") != "remove-cli" or removed.get("operation") != "remove":
+            errors.append(f"remove-cli smoke returned unexpected payload: {removed}")
+        for path, label in (
+            (module.managed_agent_path(target), "bin/agent"),
+            (module.software_stamp_path(target), "software stamp"),
+            (module.software_transaction_path(target), "software transaction marker"),
+            (module.software_version_dir(target), "version runtime"),
+            (module.launch_images_root(target), "launch images"),
+        ):
+            if path.exists() or path.is_symlink():
+                errors.append(f"remove-cli smoke left {label}")
+        if (
+            not (target / module.CONFIG_NAME).is_file()
+            or not (target / module.STAMP_NAME).is_file()
+        ):
+            errors.append("remove-cli smoke removed setup state")
+        for preserved in (auth, unrelated, bin_keep):
+            if not preserved.is_file():
+                errors.append(f"remove-cli smoke removed unrelated state: {preserved.name}")
+        status = module.software_status(target)
+        if status["installed"] or status["current"] or status["present"]:
+            errors.append(f"remove-cli smoke left software present: {status}")
+        residue = hidden_residue_names(
+            module.software_root(target), (module.SOFTWARE_REMOVE_ROLLBACK_PREFIX,)
+        )
+        if residue:
+            errors.append(f"remove-cli smoke left rollback residue: {residue}")
+
+        absent_target = root / "absent-target"
+        absent = module.remove_cursor_cli(absent_target)
+        if absent.get("operation") != "absent" or absent_target.exists():
+            errors.append("remove-cli smoke absent operation was not a no-op")
+
+        partial = root / "partial-target"
+        partial.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+        partial.chmod(module.OWNER_DIRECTORY_MODE)
+        partial_keep = partial / "bin" / "keep"
+        partial_agent = partial / "bin" / "agent"
+        partial_keep.parent.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+        partial_keep.write_text("preserve\n", encoding="utf-8")
+        partial_agent.write_text("partial\n", encoding="utf-8")
+        partial_agent.chmod(module.OWNER_EXEC_MODE)
+        partial_removed = module.remove_cursor_cli(partial)
+        if partial_removed.get("operation") != "remove":
+            errors.append("remove-cli smoke did not remove partial software")
+        if partial_agent.exists() or not partial_keep.is_file():
+            errors.append("remove-cli smoke did not preserve partial target sibling")
+        partial_status = module.software_status(partial)
+        if partial_status["present"] or partial_status["current"]:
+            errors.append(f"remove-cli smoke partial target still present: {partial_status}")
+
+
 def validate_target_mode_smokes(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-target-mode-smoke-") as tmp:
         root = Path(tmp)
@@ -1238,7 +1745,10 @@ def validate_target_mode_smokes(module: Any, errors: list[str]) -> None:
                         target, "nddev-builder", "full-auto", "install"
                     ),
                 ),
-                ("migrate", lambda target=target: module.migrate_setup(target, "nddev-builder", None)),
+                (
+                    "migrate",
+                    lambda target=target: module.migrate_setup(target, "nddev-builder", None),
+                ),
                 ("restore", lambda target=target: module.restore_slot(target, 0)),
                 ("remove", lambda target=target: module.remove_setup(target)),
                 ("launch", lambda target=target: module.launch_cursor(target, ["--help"])),
@@ -1315,9 +1825,7 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
             lock_root_mode = stat.S_IMODE(lock_root.lstat().st_mode)
             if lock_root_mode != module.LOCK_HELD_DIRECTORY_MODE:
                 errors.append(f"launch smoke lock directory was writable: {oct(lock_root_mode)}")
-            assert_deferred_action_denied(
-                deferred_switch, errors, "launch lock smoke", "switch"
-            )
+            assert_deferred_action_denied(deferred_switch, errors, "launch lock smoke", "switch")
             config = module.load_target_config(target)
             assert config is not None
             config["approvalMode"] = "allowlist"
@@ -1475,9 +1983,7 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
             image_running = executable.parent / ".running" / "stub-image-state"
             image_running.write_text("image write\n", encoding="utf-8")
             writes["image"] = image_running
-            expect_permission_denied(
-                lambda: lock.unlink(), errors, "launch protection lock unlink"
-            )
+            expect_permission_denied(lambda: lock.unlink(), errors, "launch protection lock unlink")
 
             replacement = target / "replacement-agent"
             replacement.write_bytes(b"replacement\n")
@@ -1649,9 +2155,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
         holder_a = start_bootstrap_lock_holder(
             module, target, ready_a, release_a, result_a, error_a
         )
-        if not wait_for_holder_ready(
-            holder_a, ready_a, error_a, errors, "bootstrap handover A"
-        ):
+        if not wait_for_holder_ready(holder_a, ready_a, error_a, errors, "bootstrap handover A"):
             return
         first = read_result(result_a)
         lock_path = Path(first["path"])
@@ -1669,18 +2173,14 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
         if not lock_path.name.startswith(f"{module.PRODUCT_NAME}-"):
             errors.append("bootstrap handover lock filename lacks product namespace")
         expected_digest = module.sha256_bytes(
-            module.PRODUCT_NAME.encode("utf-8")
-            + b"\0"
-            + first["canonical"].encode("utf-8")
+            module.PRODUCT_NAME.encode("utf-8") + b"\0" + first["canonical"].encode("utf-8")
         )
         if first["digest"] != expected_digest:
             errors.append("bootstrap handover digest did not bind product and target")
         if lock_path.name != f"{module.PRODUCT_NAME}-{expected_digest}.lock":
             errors.append("bootstrap handover lock filename digest mismatch")
         release_a.write_text("release\n", encoding="utf-8")
-        if not wait_for_holder_exit(
-            holder_a, error_a, errors, "bootstrap handover A"
-        ):
+        if not wait_for_holder_exit(holder_a, error_a, errors, "bootstrap handover A"):
             return
 
         ready_b = root / "ready-b"
@@ -1690,9 +2190,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
         holder_b = start_bootstrap_lock_holder(
             module, target, ready_b, release_b, result_b, error_b
         )
-        if not wait_for_holder_ready(
-            holder_b, ready_b, error_b, errors, "bootstrap handover B"
-        ):
+        if not wait_for_holder_ready(holder_b, ready_b, error_b, errors, "bootstrap handover B"):
             return
         second = read_result(result_b)
         if (first["device"], first["inode"]) != (second["device"], second["inode"]):
@@ -1704,9 +2202,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
             "status",
         )
         release_b.write_text("release\n", encoding="utf-8")
-        if not wait_for_holder_exit(
-            holder_b, error_b, errors, "bootstrap handover B"
-        ):
+        if not wait_for_holder_exit(holder_b, error_b, errors, "bootstrap handover B"):
             return
         result = run_concurrent_status(module, target)
         if result.returncode != 0:
@@ -1735,9 +2231,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
         result = run_concurrent_status(module, target)
         if result.returncode == 0:
             errors.append("bootstrap handover accepted mismatched persistent binding")
-        elif "bootstrap lock target binding mismatch" not in (
-            f"{result.stdout}\n{result.stderr}"
-        ):
+        elif "bootstrap lock target binding mismatch" not in (f"{result.stdout}\n{result.stderr}"):
             errors.append(
                 "bootstrap handover binding mismatch failed with unexpected output: "
                 f"stdout={result.stdout} stderr={result.stderr}"
@@ -1884,6 +2378,103 @@ def validate_target_local_parent_symlink_smokes(module: Any, errors: list[str]) 
             errors.append("runtime TMP symlink smoke chmodded the external directory")
 
 
+def validate_unsupported_host_preflight_no_touch_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-host-preflight-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        bootstrap_root = root / "system-tmp"
+        bootstrap_root.mkdir(mode=0o700)
+        bootstrap_root.chmod(0o1777)
+        calls: list[str] = []
+
+        def unsupported_uname() -> Any:
+            class Uname:
+                machine = "x86_64"
+
+            return Uname()
+
+        def forbidden(name: str) -> Any:
+            def fail_forbidden(*args: Any, **kwargs: Any) -> Any:
+                del args, kwargs
+                calls.append(name)
+                raise AssertionError(f"{name} must not run on unsupported hosts")
+
+            return fail_forbidden
+
+        actions: tuple[tuple[str, Any], ...] = (
+            ("install-cli", lambda: module.install_cursor_cli(target, "install-cli")),
+            ("update-cli", lambda: module.install_cursor_cli(target, "update-cli")),
+            ("remove-cli", lambda: module.remove_cursor_cli(target)),
+            ("launch", lambda: module.launch_cursor(target, ["--help"])),
+        )
+        with (
+            with_restored_attr(module, "bootstrap_lock_system_root", lambda: bootstrap_root),
+            with_restored_attr(module.sys, "platform", "linux"),
+            with_restored_attr(module.os, "uname", unsupported_uname),
+            with_restored_attr(module, "read_linux_os_release", lambda: {"ID": "debian"}),
+            with_restored_attr(module, "detect_linux_libc", lambda: "glibc"),
+            with_restored_attr(module, "read_artifact", forbidden("network")),
+            with_restored_attr(module, "prepare_cursor_artifact", forbidden("stage")),
+            with_restored_attr(module, "target_lock", forbidden("target lock")),
+            with_restored_attr(module, "run_cursor_child", forbidden("child")),
+        ):
+            for name, action in actions:
+                try:
+                    action()
+                except module.CursorSetupError as exc:
+                    if "unsupported Cursor CLI Linux distribution" not in str(exc):
+                        errors.append(
+                            f"{name} unsupported host failed with unexpected error: {exc}"
+                        )
+                except AssertionError as exc:
+                    errors.append(f"{name} touched forbidden path before host preflight: {exc}")
+                else:
+                    errors.append(f"{name} accepted unsupported host")
+        product_roots = list(bootstrap_root.iterdir()) if bootstrap_root.exists() else []
+        if product_roots:
+            errors.append(f"unsupported host preflight touched bootstrap root: {product_roots}")
+        if target.exists() or target.is_symlink():
+            errors.append("unsupported host preflight touched target")
+        if calls:
+            errors.append(f"unsupported host preflight touched forbidden operations: {calls}")
+
+
+def validate_parser_json_error_smoke(errors: list[str]) -> None:
+    help_completed = subprocess.run(
+        [sys.executable, str(ROOT / "cli-tools" / "nddev_cursor_cli.py"), "--help"],
+        cwd=ROOT,
+        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True,
+        capture_output=True,
+        check=False,
+        close_fds=True,
+        timeout=10,
+    )
+    if help_completed.returncode != 0 or "remove-cli" not in help_completed.stdout:
+        errors.append("parser help smoke did not expose remove-cli")
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "cli-tools" / "nddev_cursor_cli.py"), "status", "--json"],
+        cwd=ROOT,
+        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True,
+        capture_output=True,
+        check=False,
+        close_fds=True,
+        timeout=10,
+    )
+    if completed.returncode != 2:
+        errors.append(f"JSON parser smoke returned {completed.returncode}, expected 2")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        errors.append(f"JSON parser smoke stdout was not JSON: {exc}; {completed.stdout!r}")
+        return
+    if payload.get("schema_version") != 1 or "--target" not in str(payload.get("error", "")):
+        errors.append(f"JSON parser smoke error payload mismatch: {payload}")
+    if completed.stderr.strip():
+        errors.append(f"JSON parser smoke emitted stderr usage: {completed.stderr!r}")
+
+
 def validate_public_manager_smokes(errors: list[str]) -> None:
     module = load_manager(errors)
     if module is None:
@@ -1917,6 +2508,30 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                     "backup rotation and binding",
                     lambda: validate_backup_rotation_and_binding_smoke(module, errors),
                 ),
+                (
+                    "backup digest rejection",
+                    lambda: validate_backup_digest_rejection_smoke(module, errors),
+                ),
+                (
+                    "managed transaction rollback fault",
+                    lambda: validate_managed_transaction_rollback_fault_smoke(module, errors),
+                ),
+                (
+                    "managed transaction stale expected",
+                    lambda: validate_managed_transaction_stale_expected_smoke(module, errors),
+                ),
+                (
+                    "software transaction rollback fault",
+                    lambda: validate_software_transaction_rollback_fault_smoke(module, errors),
+                ),
+                (
+                    "remove cli",
+                    lambda: validate_remove_cli_smoke(module, errors),
+                ),
+                (
+                    "backup publication transaction",
+                    lambda: validate_backup_publication_transaction_smoke(module, errors),
+                ),
                 ("target mode", lambda: validate_target_mode_smokes(module, errors)),
                 (
                     "initial target parent",
@@ -1932,9 +2547,7 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                 ),
                 (
                     "launch lock file and write protection",
-                    lambda: validate_launch_lock_file_and_write_protection_smoke(
-                        module, errors
-                    ),
+                    lambda: validate_launch_lock_file_and_write_protection_smoke(module, errors),
                 ),
                 (
                     "external bootstrap lock",
@@ -1950,13 +2563,19 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                 ),
                 (
                     "same-process bootstrap thread denial",
-                    lambda: validate_same_process_thread_bootstrap_denial_smoke(
-                        module, errors
-                    ),
+                    lambda: validate_same_process_thread_bootstrap_denial_smoke(module, errors),
                 ),
                 (
                     "target local parent symlink",
                     lambda: validate_target_local_parent_symlink_smokes(module, errors),
+                ),
+                (
+                    "unsupported host preflight no touch",
+                    lambda: validate_unsupported_host_preflight_no_touch_smoke(module, errors),
+                ),
+                (
+                    "parser JSON error",
+                    lambda: validate_parser_json_error_smoke(errors),
                 ),
             ]
             for name, action in smokes:
@@ -1964,8 +2583,7 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
     production_bootstrap_after = real_bootstrap_artifact_snapshot(module, errors)
     if production_bootstrap_after != production_bootstrap_before:
         errors.append(
-            "public manager smokes created or changed production system bootstrap "
-            "artifacts"
+            "public manager smokes created or changed production system bootstrap artifacts"
         )
 
 
@@ -2071,9 +2689,7 @@ def main() -> int:
         if version.get("setup_contract_schema") != 2:
             errors.append("build/version.json: setup_contract_schema must be 2")
         if version.get("nddev_builder_plugin_version") != build_version:
-            errors.append(
-                "build/version.json: nddev_builder_plugin_version must match VERSION"
-            )
+            errors.append("build/version.json: nddev_builder_plugin_version must match VERSION")
 
     if manifest is not None and version is not None:
         if manifest.get("schema_version") != 3:
@@ -2102,6 +2718,22 @@ def main() -> int:
             errors.append("build/manifest.json: backup control root mismatch")
         if backup.get("location") != ".nddev-cursor-cli/backups":
             errors.append("build/manifest.json: backup location mismatch")
+        if backup.get("envelope_schema") != 3:
+            errors.append("build/manifest.json: backup envelope schema mismatch")
+        if (
+            backup.get("file_record_schema")
+            != "payload plus sha256 over canonical declared path and payload bytes"
+        ):
+            errors.append("build/manifest.json: backup file record schema mismatch")
+        if backup.get("restore_digest_required") is not True:
+            errors.append("build/manifest.json: backup restore digest requirement mismatch")
+        if backup.get("digest_capability") != "corruption-and-incoherent-tamper-detection":
+            errors.append("build/manifest.json: backup digest capability mismatch")
+        if backup.get("digest_authenticates_same_uid_payloads") is not False:
+            errors.append("build/manifest.json: backup digest must not claim authenticity")
+        validate_runtime_compatibility(
+            "build/manifest.json", manifest.get("runtime_compatibility", {}), errors
+        )
         validate_launch_contract("build/manifest.json", manifest.get("runtime_launch", {}), errors)
         validate_software("build/manifest.json", manifest.get("software_install", {}), errors)
         transaction = manifest.get("transaction_policy", {})
@@ -2145,15 +2777,52 @@ def main() -> int:
         if transaction.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
             errors.append("build/manifest.json: mutable runtime TMPDIR mismatch")
         if (
+            transaction.get("managed_transaction_journal")
+            != ".nddev-cursor-cli/.managed-txn-<unique>"
+        ):
+            errors.append("build/manifest.json: managed transaction journal mismatch")
+        if transaction.get("managed_transaction_residue_on_failure") is not False:
+            errors.append("build/manifest.json: managed transaction residue policy mismatch")
+        if (
             transaction.get("target_local_directory_parents")
             != "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed"
         ):
             errors.append("build/manifest.json: target-local parent policy mismatch")
         if "preserve_existing_target_mode" in transaction:
             errors.append("build/manifest.json: must not preserve arbitrary target mode")
-        commands = manifest.get("command_policy", {}).get("json_supported", [])
-        if "migrate" not in commands:
-            errors.append("build/manifest.json: command_policy must include migrate")
+        command_policy = manifest.get("command_policy", {})
+        expected_json_commands = [
+            "list",
+            "status",
+            "plan",
+            "install",
+            "switch",
+            "migrate",
+            "restore",
+            "remove",
+            "software-status",
+            "install-cli",
+            "update-cli",
+            "remove-cli",
+        ]
+        expected_target_commands = [
+            "status",
+            "plan",
+            "install",
+            "switch",
+            "migrate",
+            "restore",
+            "remove",
+            "software-status",
+            "install-cli",
+            "update-cli",
+            "remove-cli",
+            "launch",
+        ]
+        if command_policy.get("json_supported") != expected_json_commands:
+            errors.append("build/manifest.json: command_policy JSON commands mismatch")
+        if command_policy.get("target_required") != expected_target_commands:
+            errors.append("build/manifest.json: command_policy target commands mismatch")
 
     if contract is not None:
         if contract.get("contract_version") != 3:
@@ -2172,6 +2841,9 @@ def main() -> int:
             errors.append("config/nddev-contract.json: content_setup_ids mismatch")
         if setup_system.get("profile_ids") != PROFILE_IDS:
             errors.append("config/nddev-contract.json: profile_ids mismatch")
+        validate_runtime_compatibility(
+            "config/nddev-contract.json", contract.get("runtime_compatibility", {}), errors
+        )
         safety = contract.get("safety", {})
         if safety.get("new_target_mode") != "0700":
             errors.append("config/nddev-contract.json: new target mode mismatch")
@@ -2187,6 +2859,8 @@ def main() -> int:
             errors.append("config/nddev-contract.json: lock parent mismatch")
         if safety.get("lock_path") != ".nddev-cursor-cli/locks/target.lock":
             errors.append("config/nddev-contract.json: lock path mismatch")
+        if safety.get("explicit_target_required") != expected_target_commands:
+            errors.append("config/nddev-contract.json: explicit target commands mismatch")
         if safety.get("lock_type") != "persistent flock file":
             errors.append("config/nddev-contract.json: lock type mismatch")
         if safety.get("lock_file_mode") != "0600":
@@ -2209,6 +2883,19 @@ def main() -> int:
             errors.append("config/nddev-contract.json: bootstrap lock binding mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
             errors.append("config/nddev-contract.json: backup path mismatch")
+        if safety.get("backup_envelope_schema") != 3:
+            errors.append("config/nddev-contract.json: backup envelope schema mismatch")
+        if (
+            safety.get("backup_file_record_schema")
+            != "payload plus sha256 over canonical declared path and payload bytes"
+        ):
+            errors.append("config/nddev-contract.json: backup file record schema mismatch")
+        if safety.get("backup_restore_digest_required") is not True:
+            errors.append("config/nddev-contract.json: backup restore digest requirement mismatch")
+        if safety.get("backup_digest_capability") != "corruption-and-incoherent-tamper-detection":
+            errors.append("config/nddev-contract.json: backup digest capability mismatch")
+        if safety.get("backup_digest_authenticates_same_uid_payloads") is not False:
+            errors.append("config/nddev-contract.json: backup digest must not claim authenticity")
         if safety.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
             errors.append("config/nddev-contract.json: mutable runtime TMPDIR mismatch")
         if (
@@ -2218,7 +2905,9 @@ def main() -> int:
             errors.append("config/nddev-contract.json: target-local parent policy mismatch")
         if "preserve_existing_target_mode" in safety:
             errors.append("config/nddev-contract.json: must not preserve arbitrary target mode")
-        validate_launch_contract("config/nddev-contract.json", contract.get("runtime_launch", {}), errors)
+        validate_launch_contract(
+            "config/nddev-contract.json", contract.get("runtime_launch", {}), errors
+        )
         software = contract.get("software_install")
         if not isinstance(software, dict):
             errors.append("config/nddev-contract.json: missing software_install")
@@ -2242,10 +2931,21 @@ def main() -> int:
                 errors.append("config/nddev-contract.json: software_lifecycle stamp mismatch")
             if lifecycle.get("entrypoint") != "bin/agent":
                 errors.append("config/nddev-contract.json: software_lifecycle entrypoint mismatch")
+            if "remove-cli" not in str(lifecycle.get("remove_command", "")):
+                errors.append(
+                    "config/nddev-contract.json: software_lifecycle remove command mismatch"
+                )
             if lifecycle.get("status_executes_binary") is not False:
                 errors.append("config/nddev-contract.json: software_status must not execute")
             if lifecycle.get("target_owned") is not True:
                 errors.append("config/nddev-contract.json: software_lifecycle must be target-owned")
+            if lifecycle.get("transaction_marker") != "NDDEV-CURSOR-CLI-TRANSACTION.json":
+                errors.append("config/nddev-contract.json: software transaction marker mismatch")
+            if (
+                lifecycle.get("failure_current_behavior")
+                != "exact rollback or transaction marker forces current=false"
+            ):
+                errors.append("config/nddev-contract.json: software failure behavior mismatch")
         projection = contract.get("builder_projection", {})
         install = projection.get("installation", {})
         if install.get("native_local_plugin_path") != BUILDER_TARGET_PATH:
@@ -2264,6 +2964,24 @@ def main() -> int:
             errors.append("references/cursor-cli-baseline.json: verified_date mismatch")
         if baseline.get("release", {}).get("artifacts") != EXPECTED_ARTIFACTS:
             errors.append("references/cursor-cli-baseline.json: artifact pins mismatch")
+        if baseline.get("host_platform_scope") != BASELINE_PLATFORM_SCOPE:
+            errors.append("references/cursor-cli-baseline.json: host platform scope mismatch")
+        if baseline.get("observed_vendor_assets") != OBSERVED_VENDOR_ASSETS:
+            errors.append("references/cursor-cli-baseline.json: observed vendor assets mismatch")
+        observed_assets = (
+            baseline.get("observed_vendor_assets", {})
+            .get("unsupported_windows", {})
+            .get("assets", {})
+        )
+        for asset_path in observed_assets:
+            if asset_path in baseline.get("release", {}).get("artifacts", {}):
+                errors.append("references/cursor-cli-baseline.json: Windows asset is supported")
+            if asset_path in str(
+                baseline.get("host_platform_scope", {}).get("vendor_asset_mapping", {})
+            ):
+                errors.append(
+                    "references/cursor-cli-baseline.json: Windows asset leaked into mapping"
+                )
         if baseline.get("cli_identity", {}).get("command") != "agent":
             errors.append("references/cursor-cli-baseline.json: CLI command must be agent")
         if baseline.get("configuration", {}).get("environment_override") != "CURSOR_CONFIG_DIR":
@@ -2274,7 +2992,9 @@ def main() -> int:
         if install.get("managed_command") != "bin/agent":
             errors.append("references/cursor-cli-baseline.json: managed_command mismatch")
         if install.get("npm") is not None or install.get("pip") is not None:
-            errors.append("references/cursor-cli-baseline.json: software_install must not use npm/pip")
+            errors.append(
+                "references/cursor-cli-baseline.json: software_install must not use npm/pip"
+            )
 
     validate_profiles(errors)
     validate_builder_toolkit(version, build_version, errors)

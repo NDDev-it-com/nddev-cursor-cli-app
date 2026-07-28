@@ -8,9 +8,11 @@ import base64
 import contextlib
 import errno
 import fcntl
+import glob
 import hashlib
 import json
 import os
+import platform as py_platform
 import re
 import secrets
 import shutil
@@ -37,10 +39,15 @@ CONFIG_NAME = "cli-config.json"
 STAMP_NAME = "NDDEV-CURSOR-CLI-SETUP.json"
 BACKUP_NAME = "NDDEV-CURSOR-CLI-BACKUP.json"
 SOFTWARE_STAMP_NAME = "NDDEV-CURSOR-CLI-SOFTWARE.json"
+SOFTWARE_TRANSACTION_NAME = "NDDEV-CURSOR-CLI-TRANSACTION.json"
+SOFTWARE_REMOVE_ROLLBACK_PREFIX = ".remove-rollback-"
 CONTROL_ROOT_NAME = ".nddev-cursor-cli"
 CONTROL_LOCKS_NAME = "locks"
 CONTROL_LOCK_NAME = "target.lock"
 CONTROL_BACKUPS_NAME = "backups"
+MANAGED_TRANSACTION_PREFIX = ".managed-txn-"
+BACKUP_STAGE_PREFIX = ".slot-stage-"
+BACKUP_RETIRED_PREFIX = ".slot-retired-"
 BOOTSTRAP_LOCK_ROOT_PREFIX = "nddev-cursor-cli-app-locks"
 BOOTSTRAP_LOCK_MAX_BYTES = 4096
 OWNER_FILE_MODE = 0o600
@@ -67,6 +74,15 @@ CURSOR_RUNTIME_REQUIRED_FILES = frozenset(
     {CURSOR_RUNTIME_ENTRYPOINT, Path("node"), Path("index.js")}
 )
 CURSOR_RUNTIME_EPHEMERAL_ROOTS = frozenset({Path(".running")})
+LINUX_OS_RELEASE_PATH = Path("/etc/os-release")
+SUPPORTED_LINUX_DISTRIBUTION_ID = "ubuntu"
+SUPPORTED_LINUX_LIBC = "glibc"
+MUSL_LOADER_GLOBS = (
+    "/lib/ld-musl-*.so.1",
+    "/usr/lib/ld-musl-*.so.1",
+    "/lib/*/ld-musl-*.so.1",
+    "/usr/lib/*/ld-musl-*.so.1",
+)
 CURSOR_OFFICIAL_ASSETS = {
     ("darwin", "arm64"): (
         "darwin/arm64/agent-cli-package.tar.gz",
@@ -88,6 +104,24 @@ CURSOR_OFFICIAL_ASSETS = {
         "702ad595213bee5df0268be9f80a19f29fcceaa2a42fc55e39f2b5199051f0c4",
         82521188,
     ),
+}
+SUPPORTED_HOST_IDS = (
+    "macos-arm64",
+    "macos-x64",
+    "ubuntu-glibc-arm64",
+    "ubuntu-glibc-x64",
+)
+UNSUPPORTED_HOST_CATEGORIES = (
+    "windows",
+    "non-ubuntu-linux",
+    "linux-musl",
+    "unsupported-architecture",
+)
+VENDOR_ASSET_HOST_MAP = {
+    "macos-arm64": ("darwin", "arm64"),
+    "macos-x64": ("darwin", "x64"),
+    "ubuntu-glibc-arm64": ("linux", "arm64"),
+    "ubuntu-glibc-x64": ("linux", "x64"),
 }
 PROVIDER_SECRET_NAMES = {
     "ANTHROPIC_API_KEY",
@@ -121,6 +155,7 @@ BLOCKED_LAUNCH_COMMANDS = {
     "update",
     "worker",
 }
+_PARSER_JSON_ERROR_REQUESTED = False
 SETUP_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 MANAGED_CONFIG_KEYS = (
     "version",
@@ -137,9 +172,7 @@ ISOLATED_HOME_ROOT = Path(".nddev-cursor-home")
 MUTABLE_RUNTIME_ROOT = Path(".nddev-cursor-runtime")
 MUTABLE_RUNTIME_TMP_ROOT = MUTABLE_RUNTIME_ROOT / "tmp"
 LEGACY_BUILDER_TARGET_ROOT = Path("plugins") / "local" / "nddev-builder"
-BUILDER_TARGET_ROOT = (
-    ISOLATED_HOME_ROOT / ".cursor" / "plugins" / "local" / "nddev-builder"
-)
+BUILDER_TARGET_ROOT = ISOLATED_HOME_ROOT / ".cursor" / "plugins" / "local" / "nddev-builder"
 BUILDER_ROOT_FILES = (Path("README.md"),)
 BUILDER_COMPONENT_ROOTS = (
     Path(".cursor-plugin"),
@@ -172,18 +205,8 @@ STAMP_KEYS_V2 = {
     "managed_files",
     "builder_projection",
 }
-BACKUP_KEYS_V1 = {
-    "schema_version",
-    "product_name",
-    "build_version",
-    "slot",
-    "canonical_target",
-    "source_setup_id",
-    "managed_files",
-    "created_at",
-    "files",
-}
-BACKUP_KEYS_V2 = {
+BACKUP_SCHEMA_VERSION = 3
+BACKUP_KEYS_V3 = {
     "schema_version",
     "product_name",
     "build_version",
@@ -196,6 +219,12 @@ BACKUP_KEYS_V2 = {
     "created_at",
     "files",
 }
+BACKUP_FILE_KEYS_V1 = {
+    "payload",
+    "sha256",
+}
+BACKUP_FILE_DIGEST_DOMAIN = b"nddev-cursor-cli-backup-file-v1\0"
+SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 BOOTSTRAP_LOCK_KEYS_V1 = {
     "schema_version",
     "product_name",
@@ -210,6 +239,10 @@ class CursorSetupError(Exception):
     """A safe, user-facing lifecycle failure."""
 
 
+class CursorArgumentError(Exception):
+    """A parser failure that can be rendered through the JSON error boundary."""
+
+
 def fail(message: str) -> NoReturn:
     raise CursorSetupError(message)
 
@@ -220,6 +253,21 @@ def canonical_json(value: Any) -> bytes:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_existing_parent(path: Path) -> None:
+    fsync_directory(path.parent)
 
 
 def require_exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
@@ -352,9 +400,7 @@ def validate_config(config: dict[str, Any], label: str) -> None:
         fail(f"{label} network.useHttp1ForAgent must be a boolean")
 
 
-def validate_profile_config(
-    profile: dict[str, Any], config: dict[str, Any], label: str
-) -> None:
+def validate_profile_config(profile: dict[str, Any], config: dict[str, Any], label: str) -> None:
     validate_config(config, label)
     expected = {
         "approvalMode": profile["approval_mode"],
@@ -389,9 +435,7 @@ def render_content_setup(content_setup_id: str) -> dict[str, Any]:
     setup_root = SETUP_CATALOG_ROOT / content_setup_id
     if not setup_root.is_dir() or setup_root.is_symlink():
         fail(f"unknown setup: {content_setup_id}")
-    metadata = load_json_object(
-        setup_root / "setup.json", f"setup {content_setup_id} metadata"
-    )
+    metadata = load_json_object(setup_root / "setup.json", f"setup {content_setup_id} metadata")
     require_exact_keys(
         metadata,
         {
@@ -444,9 +488,7 @@ def render_profile(profile_id: str) -> tuple[dict[str, Any], dict[str, bytes]]:
     if metadata["managed_files"] != [CONFIG_NAME]:
         fail(f"profile {profile_id} managed file declaration is invalid")
     validate_supported_selection(DEFAULT_CONTENT_SETUP_ID, profile_id)
-    config = load_json_object(
-        profile_root / CONFIG_NAME, f"profile {profile_id}/{CONFIG_NAME}"
-    )
+    config = load_json_object(profile_root / CONFIG_NAME, f"profile {profile_id}/{CONFIG_NAME}")
     validate_profile_config(metadata, config, f"profile {profile_id}/{CONFIG_NAME}")
     return metadata, {CONFIG_NAME: canonical_json(config)}
 
@@ -1290,9 +1332,7 @@ def control_state_findings(target: Path, *, require_persistent_lock: bool) -> li
     return findings
 
 
-def require_owner_directory_mode(
-    path: Path, label: str, allowed_modes: set[int]
-) -> os.stat_result:
+def require_owner_directory_mode(path: Path, label: str, allowed_modes: set[int]) -> os.stat_result:
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -1601,7 +1641,18 @@ def remove_backup_slot(slot_path: Path) -> None:
         envelope = entries[0]
         require_backup_envelope_file(envelope, f"backup slot {slot_path.name} envelope")
         envelope.unlink()
+        fsync_directory(slot_path)
     slot_path.rmdir()
+    fsync_directory(slot_path.parent)
+
+
+def require_exact_backup_slot(slot_path: Path, slot: int) -> Path:
+    require_owner_private_directory(slot_path, f"backup slot {slot}")
+    entries = sorted(slot_path.iterdir(), key=lambda path: path.name)
+    names = [path.name for path in entries]
+    if names != [BACKUP_NAME]:
+        fail(f"backup slot {slot} must contain exactly {BACKUP_NAME}")
+    return slot_path / BACKUP_NAME
 
 
 def choose_backup_slot(pool: Path) -> int:
@@ -1613,6 +1664,23 @@ def choose_backup_slot(pool: Path) -> int:
         require_owner_private_directory(slot_path, f"backup slot {slot}")
     oldest = min(range(10), key=lambda slot: (pool / str(slot)).lstat().st_mtime_ns)
     return oldest
+
+
+class BackupPublication:
+    def __init__(
+        self,
+        *,
+        target: Path,
+        slot: int,
+        pool: Path,
+        pool_existed: bool,
+        retired_slot: Path | None,
+    ) -> None:
+        self.target = target
+        self.slot = slot
+        self.pool = pool
+        self.pool_existed = pool_existed
+        self.retired_slot = retired_slot
 
 
 def capture_managed_files(target: Path) -> dict[str, bytes | None]:
@@ -1630,17 +1698,53 @@ def capture_managed_files(target: Path) -> dict[str, bytes | None]:
     return captured
 
 
-def write_backup(target: Path, source_state: dict[str, Any]) -> int:
+def backup_stage_path(pool: Path) -> Path:
+    stage = Path(tempfile.mkdtemp(prefix=f"{BACKUP_STAGE_PREFIX}{os.getpid()}-", dir=str(pool)))
+    stage.chmod(OWNER_DIRECTORY_MODE)
+    fsync_directory(pool)
+    return stage
+
+
+def backup_retired_path(pool: Path, slot: int) -> Path:
+    return pool / f"{BACKUP_RETIRED_PREFIX}{slot}-{os.getpid()}-{secrets.token_hex(8)}"
+
+
+def validate_backup_envelope(target: Path, slot: int, envelope: dict[str, Any], label: str) -> None:
+    schema_version = envelope.get("schema_version")
+    if schema_version != BACKUP_SCHEMA_VERSION:
+        fail("backup schema version must include per-file digests")
+    require_exact_keys(envelope, BACKUP_KEYS_V3, label)
+    if envelope["product_name"] != PRODUCT_NAME:
+        fail("backup is not owned by nddev-cursor-cli-app")
+    if envelope["canonical_target"] != str(target.resolve(strict=False)):
+        fail("backup belongs to a different canonical target")
+    if envelope["slot"] != slot:
+        fail("backup slot identity mismatch")
+    if envelope["managed_files"] != [CONFIG_NAME]:
+        fail("backup managed_files mismatch")
+
+
+def load_backup_from_path(target: Path, slot: int, path: Path, label: str) -> dict[str, Any]:
+    require_backup_envelope_file(path, label)
+    envelope = load_json_object(path, label)
+    validate_backup_envelope(target, slot, envelope, label)
+    return envelope
+
+
+def write_backup(target: Path, source_state: dict[str, Any]) -> BackupPublication:
     pool = backup_pool(target)
+    pool_existed = path_exists_no_follow(pool)
+    if pool_existed:
+        require_owner_private_directory(pool, "backup pool")
+    else:
+        ensure_backup_pool(pool)
     slot = choose_backup_slot(pool)
     slot_path = pool / str(slot)
-    if path_exists_no_follow(slot_path):
-        remove_backup_slot(slot_path)
-    slot_path.mkdir(mode=OWNER_DIRECTORY_MODE)
-    slot_path.chmod(OWNER_DIRECTORY_MODE)
+    stage = backup_stage_path(pool)
+    retired_slot: Path | None = None
     files = capture_managed_files(target)
     envelope = {
-        "schema_version": 2,
+        "schema_version": BACKUP_SCHEMA_VERSION,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "slot": slot,
@@ -1651,35 +1755,71 @@ def write_backup(target: Path, source_state: dict[str, Any]) -> int:
         "managed_files": [CONFIG_NAME],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "files": {
-            relative: None if content is None else base64.b64encode(content).decode("ascii")
-            for relative, content in files.items()
+            relative: backup_file_record(relative, content) for relative, content in files.items()
         },
     }
-    (slot_path / BACKUP_NAME).write_bytes(canonical_json(envelope))
-    (slot_path / BACKUP_NAME).chmod(OWNER_FILE_MODE)
-    return slot
+    envelope_path = stage / BACKUP_NAME
+    try:
+        write_exclusive_file(envelope_path, canonical_json(envelope))
+        fsync_directory(stage)
+        load_backup_from_path(target, slot, envelope_path, f"backup slot {slot} staged envelope")
+        if path_exists_no_follow(slot_path):
+            retired_slot = backup_retired_path(pool, slot)
+            os.rename(slot_path, retired_slot)
+            fsync_directory(pool)
+        os.rename(stage, slot_path)
+        fsync_directory(pool)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            shutil.rmtree(stage)
+            fsync_directory(pool)
+        if retired_slot is not None and (retired_slot.exists() or retired_slot.is_symlink()):
+            with contextlib.suppress(FileNotFoundError):
+                os.rename(retired_slot, slot_path)
+                fsync_directory(pool)
+        if not pool_existed:
+            with contextlib.suppress(OSError):
+                pool.rmdir()
+                fsync_directory(pool.parent)
+        raise
+    return BackupPublication(
+        target=target,
+        slot=slot,
+        pool=pool,
+        pool_existed=pool_existed,
+        retired_slot=retired_slot,
+    )
+
+
+def finish_backup_publication(publication: BackupPublication | None) -> None:
+    if publication is None or publication.retired_slot is None:
+        return
+    remove_backup_slot(publication.retired_slot)
+    publication.retired_slot = None
+
+
+def rollback_backup_publication(publication: BackupPublication | None) -> None:
+    if publication is None:
+        return
+    slot_path = publication.pool / str(publication.slot)
+    if slot_path.exists() or slot_path.is_symlink():
+        remove_backup_slot(slot_path)
+    if publication.retired_slot is not None and (
+        publication.retired_slot.exists() or publication.retired_slot.is_symlink()
+    ):
+        os.rename(publication.retired_slot, slot_path)
+        fsync_directory(publication.pool)
+        publication.retired_slot = None
+    if not publication.pool_existed:
+        with contextlib.suppress(OSError):
+            publication.pool.rmdir()
+            fsync_directory(publication.pool.parent)
 
 
 def load_backup(target: Path, slot: int) -> dict[str, Any]:
     slot_path = backup_pool(target) / str(slot)
-    require_owner_private_directory(slot_path, f"backup slot {slot}")
-    path = slot_path / BACKUP_NAME
-    require_backup_envelope_file(path, f"backup slot {slot} envelope")
-    envelope = load_json_object(path, f"backup slot {slot}")
-    schema_version = envelope.get("schema_version")
-    if schema_version == 1:
-        require_exact_keys(envelope, BACKUP_KEYS_V1, f"backup slot {slot}")
-    elif schema_version == 2:
-        require_exact_keys(envelope, BACKUP_KEYS_V2, f"backup slot {slot}")
-    else:
-        fail("backup is not owned by nddev-cursor-cli-app")
-    if envelope["product_name"] != PRODUCT_NAME:
-        fail("backup is not owned by nddev-cursor-cli-app")
-    if envelope["canonical_target"] != str(target.resolve(strict=False)):
-        fail("backup belongs to a different canonical target")
-    if envelope["slot"] != slot:
-        fail("backup slot identity mismatch")
-    return envelope
+    path = require_exact_backup_slot(slot_path, slot)
+    return load_backup_from_path(target, slot, path, f"backup slot {slot} envelope")
 
 
 def safe_relative(relative: str) -> Path:
@@ -1692,8 +1832,11 @@ def safe_relative(relative: str) -> Path:
 def remove_empty_parents(target: Path, path: Path) -> None:
     parent = path.parent
     while parent != target and parent.is_relative_to(target):
-        with contextlib.suppress(OSError):
+        try:
             parent.rmdir()
+            fsync_directory(parent.parent)
+        except OSError:
+            pass
         parent = parent.parent
 
 
@@ -1716,15 +1859,16 @@ def ensure_real_directory(root: Path, relative: Path) -> None:
             continue
         current.mkdir(mode=OWNER_DIRECTORY_MODE)
         current.chmod(OWNER_DIRECTORY_MODE)
+        fsync_directory(current.parent)
 
 
-def write_exclusive_file(path: Path, content: bytes) -> None:
+def write_exclusive_file_with_mode(path: Path, content: bytes, mode: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, OWNER_FILE_MODE)
+    descriptor = os.open(path, flags, mode)
     try:
         view = memoryview(content)
         while view:
@@ -1732,9 +1876,151 @@ def write_exclusive_file(path: Path, content: bytes) -> None:
             if written == 0:
                 fail(f"managed write made no progress: {path}")
             view = view[written:]
-        os.fchmod(descriptor, OWNER_FILE_MODE)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def write_exclusive_file(path: Path, content: bytes) -> None:
+    write_exclusive_file_with_mode(path, content, OWNER_FILE_MODE)
+
+
+def snapshot_managed_path(target: Path, relative: Path) -> tuple[bytes | None, int | None]:
+    destination = target / relative
+    if not destination.exists() and not destination.is_symlink():
+        return None, None
+    content = read_regular_file(
+        destination,
+        f"managed path {relative.as_posix()}",
+        max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+    )
+    info = require_regular_file(
+        destination,
+        f"managed path {relative.as_posix()}",
+        max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+    )
+    return content, stat.S_IMODE(info.st_mode)
+
+
+def managed_path_matches(
+    target: Path, relative: Path, content: bytes | None, mode: int | None
+) -> bool:
+    destination = target / relative
+    if content is None:
+        return not (destination.exists() or destination.is_symlink())
+    if not (destination.exists() or destination.is_symlink()):
+        return False
+    try:
+        current = read_regular_file(
+            destination,
+            f"managed path {relative.as_posix()}",
+            max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        )
+        info = require_regular_file(
+            destination,
+            f"managed path {relative.as_posix()}",
+            max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        )
+    except CursorSetupError:
+        return False
+    return current == content and stat.S_IMODE(info.st_mode) == (mode or OWNER_FILE_MODE)
+
+
+def managed_transaction_path(target: Path) -> Path:
+    root = ensure_control_root(target)
+    transaction = Path(
+        tempfile.mkdtemp(prefix=f"{MANAGED_TRANSACTION_PREFIX}{os.getpid()}-", dir=str(root))
+    )
+    transaction.chmod(OWNER_DIRECTORY_MODE)
+    fsync_directory(root)
+    return transaction
+
+
+def cleanup_managed_transaction(transaction: Path) -> None:
+    if transaction.exists() or transaction.is_symlink():
+        shutil.rmtree(transaction)
+        fsync_directory(transaction.parent)
+
+
+def write_managed_destination(
+    target: Path, relative: Path, content: bytes | None, mode: int | None
+) -> None:
+    destination = target / relative
+    if content is None:
+        if destination.exists() or destination.is_symlink():
+            require_regular_file(
+                destination,
+                f"managed path {relative.as_posix()}",
+                max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+            )
+            destination.unlink()
+            fsync_existing_parent(destination)
+            remove_empty_parents(target, destination)
+        return
+    ensure_real_directory(target, relative.parent)
+    if destination.exists() or destination.is_symlink():
+        require_regular_file(
+            destination,
+            f"managed path {relative.as_posix()}",
+            max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+        )
+    temporary = destination.with_name(
+        f".{destination.name}.nddev-tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    try:
+        write_exclusive_file_with_mode(temporary, content, mode or OWNER_FILE_MODE)
+        fsync_existing_parent(temporary)
+        os.replace(temporary, destination)
+        fsync_existing_parent(destination)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def restore_managed_records(
+    target: Path, records: list[dict[str, Any]], state: str, *, attempts: int = 4
+) -> None:
+    errors: list[str] = []
+    for _ in range(attempts):
+        for record in records:
+            relative = record["relative"]
+            content = record[f"{state}_content"]
+            mode = record[f"{state}_mode"]
+            if managed_path_matches(target, relative, content, mode):
+                continue
+            try:
+                write_managed_destination(target, relative, content, mode)
+            except BaseException as exc:  # noqa: BLE001 - keep restoring every path.
+                errors.append(f"{relative.as_posix()}: {exc}")
+        if all(
+            managed_path_matches(
+                target, record["relative"], record[f"{state}_content"], record[f"{state}_mode"]
+            )
+            for record in records
+        ):
+            return
+    fail(f"managed transaction {state} verification failed: {errors[-5:]}")
+
+
+def validate_expected_managed_state(
+    target: Path, selected: tuple[str, ...], expected: Any | None
+) -> None:
+    if expected is None:
+        return
+    if not isinstance(expected, dict):
+        fail("managed transaction expected pre-state must be an object")
+    for relative_name in selected:
+        relative = safe_relative(relative_name)
+        key = relative.as_posix()
+        if key not in expected:
+            fail(f"managed transaction expected pre-state is missing {key}")
+        content = expected[key]
+        if content is not None and not isinstance(content, bytes):
+            fail(f"managed transaction expected pre-state for {key} must be bytes or absent")
+        mode = None if content is None else OWNER_FILE_MODE
+        if not managed_path_matches(target, relative, content, mode):
+            fail(f"managed transaction pre-state changed before write: {key}")
 
 
 def replace_managed_state(
@@ -1744,39 +2030,108 @@ def replace_managed_state(
     *,
     names: tuple[str, ...] | None = None,
 ) -> None:
-    del expected
     selected = tuple(desired) if names is None else names
-    for relative_name in selected:
-        relative = safe_relative(relative_name)
-        destination = target / relative
-        content = desired.get(relative_name)
-        if content is None:
-            if destination.exists() or destination.is_symlink():
-                require_regular_file(
-                    destination,
-                    f"managed path {relative.as_posix()}",
-                    max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+    validate_expected_managed_state(target, selected, expected)
+    transaction = managed_transaction_path(target)
+    records: list[dict[str, Any]] = []
+    try:
+        for index, relative_name in enumerate(selected):
+            relative = safe_relative(relative_name)
+            before_content, before_mode = snapshot_managed_path(target, relative)
+            desired_content = desired.get(relative_name)
+            record = {
+                "relative": relative,
+                "before_content": before_content,
+                "before_mode": before_mode,
+                "desired_content": desired_content,
+                "desired_mode": None if desired_content is None else OWNER_FILE_MODE,
+            }
+            records.append(record)
+            if before_content is not None:
+                write_exclusive_file_with_mode(
+                    transaction / f"{index}.before", before_content, OWNER_FILE_MODE
                 )
-                destination.unlink()
-                remove_empty_parents(target, destination)
-            continue
-        ensure_real_directory(target, relative.parent)
-        if destination.exists() or destination.is_symlink():
-            require_regular_file(
-                destination,
-                f"managed path {relative.as_posix()}",
-                max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+            if desired_content is not None:
+                write_exclusive_file_with_mode(
+                    transaction / f"{index}.desired", desired_content, OWNER_FILE_MODE
+                )
+        journal = [
+            {
+                "path": record["relative"].as_posix(),
+                "before_sha256": None
+                if record["before_content"] is None
+                else sha256_bytes(record["before_content"]),
+                "desired_sha256": None
+                if record["desired_content"] is None
+                else sha256_bytes(record["desired_content"]),
+            }
+            for record in records
+        ]
+        write_exclusive_file(transaction / "journal.json", canonical_json(journal))
+        fsync_directory(transaction)
+        restore_managed_records(target, records, "desired", attempts=1)
+        if not all(
+            managed_path_matches(
+                target, record["relative"], record["desired_content"], record["desired_mode"]
             )
-        temporary = destination.with_name(
-            f".{destination.name}.nddev-tmp-{os.getpid()}-{secrets.token_hex(8)}"
-        )
-        try:
-            write_exclusive_file(temporary, content)
-            os.replace(temporary, destination)
-            destination.chmod(OWNER_FILE_MODE)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                temporary.unlink()
+            for record in records
+        ):
+            fail("managed transaction desired verification failed")
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            restore_managed_records(target, records, "before")
+        if not all(
+            managed_path_matches(
+                target, record["relative"], record["before_content"], record["before_mode"]
+            )
+            for record in records
+        ):
+            with contextlib.suppress(BaseException):
+                cleanup_managed_transaction(transaction)
+            fail("managed transaction rollback verification failed")
+        cleanup_managed_transaction(transaction)
+        raise
+    cleanup_managed_transaction(transaction)
+
+
+def backup_file_digest(relative: str, content: bytes | None) -> str:
+    digest = hashlib.sha256()
+    digest.update(BACKUP_FILE_DIGEST_DOMAIN)
+    digest.update(relative.encode("utf-8"))
+    digest.update(b"\0")
+    if content is None:
+        digest.update(b"absent\0")
+    else:
+        digest.update(b"present\0")
+        digest.update(str(len(content)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def backup_file_record(relative: str, content: bytes | None) -> dict[str, str | None]:
+    return {
+        "payload": None if content is None else base64.b64encode(content).decode("ascii"),
+        "sha256": backup_file_digest(relative, content),
+    }
+
+
+def changed_paths_for_desired(target: Path, desired: dict[str, bytes | None]) -> list[str]:
+    before = capture_managed_files(target)
+    return [relative for relative, content in desired.items() if before.get(relative) != content]
+
+
+PLAN_LOCK_BOOTSTRAP_FINDINGS = frozenset(
+    {
+        CONTROL_ROOT_NAME + ":missing",
+        f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}:missing",
+        f"{CONTROL_ROOT_NAME}/{CONTROL_LOCKS_NAME}/{CONTROL_LOCK_NAME}:missing",
+    }
+)
+
+
+def plan_blocking_drift(drift: list[str]) -> list[str]:
+    return [finding for finding in drift if finding not in PLAN_LOCK_BOOTSTRAP_FINDINGS]
 
 
 def desired_for_selection(
@@ -1786,9 +2141,7 @@ def desired_for_selection(
     existing_config: dict[str, Any] | None,
 ) -> dict[str, bytes | None]:
     _, _, rendered = render_selection(content_setup_id, profile_id)
-    setup_config = parse_json_object(
-        rendered[CONFIG_NAME], f"profile {profile_id}/{CONFIG_NAME}"
-    )
+    setup_config = parse_json_object(rendered[CONFIG_NAME], f"profile {profile_id}/{CONFIG_NAME}")
     desired_config = merge_config(existing_config, setup_config)
     desired: dict[str, bytes | None] = {
         CONFIG_NAME: canonical_json(desired_config),
@@ -1815,18 +2168,39 @@ def restore_files_from_backup(envelope: dict[str, Any]) -> dict[str, bytes | Non
     files = envelope.get("files")
     if not isinstance(files, dict):
         fail("backup files must be an object")
+    expected_paths = {relative.as_posix() for relative in managed_paths()}
+    actual_paths = set(files)
+    if actual_paths != expected_paths:
+        missing = sorted(expected_paths - actual_paths)
+        extra = sorted(actual_paths - expected_paths)
+        fail(f"backup files path set mismatch (missing={missing}, extra={extra})")
     desired: dict[str, bytes | None] = {}
-    for relative, encoded in files.items():
+    for relative, record in files.items():
         path = safe_relative(str(relative))
-        if encoded is None:
-            desired[path.as_posix()] = None
-            continue
+        if path.as_posix() != relative:
+            fail(f"backup file path must be canonical: {relative}")
+        if not isinstance(record, dict):
+            fail(f"backup file record for {relative} must be an object")
+        require_exact_keys(record, BACKUP_FILE_KEYS_V1, f"backup file record {relative}")
+        encoded = record["payload"]
+        declared_digest = record["sha256"]
+        if not isinstance(declared_digest, str) or not SHA256_HEX_PATTERN.fullmatch(
+            declared_digest
+        ):
+            fail(f"backup digest for {relative} must be a lowercase SHA-256 digest")
+        content: bytes | None
         if not isinstance(encoded, str):
-            fail(f"backup payload for {relative} must be a base64 string")
-        try:
-            desired[path.as_posix()] = base64.b64decode(encoded.encode("ascii"), validate=True)
-        except (ValueError, UnicodeEncodeError) as exc:
-            fail(f"backup payload for {relative} is invalid: {exc}")
+            if encoded is not None:
+                fail(f"backup payload for {relative} must be a base64 string")
+            content = None
+        else:
+            try:
+                content = base64.b64decode(encoded.encode("ascii"), validate=True)
+            except (ValueError, UnicodeEncodeError) as exc:
+                fail(f"backup payload for {relative} is invalid: {exc}")
+        if backup_file_digest(relative, content) != declared_digest:
+            fail(f"backup digest mismatch for {relative}")
+        desired[path.as_posix()] = content
     return desired
 
 
@@ -1838,18 +2212,19 @@ def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str
     backup_required = False
     changes: list[str] = []
     if state["state"] == "managed":
+        blocking_drift = plan_blocking_drift(state["drift"])
         if state.get("legacy"):
             operation = "migrate"
             backup_required = True
             changes = (
                 ["blocked-by-drift"]
-                if state["drift"]
-                else [
-                    CONFIG_NAME,
-                    STAMP_NAME,
-                    BUILDER_TARGET_ROOT.as_posix(),
-                    LEGACY_BUILDER_TARGET_ROOT.as_posix(),
-                ]
+                if blocking_drift
+                else changed_paths_for_desired(
+                    target,
+                    desired_for_selection(
+                        target, content_setup_id, profile_id, load_target_config(target)
+                    ),
+                )
             )
         else:
             current_setup = state["content_setup_id"]
@@ -1857,25 +2232,28 @@ def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str
             selected_current = current_setup == content_setup_id and current_profile == profile_id
             operation = "update" if selected_current else "switch"
             backup_required = not selected_current
-            if state["drift"]:
+            if blocking_drift:
                 changes = ["blocked-by-drift"]
             elif not selected_current:
-                changes = [CONFIG_NAME, STAMP_NAME, BUILDER_TARGET_ROOT.as_posix()]
+                changes = changed_paths_for_desired(
+                    target,
+                    desired_for_selection(
+                        target, content_setup_id, profile_id, load_target_config(target)
+                    ),
+                )
             else:
                 desired = desired_for_selection(
                     target, content_setup_id, profile_id, load_target_config(target)
                 )
-                before = capture_managed_files(target)
-                changes = [
-                    relative
-                    for relative, content in desired.items()
-                    if before.get(relative) != content
-                ]
+                changes = changed_paths_for_desired(target, desired)
     elif state["state"] in {"missing", "empty"}:
         changes = (
             ["blocked-by-drift"]
             if state["drift"]
-            else [CONFIG_NAME, STAMP_NAME, BUILDER_TARGET_ROOT.as_posix()]
+            else changed_paths_for_desired(
+                target,
+                desired_for_selection(target, content_setup_id, profile_id, None),
+            )
         )
     else:
         changes = ["blocked-by-unmanaged-target"]
@@ -1921,9 +2299,9 @@ def mutate_setup(
             changed = [
                 relative for relative, content in desired.items() if before.get(relative) != content
             ]
-            backup_slot: int | None = None
+            backup_publication: BackupPublication | None = None
             if state["state"] == "managed" and not selected_current:
-                backup_slot = write_backup(target, state)
+                backup_publication = write_backup(target, state)
             try:
                 if changed:
                     replace_managed_state(target, desired, before)
@@ -1936,8 +2314,10 @@ def mutate_setup(
                     or final["drift"]
                 ):
                     fail("setup mutation postcondition failed")
+                finish_backup_publication(backup_publication)
             except BaseException:
                 replace_managed_state(target, before, None)
+                rollback_backup_publication(backup_publication)
                 raise
     except BaseException:
         if created_target:
@@ -1950,7 +2330,7 @@ def mutate_setup(
         "content_setup_id": content_setup_id,
         "profile_id": profile_id,
         "changed": changed,
-        "backup_slot": backup_slot,
+        "backup_slot": None if backup_publication is None else backup_publication.slot,
         "builder_projection": "current",
     }
 
@@ -1978,7 +2358,7 @@ def migrate_setup(
         changed = [
             relative for relative, content in desired.items() if before.get(relative) != content
         ]
-        backup_slot = write_backup(target, state)
+        backup_publication = write_backup(target, state)
         try:
             replace_managed_state(target, desired, before)
             final = inspect_target(target)
@@ -1990,8 +2370,10 @@ def migrate_setup(
                 or final["drift"]
             ):
                 fail("migrate postcondition failed")
+            finish_backup_publication(backup_publication)
         except BaseException:
             replace_managed_state(target, before, None)
+            rollback_backup_publication(backup_publication)
             raise
     return {
         "schema_version": 2,
@@ -2001,7 +2383,7 @@ def migrate_setup(
         "content_setup_id": content_setup_id,
         "profile_id": profile_id,
         "changed": changed,
-        "backup_slot": backup_slot,
+        "backup_slot": backup_publication.slot,
         "builder_projection": "current",
     }
 
@@ -2031,9 +2413,7 @@ def restore_slot(target: Path, slot: int) -> dict[str, Any]:
         "backup_slot": slot,
         "content_setup_id": envelope.get("source_content_setup_id"),
         "profile_id": envelope.get("source_profile_id"),
-        "legacy_setup_id": envelope.get("source_legacy_setup_id")
-        if envelope.get("schema_version") == 2
-        else envelope.get("source_setup_id"),
+        "legacy_setup_id": envelope.get("source_legacy_setup_id"),
         "builder_projection": "current",
     }
 
@@ -2094,6 +2474,32 @@ def software_stamp_path(target: Path) -> Path:
     return software_root(target) / SOFTWARE_STAMP_NAME
 
 
+def software_transaction_path(target: Path) -> Path:
+    return software_root(target) / SOFTWARE_TRANSACTION_NAME
+
+
+def write_software_transaction_marker(target: Path, command: str) -> None:
+    marker = {
+        "schema_version": 1,
+        "product_name": PRODUCT_NAME,
+        "command": command,
+        "canonical_target": str(target.resolve(strict=False)),
+        "started_at": int(time.time()),
+        "capability": "recoverable-non-current-marker",
+    }
+    atomic_write(software_transaction_path(target), canonical_json(marker))
+
+
+def clear_software_transaction_marker(target: Path) -> None:
+    marker = software_transaction_path(target)
+    if marker.exists() or marker.is_symlink():
+        require_regular_file(
+            marker, "Cursor software transaction marker", max_bytes=METADATA_MAX_BYTES
+        )
+        marker.unlink()
+        fsync_existing_parent(marker)
+
+
 def existing_path_label(path: Path, label: str) -> str | None:
     try:
         path.lstat()
@@ -2104,6 +2510,7 @@ def existing_path_label(path: Path, label: str) -> str | None:
 
 def software_presence(target: Path) -> list[str]:
     labels = (
+        (software_transaction_path(target), SOFTWARE_TRANSACTION_NAME),
         (software_stamp_path(target), SOFTWARE_STAMP_NAME),
         (software_container(target), ".nddev-software"),
         (software_root(target), ".nddev-software/cursor-cli"),
@@ -2116,21 +2523,104 @@ def software_presence(target: Path) -> list[str]:
     return sorted(label for path, label in labels if existing_path_label(path, label) is not None)
 
 
-def current_platform_asset() -> tuple[str, str, int]:
-    if sys.platform.startswith("linux"):
-        os_id = "linux"
-    elif sys.platform == "darwin":
-        os_id = "darwin"
+def parse_os_release(content: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def read_linux_os_release(path: Path = LINUX_OS_RELEASE_PATH) -> dict[str, str]:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        fail(f"unsupported Cursor CLI Linux host: cannot read {path}: {exc}")
+    return parse_os_release(content)
+
+
+def detect_linux_libc() -> str:
+    libc_name = py_platform.libc_ver()[0].lower()
+    if libc_name in {SUPPORTED_LINUX_LIBC, "musl"}:
+        return libc_name
+    for pattern in MUSL_LOADER_GLOBS:
+        if glob.glob(pattern):
+            return "musl"
+    return libc_name or "unknown"
+
+
+def require_supported_ubuntu_linux(
+    *,
+    os_release: dict[str, str] | None = None,
+    libc: str | None = None,
+) -> None:
+    release = read_linux_os_release() if os_release is None else os_release
+    distro_id = release.get("ID", "").strip().lower() or "unknown"
+    if distro_id != SUPPORTED_LINUX_DISTRIBUTION_ID:
+        fail(
+            "unsupported Cursor CLI Linux distribution (non-ubuntu-linux): "
+            f"{distro_id}; supported Linux host is Ubuntu"
+        )
+    libc_name = (detect_linux_libc() if libc is None else libc).strip().lower() or "unknown"
+    if libc_name != SUPPORTED_LINUX_LIBC:
+        fail(
+            "unsupported Cursor CLI Linux libc (linux-musl): "
+            f"{libc_name}; supported Ubuntu host must use glibc"
+        )
+
+
+def current_platform_host_id(
+    *,
+    system_platform: str | None = None,
+    machine: str | None = None,
+    linux_os_release: dict[str, str] | None = None,
+    linux_libc: str | None = None,
+) -> str:
+    active_platform = sys.platform if system_platform is None else system_platform
+    if active_platform.startswith("linux"):
+        require_supported_ubuntu_linux(os_release=linux_os_release, libc=linux_libc)
+        host_family = "ubuntu-glibc"
+    elif active_platform == "darwin":
+        host_family = "macos"
+    elif active_platform.startswith(("win", "cygwin", "msys")):
+        fail(f"unsupported Cursor CLI host category windows: {active_platform}")
     else:
-        fail(f"unsupported Cursor CLI installer platform: {sys.platform}")
-    machine = os.uname().machine.lower()
-    if machine in {"arm64", "aarch64"}:
+        fail(f"unsupported Cursor CLI installer platform: {active_platform}")
+    active_machine = (os.uname().machine if machine is None else machine).lower()
+    if active_machine in {"arm64", "aarch64"}:
         arch = "arm64"
-    elif machine in {"x86_64", "amd64"}:
+    elif active_machine in {"x86_64", "amd64"}:
         arch = "x64"
     else:
-        fail(f"unsupported Cursor CLI installer architecture: {machine}")
-    return CURSOR_OFFICIAL_ASSETS[(os_id, arch)]
+        fail(f"unsupported Cursor CLI host category unsupported-architecture: {active_machine}")
+    return f"{host_family}-{arch}"
+
+
+def current_platform_asset(
+    *,
+    system_platform: str | None = None,
+    machine: str | None = None,
+    linux_os_release: dict[str, str] | None = None,
+    linux_libc: str | None = None,
+) -> tuple[str, str, int]:
+    host_id = current_platform_host_id(
+        system_platform=system_platform,
+        machine=machine,
+        linux_os_release=linux_os_release,
+        linux_libc=linux_libc,
+    )
+    return CURSOR_OFFICIAL_ASSETS[VENDOR_ASSET_HOST_MAP[host_id]]
+
+
+def require_current_host_supported() -> None:
+    current_platform_asset()
 
 
 def official_asset_url(asset_path: str) -> str:
@@ -2314,10 +2804,19 @@ def atomic_write_with_mode(path: Path, content: bytes, mode: int) -> None:
     temporary = path.with_name(f".{path.name}.nddev.tmp.{os.getpid()}.{time.time_ns()}")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-        os.chmod(temporary, mode)
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written == 0:
+                    fail(f"software write made no progress: {path}")
+                view = view[written:]
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         os.replace(temporary, path)
+        fsync_existing_parent(path)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
@@ -2359,6 +2858,7 @@ def ensure_real_directory_path(path: Path, label: str) -> None:
             fail(f"{label} appeared concurrently")
         directory.chmod(OWNER_DIRECTORY_MODE)
         require_owner_private_directory(directory, label)
+        fsync_directory(directory.parent)
 
 
 def ensure_private_directory_chain(root: Path, relative_parent: Path) -> None:
@@ -2614,6 +3114,47 @@ def snapshot_runtime_payload(root: Path) -> dict[str, tuple[bytes, int]]:
     return files
 
 
+def path_tree_signature(root: Path, label: str) -> str | None:
+    if not root.exists() and not root.is_symlink():
+        return None
+    info = root.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} must be a real directory")
+    digest = hashlib.sha256()
+    digest.update(b"dir\0.\0")
+    digest.update(oct(stat.S_IMODE(info.st_mode)).encode("ascii"))
+    digest.update(b"\0")
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        entry_info = path.lstat()
+        if stat.S_ISLNK(entry_info.st_mode):
+            fail(f"{label} must not contain symlinks: {relative}")
+        if stat.S_ISDIR(entry_info.st_mode):
+            digest.update(b"dir\0")
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(oct(stat.S_IMODE(entry_info.st_mode)).encode("ascii"))
+            digest.update(b"\0")
+            continue
+        if not stat.S_ISREG(entry_info.st_mode):
+            fail(f"{label} must contain only regular files: {relative}")
+        if entry_info.st_nlink != 1:
+            fail(f"{label} file must not have hard-link aliases: {relative}")
+        content = read_regular_file(
+            path, f"{label} file {relative}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
+        )
+        digest.update(b"file\0")
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(oct(stat.S_IMODE(entry_info.st_mode)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(len(content)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(sha256_bytes(content).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def software_file_mode_is(path: Path, mode: int) -> bool:
     info = path.lstat()
     return not stat.S_ISLNK(info.st_mode) and stat.S_IMODE(info.st_mode) == mode
@@ -2624,6 +3165,47 @@ def remove_empty_directory_if_created(path: Path, existed_before: bool) -> None:
         return
     with contextlib.suppress(FileNotFoundError, OSError):
         path.rmdir()
+        fsync_directory(path.parent)
+
+
+def remove_empty_directory(path: Path) -> None:
+    with contextlib.suppress(FileNotFoundError, OSError):
+        path.rmdir()
+        fsync_directory(path.parent)
+
+
+def remove_software_path(path: Path) -> None:
+    if not (path.exists() or path.is_symlink()):
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    fsync_directory(path.parent)
+
+
+def optional_software_file_matches(path: Path, content: bytes | None, mode: int | None) -> bool:
+    if content is None:
+        return not (path.exists() or path.is_symlink())
+    if not (path.exists() or path.is_symlink()):
+        return False
+    try:
+        current = read_regular_file(
+            path, f"Cursor software file {path}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
+        )
+        info = require_regular_file(
+            path, f"Cursor software file {path}", max_bytes=SOFTWARE_ARTIFACT_MAX_BYTES
+        )
+    except CursorSetupError:
+        return False
+    return current == content and stat.S_IMODE(info.st_mode) == (mode or OWNER_FILE_MODE)
+
+
+def restore_optional_software_file(path: Path, content: bytes | None, mode: int | None) -> None:
+    if content is None:
+        remove_software_path(path)
+    else:
+        atomic_write_with_mode(path, content, mode or OWNER_FILE_MODE)
 
 
 @bootstrap_locked
@@ -2678,6 +3260,18 @@ def software_status(target: Path) -> dict[str, Any]:
         if directory_drift is not None:
             drift.append(directory_drift)
             directory_mode_drift = True
+    transaction_active = False
+    marker_path = software_transaction_path(target)
+    if marker_path.exists() or marker_path.is_symlink():
+        marker_info = require_regular_file(
+            marker_path,
+            f"Cursor software transaction marker {marker_path}",
+            max_bytes=METADATA_MAX_BYTES,
+        )
+        transaction_active = True
+        drift.append("software-transaction")
+        if stat.S_IMODE(marker_info.st_mode) != OWNER_FILE_MODE:
+            drift.append("software-transaction:mode")
     stamp_path = software_stamp_path(target)
     if stamp_path.exists() or stamp_path.is_symlink():
         stamp_info = require_regular_file(
@@ -2744,6 +3338,7 @@ def software_status(target: Path) -> dict[str, Any]:
             and binary_mode_ok
             and version_mode_ok
             and not directory_mode_drift
+            and not transaction_active
         )
         asset_path, artifact_sha256, artifact_size = current_platform_asset()
         expected = {
@@ -2789,8 +3384,15 @@ def prepare_cursor_artifact() -> dict[str, Any]:
     }
 
 
-@bootstrap_locked
 def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
+    if command not in {"install-cli", "update-cli"}:
+        fail(f"unsupported Cursor software command: {command}")
+    require_current_host_supported()
+    return _install_cursor_cli_locked(target, command)
+
+
+@bootstrap_locked
+def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
     if command == "update-cli":
         preflight = software_status(target)
         if not preflight["present"]:
@@ -2830,6 +3432,11 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
         before_versions_exists = versions.exists() or versions.is_symlink()
         before_bin_dir_exists = bin_dir.exists() or bin_dir.is_symlink()
         before_version_exists = version_dir.exists() or version_dir.is_symlink()
+        before_version_signature = (
+            path_tree_signature(version_dir, "Cursor software version tree")
+            if before_version_exists
+            else None
+        )
         before_binary, before_binary_mode = snapshot_optional_software_file(
             binary_path, f"Cursor managed binary {binary_path}"
         )
@@ -2870,17 +3477,23 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
                     fail("Cursor software version path is unsafe")
                 if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
                     fail("Cursor software version directory must have mode 0700")
+            write_software_transaction_marker(target, command)
             staging = Path(tempfile.mkdtemp(prefix=".stage-", dir=str(versions)))
             staging.chmod(OWNER_DIRECTORY_MODE)
+            fsync_directory(versions)
             rollback_parent = Path(tempfile.mkdtemp(prefix=".rollback-", dir=str(versions)))
             rollback_parent.chmod(OWNER_DIRECTORY_MODE)
+            fsync_directory(versions)
             rollback = rollback_parent / CURSOR_VERSION
             write_cursor_runtime_tree(staging, artifact["files"])
             if before_version_exists:
                 version_dir.rename(rollback)
+                fsync_directory(versions)
             staging.rename(version_dir)
+            fsync_directory(versions)
             atomic_write_executable(binary_path, entrypoint)
             atomic_write(stamp_path, stamp_bytes)
+            clear_software_transaction_marker(target)
             final_status = software_status(target)
             if not final_status["installed"]:
                 fail(
@@ -2889,42 +3502,83 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
             if not final_status["current"]:
                 fail("Cursor software install did not produce the current pinned CLI identity")
         except BaseException:
-            if version_dir.exists() or version_dir.is_symlink():
-                if version_dir.is_dir() and not version_dir.is_symlink():
-                    shutil.rmtree(version_dir)
-                else:
-                    version_dir.unlink()
-            if rollback is not None and rollback.exists():
-                rollback.rename(version_dir)
-            if before_binary is None:
-                with contextlib.suppress(FileNotFoundError):
-                    binary_path.unlink()
+            rollback_exact = False
+
+            def software_matches_before() -> bool:
+                try:
+                    return (
+                        path_tree_signature(version_dir, "Cursor software version tree")
+                        == before_version_signature
+                        and optional_software_file_matches(
+                            binary_path, before_binary, before_binary_mode
+                        )
+                        and optional_software_file_matches(
+                            stamp_path, before_stamp, before_stamp_mode
+                        )
+                    )
+                except CursorSetupError:
+                    return False
+
+            for _ in range(4):
+                try:
+                    if (
+                        path_tree_signature(version_dir, "Cursor software version tree")
+                        != before_version_signature
+                    ):
+                        remove_software_path(version_dir)
+                        if (
+                            before_version_signature is not None
+                            and rollback is not None
+                            and (rollback.exists() or rollback.is_symlink())
+                        ):
+                            os.rename(rollback, version_dir)
+                            fsync_directory(versions)
+                    if not optional_software_file_matches(
+                        binary_path, before_binary, before_binary_mode
+                    ):
+                        restore_optional_software_file(
+                            binary_path, before_binary, before_binary_mode
+                        )
+                    if not optional_software_file_matches(
+                        stamp_path, before_stamp, before_stamp_mode
+                    ):
+                        restore_optional_software_file(stamp_path, before_stamp, before_stamp_mode)
+                    if software_matches_before():
+                        rollback_exact = True
+                        break
+                except BaseException:
+                    pass
+            if rollback_exact:
+                try:
+                    clear_software_transaction_marker(target)
+                except BaseException:
+                    rollback_exact = False
             else:
-                atomic_write_with_mode(
-                    binary_path, before_binary, before_binary_mode or OWNER_EXEC_MODE
-                )
-            if before_stamp is None:
-                with contextlib.suppress(FileNotFoundError):
-                    stamp_path.unlink()
-            else:
-                atomic_write_with_mode(
-                    stamp_path, before_stamp, before_stamp_mode or OWNER_FILE_MODE
-                )
+                with contextlib.suppress(BaseException):
+                    if not (
+                        software_transaction_path(target).exists()
+                        or software_transaction_path(target).is_symlink()
+                    ):
+                        write_software_transaction_marker(target, command)
             if staging is not None:
                 with contextlib.suppress(FileNotFoundError):
                     shutil.rmtree(staging)
+                    fsync_directory(versions)
             if rollback_parent is not None:
                 with contextlib.suppress(FileNotFoundError):
                     shutil.rmtree(rollback_parent)
-            remove_empty_directory_if_created(bin_dir, before_bin_dir_exists)
-            remove_empty_directory_if_created(versions, before_versions_exists)
-            remove_empty_directory_if_created(root, before_root_exists)
-            remove_empty_directory_if_created(container, before_container_exists)
-            remove_empty_directory_if_created(target, before_target_exists)
+                    fsync_directory(versions)
+            if rollback_exact:
+                remove_empty_directory_if_created(bin_dir, before_bin_dir_exists)
+                remove_empty_directory_if_created(versions, before_versions_exists)
+                remove_empty_directory_if_created(root, before_root_exists)
+                remove_empty_directory_if_created(container, before_container_exists)
+                remove_empty_directory_if_created(target, before_target_exists)
             raise
         if rollback_parent is not None:
             with contextlib.suppress(FileNotFoundError):
                 shutil.rmtree(rollback_parent)
+                fsync_directory(versions)
         final_status = software_status(target)
         return {
             "schema_version": 1,
@@ -2941,6 +3595,200 @@ def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
             "runtime_tree_sha256": artifact["runtime_tree_sha256"],
             "runtime_file_count": artifact["runtime_file_count"],
             "runtime_size": artifact["runtime_size"],
+            "managed_command": str(binary_path.resolve(strict=False)),
+        }
+
+
+def software_tree_matches(path: Path, signature: str | None, label: str) -> bool:
+    try:
+        return path_tree_signature(path, label) == signature
+    except CursorSetupError:
+        return False
+
+
+def cleanup_software_remove_empty_parents(target: Path) -> None:
+    remove_empty_directory(launch_images_root(target))
+    remove_empty_directory(software_version_dir(target))
+    remove_empty_directory(software_root(target) / "versions")
+    remove_empty_directory(software_root(target))
+    remove_empty_directory(software_container(target))
+    remove_empty_directory(managed_agent_path(target).parent)
+
+
+def remove_cursor_cli(target: Path) -> dict[str, Any]:
+    require_current_host_supported()
+    return _remove_cursor_cli_locked(target)
+
+
+@bootstrap_locked
+def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
+    if not target.exists() and not target.is_symlink():
+        return {
+            "schema_version": 1,
+            "command": "remove-cli",
+            "operation": "absent",
+            "target": str(target.resolve(strict=False)),
+            "current": False,
+            "present": False,
+            "changed": [],
+            "managed_command": str(managed_agent_path(target).resolve(strict=False)),
+        }
+    prepare_lifecycle_target(target, create_missing=False)
+    with target_lock(target):
+        initial_status = software_status(target)
+        initial_presence = list(initial_status["presence"])
+        if not initial_presence:
+            return {
+                "schema_version": 1,
+                "command": "remove-cli",
+                "operation": "absent",
+                "target": str(target.resolve(strict=False)),
+                "current": False,
+                "present": False,
+                "changed": [],
+                "managed_command": str(managed_agent_path(target).resolve(strict=False)),
+            }
+
+        container = software_container(target)
+        root = software_root(target)
+        versions = root / "versions"
+        version_dir = software_version_dir(target)
+        launch_root = launch_images_root(target)
+        binary_path = managed_agent_path(target)
+        stamp_path = software_stamp_path(target)
+        marker_path = software_transaction_path(target)
+        before_container_exists = container.exists() or container.is_symlink()
+        before_root_exists = root.exists() or root.is_symlink()
+        before_versions_exists = versions.exists() or versions.is_symlink()
+        before_bin_dir_exists = binary_path.parent.exists() or binary_path.parent.is_symlink()
+        before_version_signature = path_tree_signature(version_dir, "Cursor software version tree")
+        before_launch_signature = path_tree_signature(launch_root, "Cursor launch images tree")
+        before_binary, before_binary_mode = snapshot_optional_software_file(
+            binary_path, f"Cursor managed binary {binary_path}"
+        )
+        before_stamp, before_stamp_mode = snapshot_optional_software_file(
+            stamp_path, f"Cursor software stamp {stamp_path}"
+        )
+        before_marker, before_marker_mode = snapshot_optional_software_file(
+            marker_path, f"Cursor software transaction marker {marker_path}"
+        )
+        rollback_parent: Path | None = None
+        rollback_version: Path | None = None
+        rollback_launch: Path | None = None
+
+        def matches_before() -> bool:
+            return (
+                software_tree_matches(
+                    version_dir, before_version_signature, "Cursor software version tree"
+                )
+                and software_tree_matches(
+                    launch_root, before_launch_signature, "Cursor launch images tree"
+                )
+                and optional_software_file_matches(binary_path, before_binary, before_binary_mode)
+                and optional_software_file_matches(stamp_path, before_stamp, before_stamp_mode)
+                and optional_software_file_matches(marker_path, before_marker, before_marker_mode)
+            )
+
+        try:
+            ensure_real_directory_path(container, "Cursor software container")
+            ensure_real_directory_path(root, "Cursor software root")
+            write_software_transaction_marker(target, "remove-cli")
+            rollback_parent = Path(
+                tempfile.mkdtemp(prefix=SOFTWARE_REMOVE_ROLLBACK_PREFIX, dir=str(root))
+            )
+            rollback_parent.chmod(OWNER_DIRECTORY_MODE)
+            fsync_directory(root)
+            if before_version_signature is not None:
+                ensure_real_directory_path(versions, "Cursor software versions directory")
+                rollback_version = rollback_parent / "version"
+                os.rename(version_dir, rollback_version)
+                fsync_directory(versions)
+            if before_launch_signature is not None:
+                rollback_launch = rollback_parent / LAUNCH_IMAGES_NAME
+                os.rename(launch_root, rollback_launch)
+                fsync_directory(root)
+            remove_software_path(binary_path)
+            remove_software_path(stamp_path)
+            clear_software_transaction_marker(target)
+            if (version_dir.exists() or version_dir.is_symlink()) or (
+                launch_root.exists() or launch_root.is_symlink()
+            ):
+                fail("remove-cli software tree postcondition failed")
+            shutil.rmtree(rollback_parent)
+            fsync_directory(root)
+            rollback_parent = None
+            cleanup_software_remove_empty_parents(target)
+            final_status = software_status(target)
+            if final_status["installed"] or final_status["current"]:
+                fail("remove-cli software status postcondition failed")
+        except BaseException:
+            rollback_exact = False
+            for _ in range(4):
+                try:
+                    if not software_tree_matches(
+                        version_dir, before_version_signature, "Cursor software version tree"
+                    ):
+                        remove_software_path(version_dir)
+                        if (
+                            before_version_signature is not None
+                            and rollback_version is not None
+                            and (rollback_version.exists() or rollback_version.is_symlink())
+                        ):
+                            os.rename(rollback_version, version_dir)
+                            fsync_directory(versions)
+                    if not software_tree_matches(
+                        launch_root, before_launch_signature, "Cursor launch images tree"
+                    ):
+                        remove_software_path(launch_root)
+                        if (
+                            before_launch_signature is not None
+                            and rollback_launch is not None
+                            and (rollback_launch.exists() or rollback_launch.is_symlink())
+                        ):
+                            os.rename(rollback_launch, launch_root)
+                            fsync_directory(root)
+                    if not optional_software_file_matches(
+                        binary_path, before_binary, before_binary_mode
+                    ):
+                        restore_optional_software_file(
+                            binary_path, before_binary, before_binary_mode
+                        )
+                    if not optional_software_file_matches(
+                        stamp_path, before_stamp, before_stamp_mode
+                    ):
+                        restore_optional_software_file(stamp_path, before_stamp, before_stamp_mode)
+                    if not optional_software_file_matches(
+                        marker_path, before_marker, before_marker_mode
+                    ):
+                        restore_optional_software_file(
+                            marker_path, before_marker, before_marker_mode
+                        )
+                    if matches_before():
+                        rollback_exact = True
+                        break
+                except BaseException:
+                    pass
+            if rollback_parent is not None and (
+                rollback_parent.exists() or rollback_parent.is_symlink()
+            ):
+                with contextlib.suppress(FileNotFoundError):
+                    shutil.rmtree(rollback_parent)
+                    fsync_directory(root)
+            if rollback_exact:
+                remove_empty_directory_if_created(versions, before_versions_exists)
+                remove_empty_directory_if_created(root, before_root_exists)
+                remove_empty_directory_if_created(container, before_container_exists)
+                remove_empty_directory_if_created(binary_path.parent, before_bin_dir_exists)
+            raise
+        final_status = software_status(target)
+        return {
+            "schema_version": 1,
+            "command": "remove-cli",
+            "operation": "remove",
+            "target": str(target.resolve(strict=False)),
+            "current": False,
+            "present": final_status["present"],
+            "changed": sorted(set(initial_presence)),
             "managed_command": str(binary_path.resolve(strict=False)),
         }
 
@@ -2977,9 +3825,7 @@ def restore_managed_config_after_launch_locked(target: Path) -> None:
         fail("legacy managed target cannot be restored after launch")
     profile_id = str(stamp["profile_id"])
     _, _, rendered = render_selection(str(stamp["content_setup_id"]), profile_id)
-    setup_config = parse_json_object(
-        rendered[CONFIG_NAME], f"profile {profile_id}/{CONFIG_NAME}"
-    )
+    setup_config = parse_json_object(rendered[CONFIG_NAME], f"profile {profile_id}/{CONFIG_NAME}")
     config_path = target / CONFIG_NAME
     if config_path.exists() or config_path.is_symlink():
         current = parse_json_object(
@@ -3169,8 +4015,13 @@ def launch_write_protection(launch_image_root: Path) -> Iterator[None]:
                 raise cleanup_error
 
 
-@bootstrap_locked
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
+    require_current_host_supported()
+    return _launch_cursor_locked(target, cursor_args)
+
+
+@bootstrap_locked
+def _launch_cursor_locked(target: Path, cursor_args: list[str]) -> int:
     forwarded = list(cursor_args)
     reject_managed_launch_overrides(forwarded)
     prepare_lifecycle_target(target, create_missing=False)
@@ -3263,12 +4114,33 @@ def add_setup_profile(
     )
 
 
+def argv_requests_json(argv: list[str] | None) -> bool:
+    return "--json" in (sys.argv[1:] if argv is None else argv)
+
+
+class CursorArgumentParser(argparse.ArgumentParser):
+    def parse_args(
+        self, args: list[str] | None = None, namespace: argparse.Namespace | None = None
+    ) -> argparse.Namespace:
+        global _PARSER_JSON_ERROR_REQUESTED
+        _PARSER_JSON_ERROR_REQUESTED = argv_requests_json(args)
+        self._json_error_requested = argv_requests_json(args)
+        return super().parse_args(args, namespace)
+
+    def error(self, message: str) -> NoReturn:
+        if _PARSER_JSON_ERROR_REQUESTED or getattr(self, "_json_error_requested", False):
+            raise CursorArgumentError(message)
+        super().error(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = CursorArgumentParser(
         prog="nddev-cursor-cli",
         description="Manage a portable Cursor CLI setup at an explicit target.",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=CursorArgumentParser
+    )
 
     list_parser = subparsers.add_parser("list", help="List source setups.")
     list_parser.add_argument("--json", action="store_true", dest="output_json")
@@ -3292,7 +4164,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_target(software_status_parser)
 
-    for command in ("install-cli", "update-cli"):
+    for command in ("install-cli", "update-cli", "remove-cli"):
         command_parser = subparsers.add_parser(
             command, help=f"{command.title()} target-owned Cursor CLI software."
         )
@@ -3345,6 +4217,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
         return software_status(target)
     if args.command in {"install-cli", "update-cli"}:
         return install_cursor_cli(target, args.command)
+    if args.command == "remove-cli":
+        return remove_cursor_cli(target)
     if args.command == "restore":
         return restore_slot(target, args.backup)
     if args.command == "remove":
@@ -3382,17 +4256,19 @@ def human_output(value: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    json_error = argv_requests_json(argv)
+    args: argparse.Namespace | None = None
     try:
+        args = parse_args(argv)
         result = run(args)
-    except (CursorSetupError, OSError) as exc:
+    except (CursorArgumentError, CursorSetupError, OSError) as exc:
         if isinstance(exc, OSError):
             error_message = exc.strerror or type(exc).__name__
             if exc.filename is not None:
                 error_message += f" ({exc.filename})"
         else:
             error_message = str(exc)
-        if getattr(args, "output_json", False):
+        if json_error or (args is not None and getattr(args, "output_json", False)):
             print(json.dumps({"schema_version": 1, "error": error_message}, sort_keys=True))
         else:
             print(f"nddev-cursor-cli: error: {error_message}", file=sys.stderr)

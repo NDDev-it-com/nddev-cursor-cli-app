@@ -39,7 +39,46 @@
   },
   "runtime_compatibility": {
     "baseline_ref": "references/cursor-cli-baseline.json",
-    "version_ref": "build/version.json"
+    "version_ref": "build/version.json",
+    "supported_host_ids": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ],
+    "ubuntu_distribution_id": "ubuntu",
+    "ubuntu_libc": "glibc",
+    "ubuntu_glibc_version_floor": null,
+    "ubuntu_glibc_version_floor_status": "no-official-floor",
+    "ubuntu_systems": ["desktop", "server"],
+    "unsupported_host_categories": [
+      "windows",
+      "non-ubuntu-linux",
+      "linux-musl",
+      "unsupported-architecture"
+    ],
+    "vendor_asset_mapping": {
+      "macos-arm64": {
+        "vendor_os": "darwin",
+        "vendor_arch": "arm64",
+        "asset_path": "darwin/arm64/agent-cli-package.tar.gz"
+      },
+      "macos-x64": {
+        "vendor_os": "darwin",
+        "vendor_arch": "x64",
+        "asset_path": "darwin/x64/agent-cli-package.tar.gz"
+      },
+      "ubuntu-glibc-arm64": {
+        "vendor_os": "linux",
+        "vendor_arch": "arm64",
+        "asset_path": "linux/arm64/agent-cli-package.tar.gz"
+      },
+      "ubuntu-glibc-x64": {
+        "vendor_os": "linux",
+        "vendor_arch": "x64",
+        "asset_path": "linux/x64/agent-cli-package.tar.gz"
+      }
+    }
   },
   "runtime_launch": {
     "command": "agent",
@@ -87,14 +126,17 @@
     "status_command": "python3 cli-tools/nddev_cursor_cli.py software-status --target <absolute-target> [--json]",
     "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target <absolute-target> [--json]",
     "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target <absolute-target> [--json]",
+    "remove_command": "python3 cli-tools/nddev_cursor_cli.py remove-cli --target <absolute-target> [--json]",
     "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
     "status_fields": ["installed", "current", "present", "presence", "drift"],
     "install_precondition": "absent target-owned software presence",
     "update_precondition": "existing target-owned software presence, including repairable missing or corrupt identity stamp",
+    "remove_precondition": "absent, current, or partial target-owned software presence",
     "update_current_behavior": "idempotent no-op without downloading",
     "stage_and_atomic_swap": true,
     "rollback_on_failure": true,
     "artifact_reader": "bounded dist-package runtime-tree extraction; requires cursor-agent, node, and index.js; rejects traversal, symlink, hardlink, device, duplicate, unsafe mode, and oversize members",
+    "host_platform_preflight": "Supported NDDev host IDs are macos-arm64, macos-x64, ubuntu-glibc-arm64, and ubuntu-glibc-x64. Ubuntu desktop/server hosts must report ID=ubuntu and glibc; Cursor publishes no official Ubuntu/glibc version floor. Upstream darwin/* and linux/* artifact paths remain vendor IDs. windows, non-ubuntu-linux, linux-musl, and unsupported-architecture fail before bootstrap lock, target lock, target creation, download, stage, or launch",
     "npm": null,
     "pip": null
   },
@@ -104,13 +146,17 @@
     "status_command": "python3 cli-tools/nddev_cursor_cli.py software-status --target /absolute/target --json",
     "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target /absolute/target --json",
     "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target /absolute/target --json",
+    "remove_command": "python3 cli-tools/nddev_cursor_cli.py remove-cli --target /absolute/target --json",
     "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
     "install_precondition": "install-cli refuses any existing target-owned software presence; use update-cli for partial or existing state",
     "update_precondition": "update-cli repairs existing target-owned software presence and refuses absent software state",
+    "remove_precondition": "remove-cli accepts absent, current, or partial target-owned software state and removes only manager-owned software paths",
     "target_owned": true,
     "software_root": ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
     "entrypoint": "bin/agent",
     "status_executes_binary": false,
+    "transaction_marker": "NDDEV-CURSOR-CLI-TRANSACTION.json",
+    "failure_current_behavior": "exact rollback or transaction marker forces current=false",
     "private_modes": {
       "directories": "0700",
       "stamp": "0600",
@@ -153,7 +199,7 @@
     "absolute_target_required": true,
     "canonical_target_binding": true,
     "default_target": null,
-    "explicit_target_required": ["status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "launch"],
+    "explicit_target_required": ["status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "remove-cli", "launch"],
     "max_backups": 10,
     "missing_target_argument_rejected": true,
     "new_target_mode": "0700",
@@ -170,6 +216,11 @@
     "bootstrap_lock_file_mode": "0600",
     "bootstrap_lock_binding": "schema/product/canonical-target/product-target-sha256 JSON",
     "backup_path": ".nddev-cursor-cli/backups",
+    "backup_envelope_schema": 3,
+    "backup_file_record_schema": "payload plus sha256 over canonical declared path and payload bytes",
+    "backup_restore_digest_required": true,
+    "backup_digest_capability": "corruption-and-incoherent-tamper-detection",
+    "backup_digest_authenticates_same_uid_payloads": false,
     "mutable_runtime_tmp": ".nddev-cursor-runtime/tmp",
     "target_local_directory_parents": "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed",
     "relative_target_rejected": true,
