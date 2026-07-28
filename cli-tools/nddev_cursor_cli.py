@@ -2773,6 +2773,7 @@ def recover_cleanup_publication_stage(target: Path, stage: Path, *, complete: bo
                 max_bytes=CLEANUP_JOURNAL_MAX_BYTES,
             )
         else:
+            remove_unpublished_cleanup_journal_aliases(stage, journal)
             tombstones = [move["tombstone"] for move in moves]
             journal_content = cleanup_journal_bytes(target, tombstones)
             if publish_cleanup_journal_no_replace(journal, journal_content):
@@ -2928,6 +2929,27 @@ def recover_cleanup_journal_publication_alias(journal: Path) -> None:
     )
     if final.st_nlink != 1:
         cleanup_metadata_error("cleanup journal alias recovery did not restore nlink=1")
+
+
+def remove_unpublished_cleanup_journal_aliases(parent: Path, journal: Path) -> None:
+    for child in sorted(parent.iterdir(), key=lambda item: item.name):
+        if child.name == journal.name or not is_cleanup_publication_alias(child, journal):
+            continue
+        try:
+            info = child.lstat()
+        except FileNotFoundError:
+            continue
+        uid = current_user_id()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or (uid is not None and info.st_uid != uid)
+            or stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE
+        ):
+            cleanup_metadata_error("cleanup journal has an unsafe unpublished alias")
+        child.unlink()
+        fsync_directory(parent)
 
 
 def load_cleanup_journal(target: Path, *, recover_alias: bool) -> dict[str, Any]:
@@ -3207,6 +3229,30 @@ def cleanup_pending_result(target: Path) -> dict[str, Any]:
     }
 
 
+def recover_cleanup_retirement_residue(target: Path) -> bool:
+    root = cleanup_pending_root(target)
+    if not path_exists_no_follow(root):
+        return False
+    require_owner_private_directory(root, "cleanup pending")
+    journal = cleanup_journal_path(target)
+    if path_exists_no_follow(journal):
+        return False
+    actual = {child.name: child for child in root.iterdir()}
+    allowed = {CLEANUP_TOMBSTONES_NAME}
+    if set(actual) - allowed:
+        cleanup_metadata_error("cleanup retirement residue contains unknown entries")
+    tombstones = actual.get(CLEANUP_TOMBSTONES_NAME)
+    if tombstones is not None:
+        require_owner_private_directory(tombstones, "cleanup tombstones")
+        if any(tombstones.iterdir()):
+            cleanup_metadata_error("cleanup retirement residue contains tombstones without journal")
+        tombstones.rmdir()
+        fsync_directory(root)
+    root.rmdir()
+    fsync_directory(root.parent)
+    return True
+
+
 def remove_cleanup_tombstone(target: Path, tombstone: dict[str, Any]) -> None:
     name = require_cleanup_name(str(tombstone["name"]), "cleanup tombstone")
     root = cleanup_tombstones_root(target) / name
@@ -3245,6 +3291,8 @@ def remove_cleanup_tombstone(target: Path, tombstone: dict[str, Any]) -> None:
 
 def drain_cleanup_pending(target: Path, *, fail_closed: bool) -> bool:
     try:
+        if recover_cleanup_retirement_residue(target):
+            return True
         state = cleanup_pending_metadata(target, recover_alias=True)
         if not state["pending"]:
             return False
