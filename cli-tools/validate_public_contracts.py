@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import importlib.util
@@ -20,6 +21,16 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 CURSOR_RELEASE_ID = "2026.07.23-e383d2b"
+PYTHON_REQUIRES = ">=3.9"
+BOOTSTRAP_LOCK_SCOPE = (
+    "external product-and-lexical-target flock before target creation or inspection "
+    "through full operation and child cleanup"
+)
+BOOTSTRAP_LOCK_PATH = (
+    "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/"
+    "nddev-cursor-cli-app-<sha256(product-name NUL lexical-target)>.lock"
+)
+BOOTSTRAP_LOCK_BINDING = "schema/product/lexical-target/product-target-sha256 JSON"
 CONTENT_SETUP_IDS = ["nddev-builder"]
 PROFILE_IDS = ["full-auto", "safe"]
 BUILDER_TARGET_PATH = ".nddev-cursor-home/.cursor/plugins/local/nddev-builder"
@@ -347,6 +358,24 @@ def load_build_version(errors: list[str]) -> str:
     return value
 
 
+def validate_python39_syntax(errors: list[str]) -> None:
+    for path in sorted(ROOT.rglob("*.py"), key=lambda item: item.relative_to(ROOT).as_posix()):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"{path.relative_to(ROOT)}: unreadable for Python 3.9 syntax check: {exc}")
+            continue
+        try:
+            ast.parse(source, filename=str(path), feature_version=(3, 9))
+        except SyntaxError as exc:
+            errors.append(
+                f"{path.relative_to(ROOT)}: not valid Python 3.9 syntax: "
+                f"{exc.msg} at line {exc.lineno}"
+            )
+
+
 def real_dirs(root: Path) -> list[str]:
     if not root.is_dir() or root.is_symlink():
         return []
@@ -388,7 +417,7 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch target lock scope mismatch")
     if (
         launch.get("bootstrap_lock_scope")
-        != "external product-and-canonical-target flock before target creation or inspection through full operation and child cleanup"
+        != BOOTSTRAP_LOCK_SCOPE
     ):
         errors.append(f"{owner}: runtime_launch bootstrap lock scope mismatch")
     if launch.get("bootstrap_lock_exposed_to_child") is not False:
@@ -1035,13 +1064,13 @@ def start_bootstrap_lock_holder(
     if pid == 0:
         try:
             with module.bootstrap_lifecycle_lock(target):
-                path, canonical, digest = module.bootstrap_lock_path(target)
+                path, lexical, digest = module.bootstrap_lock_path(target)
                 info = path.lstat()
                 result.write_text(
                     json.dumps(
                         {
                             "path": str(path),
-                            "canonical": canonical,
+                            "lexical": lexical,
                             "digest": digest,
                             "device": info.st_dev,
                             "inode": info.st_ino,
@@ -1088,7 +1117,7 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         'require_lock_file_matches_fd(path, descriptor, "bootstrap lock")',
         "require_directory_matches_fd",
         "threading.get_ident()",
-        'PRODUCT_NAME.encode("utf-8") + b"\\0" + canonical.encode("utf-8")',
+        'PRODUCT_NAME.encode("utf-8") + b"\\0" + lexical.encode("utf-8")',
         'Path("/tmp").resolve(strict=True)',
         "stat.S_ISVTX",
         'f"{PRODUCT_NAME}-{digest}.lock"',
@@ -1711,7 +1740,7 @@ def backup_residue(module: Any, target: Path) -> list[str]:
     pool = module.backup_pool(target)
     return hidden_residue_names(
         pool,
-        (module.BACKUP_STAGE_PREFIX, module.BACKUP_RETIRED_PREFIX),
+        (module.BACKUP_STAGE_PREFIX, module.BACKUP_RETIRED_PREFIX, module.BACKUP_CLEANUP_PREFIX),
     )
 
 
@@ -2327,7 +2356,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
         if not lock_path.name.startswith(f"{module.PRODUCT_NAME}-"):
             errors.append("bootstrap handover lock filename lacks product namespace")
         expected_digest = module.sha256_bytes(
-            module.PRODUCT_NAME.encode("utf-8") + b"\0" + first["canonical"].encode("utf-8")
+            module.PRODUCT_NAME.encode("utf-8") + b"\0" + first["lexical"].encode("utf-8")
         )
         if first["digest"] != expected_digest:
             errors.append("bootstrap handover digest did not bind product and target")
@@ -2374,7 +2403,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
                 {
                     "schema_version": 1,
                     "product_name": module.PRODUCT_NAME,
-                    "canonical_target": first["canonical"],
+                    "lexical_target": first["lexical"],
                     "target_sha256": "0" * 64,
                 },
                 sort_keys=True,
@@ -2647,6 +2676,101 @@ def validate_unsupported_host_preflight_no_touch_smoke(module: Any, errors: list
                 )
 
 
+def validate_target_command_external_lock_order_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-lock-order-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        command_argvs: tuple[tuple[str, list[str], str], ...] = (
+            ("status", ["status", "--target", str(target)], "inspect_target"),
+            ("plan", ["plan", "--target", str(target)], "plan_setup"),
+            ("install", ["install", "--target", str(target)], "mutate_setup"),
+            ("update", ["update", "--target", str(target)], "mutate_setup"),
+            ("switch", ["switch", "--target", str(target)], "mutate_setup"),
+            (
+                "migrate",
+                ["migrate", "--profile", "safe", "--target", str(target)],
+                "migrate_setup",
+            ),
+            ("restore", ["restore", "--backup", "0", "--target", str(target)], "restore_slot"),
+            ("remove", ["remove", "--target", str(target)], "remove_setup"),
+            ("software-status", ["software-status", "--target", str(target)], "software_status"),
+            ("install-cli", ["install-cli", "--target", str(target)], "install_cursor_cli"),
+            ("update-cli", ["update-cli", "--target", str(target)], "install_cursor_cli"),
+            ("remove-cli", ["remove-cli", "--target", str(target)], "remove_cursor_cli"),
+            ("launch", ["launch", "--target", str(target), "--", "--help"], "launch_cursor"),
+        )
+
+        for command, argv, work_attr in command_argvs:
+            events: list[str] = []
+            locked = {"value": False}
+
+            def fake_host() -> None:
+                events.append("host")
+
+            def fake_lexical(raw: Any) -> str:
+                if events != ["host"]:
+                    errors.append(f"{command}: lexical target validation ran out of order: {events}")
+                events.append("lexical")
+                return os.fspath(raw)
+
+            @contextlib.contextmanager
+            def fake_bootstrap(raw: Any) -> Any:
+                if events != ["host", "lexical"]:
+                    errors.append(f"{command}: bootstrap lock ran out of order: {events}")
+                events.append("bootstrap-enter")
+                locked["value"] = True
+                try:
+                    yield
+                finally:
+                    locked["value"] = False
+                    events.append("bootstrap-exit")
+
+            def fake_resolve(raw: str) -> Path:
+                if not locked["value"]:
+                    raise AssertionError("resolve_target ran before bootstrap lock")
+                events.append("resolve")
+                return Path(raw)
+
+            def fake_work(*args: Any, **kwargs: Any) -> Any:
+                del args, kwargs
+                if not locked["value"]:
+                    raise AssertionError(f"{work_attr} ran before bootstrap lock")
+                events.append(work_attr)
+                if work_attr == "inspect_target":
+                    return {
+                        "state": "missing",
+                        "setup_id": None,
+                        "content_setup_id": None,
+                        "profile_id": None,
+                        "legacy_setup_id": None,
+                        "legacy": False,
+                        "drift": [],
+                        "builder_projection": "missing",
+                        "launchable": False,
+                    }
+                raise module.CursorSetupError("lock-order trace stop")
+
+            with (
+                with_restored_attr(module, "require_current_host_supported", fake_host),
+                with_restored_attr(module, "lexical_target_text", fake_lexical),
+                with_restored_attr(module, "bootstrap_lifecycle_lock", fake_bootstrap),
+                with_restored_attr(module, "resolve_target", fake_resolve),
+                with_restored_attr(module, work_attr, fake_work),
+            ):
+                try:
+                    module.run(module.parse_args(argv))
+                except module.CursorSetupError as exc:
+                    if "lock-order trace stop" not in str(exc):
+                        errors.append(f"{command}: failed with unexpected trace error: {exc}")
+                except AssertionError as exc:
+                    errors.append(f"{command}: {exc}")
+                except BaseException as exc:  # noqa: BLE001 - public smoke serializes failures.
+                    errors.append(f"{command}: lock-order trace raised unexpectedly: {exc}")
+            expected_events = ["host", "lexical", "bootstrap-enter", "resolve", work_attr]
+            if events[:5] != expected_events or events[-1:] != ["bootstrap-exit"]:
+                errors.append(f"{command}: target command lock order mismatch: {events}")
+
+
 def validate_parser_json_error_smoke(errors: list[str]) -> None:
     help_completed = subprocess.run(
         [sys.executable, str(ROOT / "cli-tools" / "nddev_cursor_cli.py"), "--help"],
@@ -2790,6 +2914,10 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                     lambda: validate_unsupported_host_preflight_no_touch_smoke(module, errors),
                 ),
                 (
+                    "target command external lock order",
+                    lambda: validate_target_command_external_lock_order_smoke(module, errors),
+                ),
+                (
                     "parser JSON error",
                     lambda: validate_parser_json_error_smoke(errors),
                 ),
@@ -2890,12 +3018,17 @@ def main() -> int:
 
     if version is not None:
         missing = REQUIRED_VERSION_KEYS - set(version)
+        extra = set(version) - REQUIRED_VERSION_KEYS
         if missing:
             errors.append(f"build/version.json: missing required keys {sorted(missing)}")
+        if extra:
+            errors.append(f"build/version.json: unexpected keys {sorted(extra)}")
         if version.get("schema_version") != 3:
             errors.append("build/version.json: schema_version must be 3")
         if version.get("build_version") != build_version:
             errors.append("build/version.json:build_version must match VERSION")
+        if version.get("python_requires") != PYTHON_REQUIRES:
+            errors.append("build/version.json: python_requires must include macOS Python 3.9")
         if version.get("cursor_cli_identity") != "agent":
             errors.append("build/version.json: cursor_cli_identity must be agent")
         if version.get("cursor_cli_tested") != CURSOR_RELEASE_ID:
@@ -2980,14 +3113,14 @@ def main() -> int:
             errors.append("build/manifest.json: transaction lock mode must not be launch-only")
         if (
             transaction.get("bootstrap_lock")
-            != "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target)>.lock"
+            != BOOTSTRAP_LOCK_PATH
         ):
             errors.append("build/manifest.json: bootstrap lock path mismatch")
         if transaction.get("bootstrap_lock_file_mode") != "0600":
             errors.append("build/manifest.json: bootstrap lock mode mismatch")
         if (
             transaction.get("bootstrap_lock_binding")
-            != "schema/product/canonical-target/product-target-sha256 JSON"
+            != BOOTSTRAP_LOCK_BINDING
         ):
             errors.append("build/manifest.json: bootstrap lock binding mismatch")
         if transaction.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
@@ -3091,14 +3224,14 @@ def main() -> int:
             errors.append("config/nddev-contract.json: safety lock mode must not be launch-only")
         if (
             safety.get("bootstrap_lock")
-            != "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target)>.lock"
+            != BOOTSTRAP_LOCK_PATH
         ):
             errors.append("config/nddev-contract.json: bootstrap lock path mismatch")
         if safety.get("bootstrap_lock_file_mode") != "0600":
             errors.append("config/nddev-contract.json: bootstrap lock mode mismatch")
         if (
             safety.get("bootstrap_lock_binding")
-            != "schema/product/canonical-target/product-target-sha256 JSON"
+            != BOOTSTRAP_LOCK_BINDING
         ):
             errors.append("config/nddev-contract.json: bootstrap lock binding mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
@@ -3227,6 +3360,7 @@ def main() -> int:
     validate_public_doc_hygiene(errors)
     validate_public_manager_smokes(errors)
     validate_no_forbidden_public_paths(errors)
+    validate_python39_syntax(errors)
 
     if errors:
         print(f"validate_public_contracts.py: FAIL ({len(errors)} error(s))")
