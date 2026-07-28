@@ -914,10 +914,15 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         "control_lock_root",
         "open_control_lock_root_fd",
         "set_owner_directory_fd_mode",
-        "validate_or_write_bootstrap_binding",
+        "publish_missing_bootstrap_lock_file",
+        "rename_no_replace",
+        "RENAME_NOREPLACE_LINUX",
+        "RENAME_EXCL_DARWIN",
+        "write_bootstrap_lock_stage_file",
         "read_valid_bootstrap_binding",
         "require_lock_file_matches_fd(path, descriptor, \"bootstrap lock\")",
         "require_directory_matches_fd",
+        "fsync_directory(path.parent, \"bootstrap lock root\")",
         "threading.get_ident()",
         "PRODUCT_NAME.encode(\"utf-8\") + b\"\\0\" + canonical.encode(\"utf-8\")",
         "Path(\"/tmp\").resolve(strict=True)",
@@ -926,6 +931,9 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
     ):
         if needle not in manager_source:
             errors.append(f"nddev_cursor_cli.py must keep bootstrap lock evidence: {needle}")
+    for forbidden in ("fd_write_all", "os.ftruncate(descriptor, 0)"):
+        if forbidden in manager_source:
+            errors.append(f"nddev_cursor_cli.py must not mutate a published bootstrap lock: {forbidden}")
     if re.search(r"bootstrap.*unlink|unlink.*bootstrap", manager_source, re.IGNORECASE):
         errors.append("nddev_cursor_cli.py must not unlink bootstrap lock files")
     if re.search(r"os\.environ[^\n]*BOOTSTRAP|BOOTSTRAP[^\n]*os\.environ", manager_source):
@@ -1744,6 +1752,69 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
             )
 
 
+def validate_bootstrap_anchor_publication_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-publish-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        path, canonical, digest = module.bootstrap_lock_path(target)
+
+        path.write_bytes(b"")
+        path.chmod(module.OWNER_FILE_MODE)
+        empty_before = path.lstat()
+        try:
+            with module.bootstrap_lifecycle_lock(target):
+                pass
+        except module.CursorSetupError as exc:
+            if "bootstrap lock binding is missing" not in str(exc):
+                errors.append(f"empty bootstrap anchor failed with unexpected error: {exc}")
+        else:
+            errors.append("empty bootstrap anchor was adopted instead of failing closed")
+        empty_after = path.lstat()
+        if (
+            empty_before.st_dev,
+            empty_before.st_ino,
+            empty_before.st_size,
+            stat.S_IMODE(empty_before.st_mode),
+        ) != (
+            empty_after.st_dev,
+            empty_after.st_ino,
+            empty_after.st_size,
+            stat.S_IMODE(empty_after.st_mode),
+        ):
+            errors.append("empty bootstrap anchor was mutated during fail-closed validation")
+        if path.read_bytes() != b"":
+            errors.append("empty bootstrap anchor content changed during fail-closed validation")
+
+        path.unlink()
+        with module.bootstrap_lifecycle_lock(target):
+            pass
+        created = path.lstat()
+        if stat.S_IMODE(created.st_mode) != module.OWNER_FILE_MODE:
+            errors.append("published bootstrap anchor has unexpected mode")
+        if created.st_nlink != 1:
+            errors.append("published bootstrap anchor has a hard-link alias")
+        content = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            content.get("schema_version") != 1
+            or content.get("product_name") != module.PRODUCT_NAME
+            or content.get("canonical_target") != canonical
+            or content.get("target_sha256") != digest
+        ):
+            errors.append(f"published bootstrap anchor binding mismatch: {content}")
+        for stage in path.parent.glob(f".{path.name}.nddev.tmp.*"):
+            errors.append(f"bootstrap publication left staged lock residue: {stage.name}")
+
+        with module.bootstrap_lifecycle_lock(target):
+            pass
+        reused = path.lstat()
+        if (created.st_dev, created.st_ino, created.st_mtime_ns) != (
+            reused.st_dev,
+            reused.st_ino,
+            reused.st_mtime_ns,
+        ):
+            errors.append("complete bootstrap anchor was rewritten instead of reused")
+
+
 def validate_same_process_thread_bootstrap_denial_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-thread-smoke-") as tmp:
         root = Path(tmp)
@@ -1947,6 +2018,10 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                 (
                     "bootstrap lock handover",
                     lambda: validate_bootstrap_lock_handover_smoke(module, errors),
+                ),
+                (
+                    "bootstrap anchor publication",
+                    lambda: validate_bootstrap_anchor_publication_smoke(module, errors),
                 ),
                 (
                     "same-process bootstrap thread denial",

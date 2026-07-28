@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import ctypes
 import errno
 import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -47,6 +49,15 @@ OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 OWNER_EXEC_MODE = 0o700
 LOCK_HELD_DIRECTORY_MODE = 0o500
+AT_FDCWD_BY_SYSTEM = {"darwin": -2, "linux": -100}
+RENAME_EXCL_DARWIN = 0x00000004
+RENAME_NOREPLACE_LINUX = 1
+RENAMEAT2_SYSCALL_BY_MACHINE = {
+    "amd64": 316,
+    "x86_64": 316,
+    "aarch64": 276,
+    "arm64": 276,
+}
 METADATA_MAX_BYTES = 256 * 1024
 MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
 SOFTWARE_ARTIFACT_MAX_BYTES = 300 * 1024 * 1024
@@ -611,6 +622,78 @@ def canonical_target_text(target: Path) -> str:
     return str(parent.resolve(strict=True) / target.name)
 
 
+def fsync_directory(path: Path, label: str) -> None:
+    require_owner_private_directory(path, label)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened for fsync: {exc}")
+    try:
+        require_directory_matches_fd(path, descriptor, label, {OWNER_DIRECTORY_MODE})
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def rename_no_replace(source: Path, destination: Path, label: str) -> bool:
+    system = platform.system().lower()
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if system == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = libc.renameatx_np
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            AT_FDCWD_BY_SYSTEM["darwin"],
+            source_bytes,
+            AT_FDCWD_BY_SYSTEM["darwin"],
+            destination_bytes,
+            RENAME_EXCL_DARWIN,
+        )
+    elif system == "linux":
+        machine = platform.machine().lower()
+        syscall_number = RENAMEAT2_SYSCALL_BY_MACHINE.get(machine)
+        if syscall_number is None:
+            fail(f"{label} no-replace publication is unsupported on this architecture")
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+        result = syscall(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(AT_FDCWD_BY_SYSTEM["linux"]),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(AT_FDCWD_BY_SYSTEM["linux"]),
+            ctypes.c_char_p(destination_bytes),
+            ctypes.c_uint(RENAME_NOREPLACE_LINUX),
+        )
+    else:
+        fail(f"{label} no-replace publication is unsupported on this platform")
+    if result == 0:
+        return True
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        return False
+    if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+        fail(f"{label} no-replace publication primitive is unavailable")
+    fail(f"{label} no-replace publication failed: {os.strerror(error)}")
+
+
 def bootstrap_lock_system_root() -> Path:
     return Path("/tmp").resolve(strict=True)
 
@@ -645,32 +728,101 @@ def bootstrap_lock_path(target: Path) -> tuple[Path, str, str]:
     return bootstrap_lock_root() / f"{PRODUCT_NAME}-{digest}.lock", canonical, digest
 
 
-def open_bootstrap_lock_file(path: Path) -> int:
+def bootstrap_lock_binding(canonical: str, digest: str) -> bytes:
+    binding = canonical_json(
+        {
+            "schema_version": 1,
+            "product_name": PRODUCT_NAME,
+            "canonical_target": canonical,
+            "target_sha256": digest,
+        }
+    )
+    if len(binding) > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail("bootstrap lock binding exceeds the size limit")
+    return binding
+
+
+def write_bootstrap_lock_stage_file(stage: Path, content: bytes) -> None:
+    require_owner_private_directory(stage.parent, "bootstrap lock root")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(stage, flags, OWNER_FILE_MODE)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("staged bootstrap lock path is unsafe")
+        fail(f"staged bootstrap lock could not be opened: {exc}")
+    try:
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                fail("staged bootstrap lock write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        require_lock_file_matches_fd(stage, descriptor, "staged bootstrap lock")
+    finally:
+        os.close(descriptor)
+
+
+def cleanup_bootstrap_lock_stage_file(stage: Path) -> None:
+    if not path_exists_no_follow(stage):
+        return
+    require_regular_file(stage, "staged bootstrap lock", max_bytes=BOOTSTRAP_LOCK_MAX_BYTES)
+    stage.unlink()
+    fsync_directory(stage.parent, "bootstrap lock root")
+
+
+def publish_missing_bootstrap_lock_file(path: Path, canonical: str, digest: str) -> None:
     require_owner_private_directory(path.parent, "bootstrap lock root")
+    content = bootstrap_lock_binding(canonical, digest)
+    stage = path.with_name(
+        f".{path.name}.nddev.tmp.{os.getpid()}.{time.time_ns()}.{secrets.token_hex(8)}"
+    )
+    final_visible = False
+    try:
+        write_bootstrap_lock_stage_file(stage, content)
+        if not rename_no_replace(stage, path, "bootstrap lock"):
+            cleanup_bootstrap_lock_stage_file(stage)
+            return
+        final_visible = True
+        fsync_directory(path.parent, "bootstrap lock root")
+    except BaseException:
+        if path_exists_no_follow(stage):
+            cleanup_bootstrap_lock_stage_file(stage)
+        if final_visible:
+            # Final-path visibility is the anchor publication commit point.  The
+            # complete final rendezvous object is intentionally left in place on
+            # post-publication failures so concurrent waiters never split inodes.
+            with contextlib.suppress(BaseException):
+                require_regular_file(path, "bootstrap lock", max_bytes=BOOTSTRAP_LOCK_MAX_BYTES)
+        raise
+
+
+def open_bootstrap_lock_file(path: Path, canonical: str, digest: str) -> int:
+    require_owner_private_directory(path.parent, "bootstrap lock root")
+    if not path_exists_no_follow(path):
+        publish_missing_bootstrap_lock_file(path, canonical, digest)
     flags = os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    created = False
     try:
-        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, OWNER_FILE_MODE)
-        created = True
-    except FileExistsError:
-        try:
-            descriptor = os.open(path, flags)
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                fail("bootstrap lock path is unsafe")
-            raise
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        fail("bootstrap lock was not published")
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             fail("bootstrap lock path is unsafe")
         fail(f"bootstrap lock could not be opened: {exc}")
     try:
-        if created:
-            os.fchmod(descriptor, OWNER_FILE_MODE)
         require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+        read_valid_bootstrap_binding(descriptor, path, canonical, digest)
     except BaseException:
         os.close(descriptor)
         raise
@@ -685,25 +837,13 @@ def fd_read_bounded(descriptor: int, label: str, max_bytes: int) -> bytes:
     return content
 
 
-def fd_write_all(descriptor: int, content: bytes) -> None:
-    os.ftruncate(descriptor, 0)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    view = memoryview(content)
-    while view:
-        written = os.write(descriptor, view)
-        if written == 0:
-            fail("bootstrap lock write made no progress")
-        view = view[written:]
-    os.fsync(descriptor)
-
-
 def read_valid_bootstrap_binding(
     descriptor: int, path: Path, canonical: str, digest: str
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
     content = fd_read_bounded(descriptor, "bootstrap lock", BOOTSTRAP_LOCK_MAX_BYTES)
     if not content.strip():
-        return None
+        fail("bootstrap lock binding is missing")
     try:
         loaded = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -719,27 +859,6 @@ def read_valid_bootstrap_binding(
     ):
         fail("bootstrap lock target binding mismatch")
     return loaded
-
-
-def validate_or_write_bootstrap_binding(
-    descriptor: int, path: Path, canonical: str, digest: str
-) -> None:
-    if read_valid_bootstrap_binding(descriptor, path, canonical, digest) is not None:
-        return
-    binding = canonical_json(
-        {
-            "schema_version": 1,
-            "product_name": PRODUCT_NAME,
-            "canonical_target": canonical,
-            "target_sha256": digest,
-        }
-    )
-    if len(binding) > BOOTSTRAP_LOCK_MAX_BYTES:
-        fail("bootstrap lock binding exceeds the size limit")
-    fd_write_all(descriptor, binding)
-    require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
-    if read_valid_bootstrap_binding(descriptor, path, canonical, digest) is None:
-        fail("bootstrap lock binding was not persisted")
 
 
 @contextlib.contextmanager
@@ -782,7 +901,7 @@ def bootstrap_lifecycle_lock(target: Path) -> Iterator[None]:
                     held["depth"] -= 1
         return
     try:
-        descriptor = open_bootstrap_lock_file(path)
+        descriptor = open_bootstrap_lock_file(path, canonical, digest)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
@@ -790,7 +909,7 @@ def bootstrap_lifecycle_lock(target: Path) -> Iterator[None]:
                 fail("target is already locked")
             fail(f"bootstrap lock could not be acquired: {exc}")
         locked = True
-        validate_or_write_bootstrap_binding(descriptor, path, canonical, digest)
+        read_valid_bootstrap_binding(descriptor, path, canonical, digest)
         with _BOOTSTRAP_STATE_LOCK:
             held = _BOOTSTRAP_LOCKS.get(canonical)
             if held is None or held.get("owner") != owner:
