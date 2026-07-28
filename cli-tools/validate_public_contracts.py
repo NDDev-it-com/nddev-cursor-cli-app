@@ -25,7 +25,7 @@ PYTHON_REQUIRES = ">=3.9"
 BOOTSTRAP_LOCK_SCOPE = (
     "mutations publish or open the product anchor before target observation, then hand off to "
     "the canonical mutation anchor; read-only commands create no anchors and use cold no-anchor "
-    "double-check or shared product/canonical coordination"
+    "double-check with orphan canonical-anchor rejection or shared product/canonical coordination"
 )
 BOOTSTRAP_PRODUCT_ANCHOR = (
     "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/global.lock"
@@ -44,6 +44,13 @@ BOOTSTRAP_PUBLICATION = (
     "one bounded machine-named same-inode alias in the same private parent"
 )
 READ_ONLY_ANCHOR_COMMANDS = ["status", "plan", "software-status"]
+CLEANUP_PENDING_PATH = ".nddev-cursor-cli/cleanup-pending"
+CLEANUP_PENDING_JOURNAL = ".nddev-cursor-cli/cleanup-pending/journal.json"
+CLEANUP_PENDING_SEMANTICS = (
+    "immutable schema-1 cleanup journal with identity-bound relative tombstones; "
+    "read-only validates and reports cleanup_pending without mutation; mutations drain before "
+    "active changes; malformed or orphaned cleanup state fails closed"
+)
 CONTENT_SETUP_IDS = ["nddev-builder"]
 PROFILE_IDS = ["full-auto", "safe"]
 BUILDER_TARGET_PATH = ".nddev-cursor-home/.cursor/plugins/local/nddev-builder"
@@ -202,7 +209,7 @@ SOFTWARE_LIFECYCLE_KEYS = {
     "update_command",
     "update_precondition",
 }
-STATUS_FIELDS = ["installed", "current", "present", "presence", "drift"]
+STATUS_FIELDS = ["installed", "current", "present", "presence", "drift", "cleanup_pending", "cleanup"]
 SUPPORTED_HOST_IDS = [
     "macos-arm64",
     "macos-x64",
@@ -1134,7 +1141,16 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         "with_read_bootstrap_target",
         "existing_bootstrap_lifecycle_lock",
         "BOOTSTRAP_PRODUCT_LOCK_NAME",
+        "canonical_anchor_present_no_create",
+        "fail_if_orphaned_canonical_anchor",
+        "cleanup_pending_root",
+        "cleanup_journal_path",
+        "publish_cleanup_pending",
+        "drain_cleanup_pending",
+        "recover_cleanup_journal_publication_alias",
+        "cleanup_tombstone_progress",
         'os.link(temporary, path)',
+        'os.link(temporary, journal)',
         "allowed_nlinks={1, 2}",
         'require_lock_file_matches_fd(path, descriptor, "bootstrap lock")',
         "require_directory_matches_fd",
@@ -3415,6 +3431,14 @@ def main() -> int:
             errors.append("build/manifest.json: read-only anchor commands mismatch")
         if transaction.get("read_only_cold_no_anchor_double_check") is not True:
             errors.append("build/manifest.json: read-only cold double-check mismatch")
+        if transaction.get("read_only_orphan_canonical_anchor") != "fail-closed":
+            errors.append("build/manifest.json: orphan canonical anchor policy mismatch")
+        if transaction.get("cleanup_pending_path") != CLEANUP_PENDING_PATH:
+            errors.append("build/manifest.json: cleanup pending path mismatch")
+        if transaction.get("cleanup_pending_journal") != CLEANUP_PENDING_JOURNAL:
+            errors.append("build/manifest.json: cleanup pending journal mismatch")
+        if transaction.get("cleanup_pending_semantics") != CLEANUP_PENDING_SEMANTICS:
+            errors.append("build/manifest.json: cleanup pending semantics mismatch")
         if transaction.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
             errors.append("build/manifest.json: mutable runtime TMPDIR mismatch")
         if (
@@ -3534,6 +3558,14 @@ def main() -> int:
             errors.append("config/nddev-contract.json: read-only anchor commands mismatch")
         if safety.get("read_only_cold_no_anchor_double_check") is not True:
             errors.append("config/nddev-contract.json: read-only cold double-check mismatch")
+        if safety.get("read_only_orphan_canonical_anchor") != "fail-closed":
+            errors.append("config/nddev-contract.json: orphan canonical anchor policy mismatch")
+        if safety.get("cleanup_pending_path") != CLEANUP_PENDING_PATH:
+            errors.append("config/nddev-contract.json: cleanup pending path mismatch")
+        if safety.get("cleanup_pending_journal") != CLEANUP_PENDING_JOURNAL:
+            errors.append("config/nddev-contract.json: cleanup pending journal mismatch")
+        if safety.get("cleanup_pending_semantics") != CLEANUP_PENDING_SEMANTICS:
+            errors.append("config/nddev-contract.json: cleanup pending semantics mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
             errors.append("config/nddev-contract.json: backup path mismatch")
         if safety.get("backup_envelope_schema") != 3:

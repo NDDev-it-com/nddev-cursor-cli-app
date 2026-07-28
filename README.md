@@ -29,6 +29,9 @@ legacy sibling control state. Exact path names, modes, lock binding, backup
 layout, and drift labels are code-owned by
 `cli-tools/nddev_cursor_cli.py` and summarized by `config/nddev-contract.json`,
 `build/manifest.json`, and `status --target <target> --json`.
+Read-only status and plan validate cleanup-pending state without repairing it;
+later mutations drain valid pending cleanup before active changes, while
+malformed cleanup state fails closed.
 
 The lock model is a cooperative same-UID boundary for manager operations and a
 target-privacy boundary for other local users. It does not claim resistance to
