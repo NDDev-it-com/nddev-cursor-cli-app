@@ -61,6 +61,7 @@ CLEANUP_JOURNAL_MAX_BYTES = 2 * 1024 * 1024
 BOOTSTRAP_LOCK_ROOT_PREFIX = "nddev-cursor-cli-app-locks"
 BOOTSTRAP_PRODUCT_LOCK_NAME = "global.lock"
 BOOTSTRAP_LOCK_MAX_BYTES = 4096
+BOOTSTRAP_NAMESPACE_MAX_ENTRIES = 256
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 OWNER_EXEC_MODE = 0o700
@@ -1347,6 +1348,176 @@ def is_bootstrap_publication_alias(candidate: Path, final: Path) -> bool:
     return all(part.isdecimal() and 1 <= len(part) <= 32 for part in parts)
 
 
+def parse_bootstrap_anchor_final_name(name: str) -> tuple[str, str] | None:
+    if name == BOOTSTRAP_PRODUCT_LOCK_NAME:
+        return "product", bootstrap_lock_digest(PRODUCT_LIFECYCLE_LOCK_KEY)
+    prefix = f"{PRODUCT_NAME}-"
+    suffix = ".lock"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    digest = name[len(prefix) : -len(suffix)]
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        return None
+    return "target", digest
+
+
+def parse_bootstrap_publication_alias_name(name: str) -> tuple[str, str] | None:
+    marker = ".nddev-anchor-tmp."
+    if not name.startswith(".") or marker not in name:
+        return None
+    final_name = name[1 : name.index(marker)]
+    parsed = parse_bootstrap_anchor_final_name(final_name)
+    if parsed is None:
+        return None
+    final = Path(final_name)
+    if not is_bootstrap_publication_alias(Path(name), final):
+        return None
+    return parsed
+
+
+def read_bootstrap_namespace_entry_binding(
+    path: Path, role: str, digest: str
+) -> dict[str, Any]:
+    content = read_snapshot_file(
+        path,
+        "bootstrap product namespace entry",
+        max_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+        allow_hardlinks=True,
+    )
+    if not content.strip():
+        fail("bootstrap product namespace contains an empty bootstrap lock entry")
+    try:
+        loaded = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("bootstrap product namespace contains a malformed bootstrap lock entry")
+    if not isinstance(loaded, dict):
+        fail("bootstrap product namespace entry must contain a JSON object")
+    require_exact_keys(loaded, BOOTSTRAP_LOCK_KEYS_V1, "bootstrap product namespace entry")
+    expected_key = PRODUCT_LIFECYCLE_LOCK_KEY if role == "product" else loaded["lock_key"]
+    if (
+        loaded["schema_version"] != 1
+        or loaded["product_name"] != PRODUCT_NAME
+        or loaded["target_sha256"] != digest
+        or not isinstance(loaded["lock_key"], str)
+        or loaded["lock_key"] != expected_key
+    ):
+        fail("bootstrap product namespace entry binding mismatch")
+    return loaded
+
+
+def capture_bootstrap_namespace_entry(path: Path) -> dict[str, Any]:
+    name = path.name
+    parsed = parse_bootstrap_anchor_final_name(name)
+    publication_alias = False
+    if parsed is None:
+        parsed = parse_bootstrap_publication_alias_name(name)
+        publication_alias = parsed is not None
+    if parsed is None:
+        fail("bootstrap product namespace contains an unknown entry")
+    role, digest = parsed
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail("bootstrap product namespace changed while it was inspected")
+    if stat.S_ISLNK(info.st_mode):
+        fail("bootstrap product namespace contains a symlink entry")
+    if not stat.S_ISREG(info.st_mode):
+        fail("bootstrap product namespace contains a non-file entry")
+    uid = current_user_id()
+    if uid is not None and info.st_uid != uid:
+        fail("bootstrap product namespace entry must be owned by the current user")
+    if stat.S_IMODE(info.st_mode) != OWNER_FILE_MODE:
+        fail("bootstrap product namespace entry has unsafe mode")
+    if info.st_nlink not in {1, 2}:
+        fail("bootstrap product namespace entry has an unsafe link count")
+    if info.st_size > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail("bootstrap product namespace entry exceeds the size limit")
+    binding = read_bootstrap_namespace_entry_binding(path, role, digest)
+    return {
+        "name": name,
+        "role": role,
+        "publication_alias": publication_alias,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "mtime_ns": info.st_mtime_ns,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "target_sha256": binding["target_sha256"],
+    }
+
+
+def capture_absent_product_anchor_namespace() -> dict[str, Any]:
+    root = bootstrap_lock_root_path()
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return {"kind": "absent"}
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        fail("bootstrap product namespace must be a real directory")
+    uid = current_user_id()
+    if uid is not None and root_info.st_uid != uid:
+        fail("bootstrap product namespace must be owned by the current user")
+    if stat.S_IMODE(root_info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail("bootstrap product namespace has unsafe mode")
+    try:
+        children = sorted(root.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        fail(f"bootstrap product namespace could not be inspected: {exc}")
+    if len(children) > BOOTSTRAP_NAMESPACE_MAX_ENTRIES:
+        fail("bootstrap product namespace exceeds the entry limit")
+    entries = [capture_bootstrap_namespace_entry(child) for child in children]
+    try:
+        after_info = root.lstat()
+    except FileNotFoundError:
+        fail("bootstrap product namespace changed while it was inspected")
+    if (after_info.st_dev, after_info.st_ino) != (root_info.st_dev, root_info.st_ino):
+        fail("bootstrap product namespace changed while it was inspected")
+    return {
+        "kind": "dir",
+        "device": root_info.st_dev,
+        "inode": root_info.st_ino,
+        "mode": stat.S_IMODE(root_info.st_mode),
+        "mtime_ns": root_info.st_mtime_ns,
+        "size": root_info.st_size,
+        "entries": entries,
+    }
+
+
+def cold_namespace_has_product_anchor(state: dict[str, Any]) -> bool:
+    return any(
+        entry.get("role") == "product" and not entry.get("publication_alias")
+        for entry in state.get("entries", [])
+        if isinstance(entry, dict)
+    )
+
+
+def require_cold_namespace_empty(state: dict[str, Any]) -> None:
+    entries = state.get("entries", [])
+    if entries:
+        fail("bootstrap product namespace is not empty without the product anchor")
+
+
+def read_without_product_anchor_if_namespace_stable(
+    lexical: str, function: Any, *args: Any, **kwargs: Any
+) -> tuple[bool, Any]:
+    before = capture_absent_product_anchor_namespace()
+    if cold_namespace_has_product_anchor(before):
+        return False, None
+    require_cold_namespace_empty(before)
+    target = resolve_target(lexical)
+    result = function(target, *args, **kwargs)
+    if product_anchor_present_no_create():
+        return False, None
+    after = capture_absent_product_anchor_namespace()
+    if cold_namespace_has_product_anchor(after):
+        return False, None
+    require_cold_namespace_empty(after)
+    if after != before:
+        fail("bootstrap product namespace changed during cold read")
+    return True, result
+
+
 def recover_bootstrap_publication_alias(
     path: Path, descriptor: int, lock_key: str, digest: str
 ) -> None:
@@ -1725,29 +1896,25 @@ def with_read_bootstrap_target(target_input: Any, function: Any, *args: Any, **k
     require_current_host_supported()
     lexical = lexical_target_text(target_input)
     if not product_anchor_present_no_create():
-        target = resolve_target(lexical)
-        fail_if_orphaned_canonical_anchor(target)
-        result = function(target, *args, **kwargs)
-        if not product_anchor_present_no_create():
+        stable, result = read_without_product_anchor_if_namespace_stable(
+            lexical, function, *args, **kwargs
+        )
+        if stable:
             return result
 
     product_context = product_lifecycle_lock(create=False, exclusive=False)
     product_locked = product_context.__enter__()
     if not product_locked:
         try:
-            target = resolve_target(lexical)
-            fail_if_orphaned_canonical_anchor(target)
-            result = function(target, *args, **kwargs)
-            if product_anchor_present_no_create():
-                retry = True
-            else:
-                retry = False
+            stable, result = read_without_product_anchor_if_namespace_stable(
+                lexical, function, *args, **kwargs
+            )
         except BaseException:
             product_context.__exit__(*sys.exc_info())
             raise
         else:
             product_context.__exit__(None, None, None)
-            if retry:
+            if not stable:
                 return with_read_bootstrap_target(target_input, function, *args, **kwargs)
             return result
     target_context: Any = None

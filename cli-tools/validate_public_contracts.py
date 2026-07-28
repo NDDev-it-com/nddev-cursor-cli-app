@@ -25,7 +25,7 @@ PYTHON_REQUIRES = ">=3.9"
 BOOTSTRAP_LOCK_SCOPE = (
     "mutations publish or open the product anchor before target observation, then hand off to "
     "the canonical mutation anchor; read-only commands create no anchors and use cold no-anchor "
-    "double-check with orphan canonical-anchor rejection or shared product/canonical coordination"
+    "double-check with whole product-namespace emptiness or shared product/canonical coordination"
 )
 BOOTSTRAP_PRODUCT_ANCHOR = (
     "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/global.lock"
@@ -1178,6 +1178,11 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         "is_bootstrap_publication_alias",
         "open_or_publish_bootstrap_anchor",
         "product_anchor_present_no_create",
+        "BOOTSTRAP_NAMESPACE_MAX_ENTRIES",
+        "capture_absent_product_anchor_namespace",
+        "capture_bootstrap_namespace_entry",
+        "read_without_product_anchor_if_namespace_stable",
+        "require_cold_namespace_empty",
         "with_read_bootstrap_target",
         "existing_bootstrap_lifecycle_lock",
         "BOOTSTRAP_PRODUCT_LOCK_NAME",
