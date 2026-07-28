@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -929,7 +930,10 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
             errors.append(f"nddev_cursor_cli.py must keep explicit launch workspace evidence: {needle}")
     for needle in (
         "bootstrap_lifecycle_lock",
+        "lexical_target_path",
         "BOOTSTRAP_LOCK_ROOT_PREFIX",
+        "BOOTSTRAP_PRODUCT_ANCHOR_NAME",
+        "BOOTSTRAP_PRODUCT_ANCHOR_CANONICAL_TARGET",
         "CONTROL_LOCKS_NAME",
         "control_lock_root",
         "open_control_lock_root_fd",
@@ -938,7 +942,16 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         "rename_no_replace",
         "RENAME_NOREPLACE_LINUX",
         "RENAME_EXCL_DARWIN",
+        "BOOTSTRAP_LOCK_STAGE_MAX_ALIASES",
         "write_bootstrap_lock_stage_file",
+        "validated_bootstrap_lock_stage_aliases",
+        "unlink_validated_bootstrap_lock_stage_file",
+        "promote_bootstrap_lock_stage_alias",
+        "drain_bootstrap_lock_stage_aliases",
+        "bootstrap_read_locked",
+        "run_under_product_shared_lock",
+        "run_cold_bootstrap_read",
+        "bootstrap_lock_cold_namespace_snapshot",
         "read_valid_bootstrap_binding",
         "require_lock_file_matches_fd(path, descriptor, \"bootstrap lock\")",
         "require_directory_matches_fd",
@@ -954,10 +967,15 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
     for forbidden in ("fd_write_all", "os.ftruncate(descriptor, 0)"):
         if forbidden in manager_source:
             errors.append(f"nddev_cursor_cli.py must not mutate a published bootstrap lock: {forbidden}")
-    if re.search(r"bootstrap.*unlink|unlink.*bootstrap", manager_source, re.IGNORECASE):
-        errors.append("nddev_cursor_cli.py must not unlink bootstrap lock files")
+    if (
+        "if not rename_no_replace(stage, path, \"bootstrap lock\"):\n"
+        "            cleanup_bootstrap_lock_stage_file(stage)" in manager_source
+    ):
+        errors.append("nddev_cursor_cli.py must not pre-clean a complete staged bootstrap lock")
     if re.search(r"os\.environ[^\n]*BOOTSTRAP|BOOTSTRAP[^\n]*os\.environ", manager_source):
         errors.append("nddev_cursor_cli.py must not expose a bootstrap lock env override")
+    if "target = resolve_target(args.target)" in manager_source:
+        errors.append("nddev_cursor_cli.py must not resolve target before command coordination")
 
     artifact = b"official artifact bytes"
     asset_path = "linux/x64/agent-cli-package.tar.gz"
@@ -1771,6 +1789,23 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
         second = read_result(result_b)
         if (first["device"], first["inode"]) != (second["device"], second["inode"]):
             errors.append("bootstrap handover did not reuse the persistent lock inode")
+        ready_other = root / "ready-other"
+        release_other = root / "release-other"
+        result_other = root / "result-other.json"
+        error_other = root / "error-other.txt"
+        holder_other = start_bootstrap_lock_holder(
+            module, root / "other-target", ready_other, release_other, result_other, error_other
+        )
+        if wait_for_holder_ready(
+            holder_other, ready_other, error_other, errors, "bootstrap handover other target"
+        ):
+            other = read_result(result_other)
+            if other["path"] == second["path"]:
+                errors.append("bootstrap handover reused a target lock for a different target")
+            release_other.write_text("release\n", encoding="utf-8")
+            wait_for_holder_exit(
+                holder_other, error_other, errors, "bootstrap handover other target"
+            )
         assert_concurrent_command_denied(
             lambda: run_concurrent_status(module, target),
             errors,
@@ -1879,6 +1914,683 @@ def validate_bootstrap_anchor_publication_smoke(module: Any, errors: list[str]) 
             reused.st_mtime_ns,
         ):
             errors.append("complete bootstrap anchor was rewritten instead of reused")
+
+
+def snapshot_bootstrap_path(path: Path) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    result: dict[str, Any] = {
+        "exists": True,
+        "mode": stat.S_IMODE(info.st_mode),
+        "kind": stat.S_IFMT(info.st_mode),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+    }
+    if stat.S_ISLNK(info.st_mode):
+        result["link"] = os.readlink(path)
+    elif stat.S_ISREG(info.st_mode):
+        result["bytes"] = path.read_bytes()
+    elif stat.S_ISDIR(info.st_mode):
+        result["children"] = sorted(child.name for child in path.iterdir())
+    return result
+
+
+def create_valid_bootstrap_stage(module: Any, path: Path, canonical: str, digest: str) -> Path:
+    stage = module.bootstrap_lock_stage_path(path)
+    module.write_bootstrap_lock_stage_file(
+        stage,
+        module.bootstrap_lock_binding(canonical, digest),
+    )
+    return stage
+
+
+def expect_pending_stage_read_only_failure(
+    module: Any, target: Path, stage: Path, final: Path, errors: list[str], label: str
+) -> None:
+    before_stage = snapshot_bootstrap_path(stage)
+    before_final = snapshot_bootstrap_path(final)
+    try:
+        module.inspect_target(target)
+    except module.CursorSetupError as exc:
+        message = str(exc)
+        if (
+            "bootstrap lock staged publication is pending" not in message
+            and "bootstrap product lock staged publication is pending" not in message
+            and "bootstrap lock namespace is not empty for cold read" not in message
+        ):
+            errors.append(f"{label} read-only failed with unexpected error: {exc}")
+    else:
+        errors.append(f"{label} read-only unexpectedly recovered staged bootstrap lock")
+    if snapshot_bootstrap_path(stage) != before_stage:
+        errors.append(f"{label} read-only mutated staged bootstrap lock")
+    if snapshot_bootstrap_path(final) != before_final:
+        errors.append(f"{label} read-only mutated final bootstrap lock")
+
+
+def validate_bootstrap_stage_recovery_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-stage-recovery-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        final, canonical, digest = module.bootstrap_lock_path(target)
+        stage = create_valid_bootstrap_stage(module, final, canonical, digest)
+        expect_pending_stage_read_only_failure(
+            module, target, stage, final, errors, "bootstrap stage recovery"
+        )
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        if stage.exists() or stage.is_symlink():
+            errors.append("bootstrap stage recovery left the promoted stage alias behind")
+        if not final.exists() or final.is_symlink():
+            errors.append("bootstrap stage recovery did not publish the final anchor")
+        else:
+            info = final.lstat()
+            if info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != module.OWNER_FILE_MODE:
+                errors.append("bootstrap stage recovery final anchor identity is unsafe")
+
+
+def validate_bootstrap_cold_read_no_create_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-cold-read-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        system_root = module.bootstrap_lock_system_root()
+        before = sorted(path.relative_to(system_root).as_posix() for path in system_root.rglob("*"))
+        state = module.inspect_target(target)
+        after = sorted(path.relative_to(system_root).as_posix() for path in system_root.rglob("*"))
+        if state["state"] != "missing":
+            errors.append(f"cold read no-create smoke returned unexpected state: {state['state']}")
+        if after != before:
+            errors.append(f"cold read no-create smoke created bootstrap residue: before={before} after={after}")
+
+
+def validate_bootstrap_product_first_observation_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-product-first-") as tmp:
+        root = Path(tmp)
+        injected_system_root = root / "system-tmp"
+        injected_system_root.mkdir(mode=0o700)
+        injected_system_root.chmod(0o1777)
+        target = root / "target"
+        events: list[str] = []
+        state = {
+            "phase": "",
+            "product_locked": False,
+            "cold_snapshot": False,
+        }
+        real_resolve_target = module.resolve_target
+        real_canonical_target_text = module.canonical_target_text
+        real_acquire_flock = module.acquire_flock
+        real_cold_snapshot = module.bootstrap_lock_cold_namespace_snapshot
+
+        def injected_bootstrap_system_root() -> Path:
+            return injected_system_root.resolve(strict=True)
+
+        def guarded_acquire_flock(
+            descriptor: int, label: str, *, exclusive: bool, blocking: bool
+        ) -> None:
+            real_acquire_flock(descriptor, label, exclusive=exclusive, blocking=blocking)
+            if label == "bootstrap product lock":
+                state["product_locked"] = True
+                events.append(f"{state['phase']}:product-lock")
+
+        def guarded_cold_snapshot(path: Path) -> dict[str, Any]:
+            result = real_cold_snapshot(path)
+            state["cold_snapshot"] = True
+            events.append(f"{state['phase']}:cold-snapshot")
+            return result
+
+        def require_observation_allowed(label: str) -> None:
+            if state["phase"] == "mutate" and not state["product_locked"]:
+                raise module.CursorSetupError(f"{label} before product lock")
+            if (
+                state["phase"] == "cold-read"
+                and not state["product_locked"]
+                and not state["cold_snapshot"]
+            ):
+                raise module.CursorSetupError(f"{label} before cold namespace snapshot")
+
+        def guarded_resolve_target(raw_target: str) -> Path:
+            require_observation_allowed("resolve_target")
+            events.append(f"{state['phase']}:resolve-target")
+            return real_resolve_target(raw_target)
+
+        def guarded_canonical_target_text(candidate: Path) -> str:
+            require_observation_allowed("canonical_target_text")
+            events.append(f"{state['phase']}:canonical-target")
+            return real_canonical_target_text(candidate)
+
+        with with_restored_attr(
+            module, "bootstrap_lock_system_root", injected_bootstrap_system_root
+        ):
+            with with_restored_attr(module, "acquire_flock", guarded_acquire_flock):
+                with with_restored_attr(
+                    module, "bootstrap_lock_cold_namespace_snapshot", guarded_cold_snapshot
+                ):
+                    with with_restored_attr(module, "resolve_target", guarded_resolve_target):
+                        with with_restored_attr(
+                            module, "canonical_target_text", guarded_canonical_target_text
+                        ):
+                            state.update(
+                                {
+                                    "phase": "cold-read",
+                                    "product_locked": False,
+                                    "cold_snapshot": False,
+                                }
+                            )
+                            status = module.run(
+                                module.parse_args(["status", "--target", str(target)])
+                            )
+                            if status["state"] != "missing":
+                                errors.append(
+                                    f"product-first cold read returned unexpected state: {status}"
+                                )
+                            state.update(
+                                {
+                                    "phase": "mutate",
+                                    "product_locked": False,
+                                    "cold_snapshot": False,
+                                }
+                            )
+                            module.run(
+                                module.parse_args(["install", "--target", str(target)])
+                            )
+        cold_events = [event for event in events if event.startswith("cold-read:")]
+        mutate_events = [event for event in events if event.startswith("mutate:")]
+        if "cold-read:cold-snapshot" not in cold_events:
+            errors.append("product-first smoke did not snapshot cold namespace")
+        if "cold-read:product-lock" in cold_events:
+            errors.append("product-first cold read created or acquired product lock")
+        if (
+            "mutate:product-lock" not in mutate_events
+            or "mutate:resolve-target" not in mutate_events
+            or mutate_events.index("mutate:product-lock")
+            > mutate_events.index("mutate:resolve-target")
+        ):
+            errors.append(f"product-first mutate observation order was invalid: {mutate_events}")
+
+
+def validate_bootstrap_product_stage_recovery_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-product-stage-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        product_path, product_canonical, product_digest = module.bootstrap_product_lock_path(
+            create_root=True
+        )
+        stage = create_valid_bootstrap_stage(
+            module, product_path, product_canonical, product_digest
+        )
+        expect_pending_stage_read_only_failure(
+            module, target, stage, product_path, errors, "bootstrap product stage recovery"
+        )
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        if stage.exists() or stage.is_symlink():
+            errors.append("bootstrap product stage recovery left staged anchor residue")
+        if not product_path.exists() or product_path.is_symlink():
+            errors.append("bootstrap product stage recovery did not publish product anchor")
+
+
+def validate_bootstrap_product_stage_sigkill_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-product-sigkill-") as tmp:
+        root = Path(tmp)
+        injected_system_root = root / "system-tmp"
+        injected_system_root.mkdir(mode=0o700)
+        injected_system_root.chmod(0o1777)
+
+        def injected_bootstrap_system_root() -> Path:
+            return injected_system_root.resolve(strict=True)
+
+        with with_restored_attr(
+            module, "bootstrap_lock_system_root", injected_bootstrap_system_root
+        ):
+            validate_bootstrap_product_stage_sigkill_smoke_in_root(module, root, errors)
+
+
+def validate_bootstrap_product_stage_sigkill_smoke_in_root(
+    module: Any, root: Path, errors: list[str]
+) -> None:
+    target = root / "target"
+    product_path, product_canonical, product_digest = module.bootstrap_product_lock_path(
+        create_root=True
+    )
+    ready = root / "ready"
+    child_error = root / "child-error.txt"
+    pid = os.fork()
+    if pid == 0:
+        try:
+            real_rename_no_replace = module.rename_no_replace
+
+            def barrier_rename_no_replace(source: Path, destination: Path, label: str) -> bool:
+                if destination == product_path:
+                    ready.write_text("ready\n", encoding="utf-8")
+                    while True:
+                        time.sleep(1)
+                return real_rename_no_replace(source, destination, label)
+
+            module.rename_no_replace = barrier_rename_no_replace
+            with module.bootstrap_lifecycle_lock(target):
+                pass
+        except BaseException as exc:  # noqa: BLE001 - serialize smoke failure.
+            child_error.write_text(str(exc), encoding="utf-8")
+            os._exit(2)
+        os._exit(0)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not ready.exists():
+        if child_error.exists():
+            break
+        time.sleep(0.02)
+    if child_error.exists():
+        os.waitpid(pid, 0)
+        errors.append(
+            f"bootstrap product SIGKILL child failed before barrier: {child_error.read_text()}"
+        )
+        return
+    if not ready.exists():
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        errors.append("bootstrap product SIGKILL child did not reach post-stage-fsync barrier")
+        return
+    os.kill(pid, signal.SIGKILL)
+    _, status = os.waitpid(pid, 0)
+    if not (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL):
+        errors.append(f"bootstrap product SIGKILL child exited with unexpected status {status}")
+        return
+
+    stages = module.validated_bootstrap_lock_stage_aliases(
+        product_path, product_canonical, product_digest
+    )
+    if len(stages) != 1:
+        errors.append(f"bootstrap product SIGKILL left {len(stages)} staged anchors, expected 1")
+        return
+    stage = stages[0]["path"]
+    if product_path.exists() or product_path.is_symlink():
+        errors.append("bootstrap product SIGKILL published final anchor before barrier")
+        return
+    expect_pending_stage_read_only_failure(
+        module, target, stage, product_path, errors, "bootstrap product SIGKILL recovery"
+    )
+    module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+    if stage.exists() or stage.is_symlink():
+        errors.append("bootstrap product SIGKILL recovery left staged anchor residue")
+    if not product_path.exists() or product_path.is_symlink():
+        errors.append("bootstrap product SIGKILL recovery did not publish final anchor")
+
+
+def validate_bootstrap_stage_sigkill_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-stage-sigkill-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        with module.bootstrap_lifecycle_lock(root / "seed-target"):
+            pass
+        final, canonical, digest = module.bootstrap_lock_path(target)
+        ready = root / "ready"
+        child_error = root / "child-error.txt"
+        pid = os.fork()
+        if pid == 0:
+            try:
+                real_rename_no_replace = module.rename_no_replace
+
+                def barrier_rename_no_replace(source: Path, destination: Path, label: str) -> bool:
+                    del source, destination, label
+                    ready.write_text("ready\n", encoding="utf-8")
+                    while True:
+                        time.sleep(1)
+
+                module.rename_no_replace = barrier_rename_no_replace
+                with module.bootstrap_lifecycle_lock(target):
+                    pass
+            except BaseException as exc:  # noqa: BLE001 - serialize smoke failure.
+                child_error.write_text(str(exc), encoding="utf-8")
+                os._exit(2)
+            os._exit(0)
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not ready.exists():
+            if child_error.exists():
+                break
+            time.sleep(0.02)
+        if child_error.exists():
+            os.waitpid(pid, 0)
+            errors.append(f"bootstrap SIGKILL child failed before barrier: {child_error.read_text()}")
+            return
+        if not ready.exists():
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            errors.append("bootstrap SIGKILL child did not reach post-stage-fsync barrier")
+            return
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        if not (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL):
+            errors.append(f"bootstrap SIGKILL child exited with unexpected status {status}")
+            return
+
+        stages = module.validated_bootstrap_lock_stage_aliases(final, canonical, digest)
+        if len(stages) != 1:
+            errors.append(f"bootstrap SIGKILL left {len(stages)} staged anchors, expected 1")
+            return
+        stage = stages[0]["path"]
+        if final.exists() or final.is_symlink():
+            errors.append("bootstrap SIGKILL published final anchor before barrier")
+            return
+        expect_pending_stage_read_only_failure(
+            module, target, stage, final, errors, "bootstrap SIGKILL recovery"
+        )
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        if stage.exists() or stage.is_symlink():
+            errors.append("bootstrap SIGKILL recovery left staged anchor residue")
+        if not final.exists() or final.is_symlink():
+            errors.append("bootstrap SIGKILL recovery did not publish final anchor")
+
+
+def deterministic_bootstrap_stage_path(module: Any, path: Path, token: str) -> Path:
+    return path.with_name(
+        f"{module.bootstrap_lock_stage_prefix(path)}{os.getpid()}.1.{token}"
+    )
+
+
+def validate_bootstrap_multiple_stage_recovery_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-multiple-stage-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        with module.bootstrap_lifecycle_lock(root / "seed-target"):
+            pass
+        final, canonical, digest = module.bootstrap_lock_path(target)
+        for _ in range(module.BOOTSTRAP_LOCK_STAGE_MAX_ALIASES):
+            create_valid_bootstrap_stage(module, final, canonical, digest)
+        stages = module.validated_bootstrap_lock_stage_aliases(final, canonical, digest)
+        if len(stages) != module.BOOTSTRAP_LOCK_STAGE_MAX_ALIASES:
+            errors.append("bootstrap multiple stage smoke did not create the bounded stage set")
+            return
+        expected_promoted = stages[0]
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        if any(snapshot_bootstrap_path(stage["path"])["exists"] for stage in stages):
+            errors.append("bootstrap multiple stage recovery left staged residue")
+        final_info = final.lstat()
+        if (final_info.st_dev, final_info.st_ino) != (
+            expected_promoted["device"],
+            expected_promoted["inode"],
+        ):
+            errors.append("bootstrap multiple stage recovery did not promote deterministic winner")
+
+
+def validate_bootstrap_concurrent_winner_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-winner-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        final, canonical, digest = module.bootstrap_lock_path(target)
+        stage = deterministic_bootstrap_stage_path(module, final, "0" * 16)
+        real_stage_path = module.bootstrap_lock_stage_path
+        real_rename_no_replace = module.rename_no_replace
+
+        def fixed_stage_path(path: Path) -> Path:
+            if path == final:
+                return stage
+            return real_stage_path(path)
+
+        def winner_rename_no_replace(source: Path, destination: Path, label: str) -> bool:
+            if source == stage and destination == final:
+                if not real_rename_no_replace(source, destination, label):
+                    return False
+                return False
+            return real_rename_no_replace(source, destination, label)
+
+        with with_restored_attr(module, "bootstrap_lock_stage_path", fixed_stage_path):
+            with with_restored_attr(module, "rename_no_replace", winner_rename_no_replace):
+                residue = module.publish_missing_bootstrap_lock_file(final, canonical, digest)
+        if residue is not None:
+            errors.append("bootstrap concurrent winner returned staged residue instead of won race")
+        if stage.exists() or stage.is_symlink():
+            errors.append("bootstrap concurrent winner left missing-own-stage residue")
+        try:
+            module.validate_existing_bootstrap_lock_file(final, canonical, digest)
+        except module.CursorSetupError as exc:
+            errors.append(f"bootstrap concurrent winner did not publish valid final: {exc}")
+
+
+def validate_bootstrap_valid_eexist_stage_survives_to_drain_smoke(
+    module: Any, errors: list[str]
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-valid-eexist-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        final, canonical, digest = module.bootstrap_lock_path(target)
+        module.publish_missing_bootstrap_lock_file(final, canonical, digest)
+        final_before = snapshot_bootstrap_path(final)
+        stage = deterministic_bootstrap_stage_path(module, final, "2" * 16)
+        real_stage_path = module.bootstrap_lock_stage_path
+
+        def fixed_stage_path(path: Path) -> Path:
+            if path == final:
+                return stage
+            return real_stage_path(path)
+
+        with with_restored_attr(module, "bootstrap_lock_stage_path", fixed_stage_path):
+            residue = module.publish_missing_bootstrap_lock_file(final, canonical, digest)
+        if residue != stage:
+            errors.append("bootstrap valid EEXIST did not return the surviving staged anchor")
+        stage_before = snapshot_bootstrap_path(stage)
+        if not stage_before["exists"]:
+            errors.append("bootstrap valid EEXIST removed staged anchor before final lock")
+            return
+        if snapshot_bootstrap_path(final) != final_before:
+            errors.append("bootstrap valid EEXIST mutated final anchor before drain")
+        descriptor = module.open_existing_bootstrap_lock_file(final)
+        try:
+            module.acquire_flock(
+                descriptor, "bootstrap valid EEXIST drain smoke", exclusive=True, blocking=True
+            )
+            module.read_valid_bootstrap_binding(descriptor, final, canonical, digest)
+            if snapshot_bootstrap_path(stage) != stage_before:
+                errors.append("bootstrap valid EEXIST stage changed before locked drain")
+            module.drain_bootstrap_lock_stage_aliases(final, descriptor, canonical, digest)
+        finally:
+            module.release_flock(descriptor)
+            os.close(descriptor)
+        if stage.exists() or stage.is_symlink():
+            errors.append("bootstrap valid EEXIST locked drain left staged anchor")
+        if snapshot_bootstrap_path(final) != final_before:
+            errors.append("bootstrap valid EEXIST locked drain mutated final anchor")
+
+
+def validate_bootstrap_malformed_winner_cleanup_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-malformed-winner-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        final, canonical, digest = module.bootstrap_lock_path(target)
+        final.write_bytes(b"{not-json\n")
+        final.chmod(module.OWNER_FILE_MODE)
+        module.fsync_directory(final.parent, "bootstrap lock root")
+        before_parent = snapshot_bootstrap_path(final.parent)
+        before_final = snapshot_bootstrap_path(final)
+        stage = deterministic_bootstrap_stage_path(module, final, "1" * 16)
+        real_stage_path = module.bootstrap_lock_stage_path
+
+        def fixed_stage_path(path: Path) -> Path:
+            if path == final:
+                return stage
+            return real_stage_path(path)
+
+        with with_restored_attr(module, "bootstrap_lock_stage_path", fixed_stage_path):
+            try:
+                module.publish_missing_bootstrap_lock_file(final, canonical, digest)
+            except module.CursorSetupError:
+                pass
+            else:
+                errors.append("bootstrap malformed winner was accepted")
+        if stage.exists() or stage.is_symlink():
+            errors.append("bootstrap malformed winner left own staged residue")
+        if snapshot_bootstrap_path(final) != before_final:
+            errors.append("bootstrap malformed winner mutated final anchor")
+        if snapshot_bootstrap_path(final.parent) != before_parent:
+            errors.append("bootstrap malformed winner did not restore parent metadata")
+
+
+def validate_bootstrap_ordinary_cleanup_replacement_smoke(
+    module: Any, errors: list[str]
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-ordinary-replace-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        final, canonical, digest = module.bootstrap_lock_path(target)
+        stage = deterministic_bootstrap_stage_path(module, final, "3" * 16)
+        real_stage_path = module.bootstrap_lock_stage_path
+        replacement_snapshot: dict[str, Any] = {}
+
+        def fixed_stage_path(path: Path) -> Path:
+            if path == final:
+                return stage
+            return real_stage_path(path)
+
+        def replace_then_fail(source: Path, destination: Path, label: str) -> bool:
+            del destination, label
+            source.unlink()
+            module.write_bootstrap_lock_stage_file(
+                source,
+                module.bootstrap_lock_binding(canonical, digest),
+            )
+            replacement_snapshot["stage"] = snapshot_bootstrap_path(source)
+            raise module.CursorSetupError("injected publication failure after stage replacement")
+
+        with with_restored_attr(module, "bootstrap_lock_stage_path", fixed_stage_path):
+            with with_restored_attr(module, "rename_no_replace", replace_then_fail):
+                try:
+                    module.publish_missing_bootstrap_lock_file(final, canonical, digest)
+                except module.CursorSetupError as exc:
+                    if "staged bootstrap lock changed" not in str(exc):
+                        errors.append(
+                            "bootstrap ordinary cleanup replacement failed with unexpected error: "
+                            f"{exc}"
+                        )
+                else:
+                    errors.append("bootstrap ordinary cleanup replacement was accepted")
+        if snapshot_bootstrap_path(stage) != replacement_snapshot.get("stage"):
+            errors.append("bootstrap ordinary cleanup removed or changed replacement stage")
+        if final.exists() or final.is_symlink():
+            errors.append("bootstrap ordinary cleanup replacement unexpectedly published final")
+
+
+def validate_bootstrap_stage_replacement_before_unlink_smoke(
+    module: Any, errors: list[str]
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-replace-unlink-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        final, canonical, digest = module.bootstrap_lock_path(target)
+        module.publish_missing_bootstrap_lock_file(final, canonical, digest)
+        final_before = snapshot_bootstrap_path(final)
+        stage = create_valid_bootstrap_stage(module, final, canonical, digest)
+        original_validated = module.validated_bootstrap_lock_stage_aliases
+        replacement_snapshot: dict[str, Any] = {}
+
+        def stale_stage_aliases(path: Path, stage_canonical: str, stage_digest: str) -> list[dict[str, Any]]:
+            stages = original_validated(path, stage_canonical, stage_digest)
+            if path == final and stages:
+                stage_path = stages[0]["path"]
+                stage_path.unlink()
+                module.write_bootstrap_lock_stage_file(
+                    stage_path,
+                    module.bootstrap_lock_binding(stage_canonical, stage_digest),
+                )
+                replacement_snapshot["stage"] = snapshot_bootstrap_path(stage_path)
+            return stages
+
+        descriptor = module.open_existing_bootstrap_lock_file(final)
+        try:
+            module.acquire_flock(
+                descriptor, "bootstrap replacement smoke", exclusive=True, blocking=True
+            )
+            with with_restored_attr(
+                module, "validated_bootstrap_lock_stage_aliases", stale_stage_aliases
+            ):
+                try:
+                    module.drain_bootstrap_lock_stage_aliases(final, descriptor, canonical, digest)
+                except module.CursorSetupError as exc:
+                    if "staged bootstrap lock changed" not in str(exc):
+                        errors.append(
+                            "bootstrap replacement-before-unlink failed with unexpected error: "
+                            f"{exc}"
+                        )
+                else:
+                    errors.append("bootstrap replacement-before-unlink was accepted")
+        finally:
+            module.release_flock(descriptor)
+            os.close(descriptor)
+        if snapshot_bootstrap_path(final) != final_before:
+            errors.append("bootstrap replacement-before-unlink mutated final anchor")
+        if snapshot_bootstrap_path(stage) != replacement_snapshot.get("stage"):
+            errors.append("bootstrap replacement-before-unlink removed or changed replacement")
+
+
+def expect_bootstrap_stage_failure_unchanged(
+    module: Any,
+    target: Path,
+    final: Path,
+    paths: list[Path],
+    errors: list[str],
+    label: str,
+) -> None:
+    before = {str(path): snapshot_bootstrap_path(path) for path in [final, *paths]}
+    try:
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+    except module.CursorSetupError:
+        pass
+    else:
+        errors.append(f"{label} unexpectedly accepted unsafe staged bootstrap lock")
+    after = {str(path): snapshot_bootstrap_path(path) for path in [final, *paths]}
+    if after != before:
+        errors.append(f"{label} mutated unsafe staged bootstrap state")
+
+
+def validate_bootstrap_stage_adversarial_smoke(module: Any, errors: list[str]) -> None:
+    cases = ("invalid-name", "malformed-payload", "wrong-target", "symlink", "hardlink", "excessive")
+    for case in cases:
+        with tempfile.TemporaryDirectory(prefix=f"nddev-cursor-bootstrap-stage-{case}-") as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            final, canonical, digest = module.bootstrap_lock_path(target)
+            stage_paths: list[Path] = []
+            if case == "invalid-name":
+                stage = final.with_name(f"{module.bootstrap_lock_stage_prefix(final)}bad")
+                stage.write_bytes(module.bootstrap_lock_binding(canonical, digest))
+                stage.chmod(module.OWNER_FILE_MODE)
+                stage_paths.append(stage)
+            elif case == "malformed-payload":
+                stage = module.bootstrap_lock_stage_path(final)
+                stage.write_bytes(b"{not-json\n")
+                stage.chmod(module.OWNER_FILE_MODE)
+                stage_paths.append(stage)
+            elif case == "wrong-target":
+                stage = module.bootstrap_lock_stage_path(final)
+                _, other_canonical, other_digest = module.bootstrap_lock_path(root / "other-target")
+                module.write_bootstrap_lock_stage_file(
+                    stage,
+                    module.bootstrap_lock_binding(other_canonical, other_digest),
+                )
+                stage_paths.append(stage)
+            elif case == "symlink":
+                stage = module.bootstrap_lock_stage_path(final)
+                external = root / "external-stage"
+                external.write_bytes(module.bootstrap_lock_binding(canonical, digest))
+                os.symlink(external, stage)
+                stage_paths.extend([stage, external])
+            elif case == "hardlink":
+                stage = create_valid_bootstrap_stage(module, final, canonical, digest)
+                alias = root / "stage-hardlink-alias"
+                os.link(stage, alias)
+                stage_paths.extend([stage, alias])
+            elif case == "excessive":
+                for _ in range(module.BOOTSTRAP_LOCK_STAGE_MAX_ALIASES + 1):
+                    stage_paths.append(create_valid_bootstrap_stage(module, final, canonical, digest))
+            expect_bootstrap_stage_failure_unchanged(
+                module,
+                target,
+                final,
+                stage_paths,
+                errors,
+                f"bootstrap stage {case}",
+            )
 
 
 def validate_same_process_thread_bootstrap_denial_smoke(module: Any, errors: list[str]) -> None:
@@ -2094,6 +2806,64 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                     lambda: validate_bootstrap_anchor_publication_smoke(module, errors),
                 ),
                 (
+                    "bootstrap cold read no-create",
+                    lambda: validate_bootstrap_cold_read_no_create_smoke(module, errors),
+                ),
+                (
+                    "bootstrap product-first target observation",
+                    lambda: validate_bootstrap_product_first_observation_smoke(module, errors),
+                ),
+                (
+                    "bootstrap product stage recovery",
+                    lambda: validate_bootstrap_product_stage_recovery_smoke(module, errors),
+                ),
+                (
+                    "bootstrap product stage SIGKILL recovery",
+                    lambda: validate_bootstrap_product_stage_sigkill_smoke(module, errors),
+                ),
+                (
+                    "bootstrap target stage recovery",
+                    lambda: validate_bootstrap_stage_recovery_smoke(module, errors),
+                ),
+                (
+                    "bootstrap target stage SIGKILL recovery",
+                    lambda: validate_bootstrap_stage_sigkill_smoke(module, errors),
+                ),
+                (
+                    "bootstrap multiple stage recovery",
+                    lambda: validate_bootstrap_multiple_stage_recovery_smoke(module, errors),
+                ),
+                (
+                    "bootstrap concurrent winner",
+                    lambda: validate_bootstrap_concurrent_winner_smoke(module, errors),
+                ),
+                (
+                    "bootstrap valid EEXIST stage survives to drain",
+                    lambda: validate_bootstrap_valid_eexist_stage_survives_to_drain_smoke(
+                        module, errors
+                    ),
+                ),
+                (
+                    "bootstrap malformed winner cleanup",
+                    lambda: validate_bootstrap_malformed_winner_cleanup_smoke(module, errors),
+                ),
+                (
+                    "bootstrap ordinary cleanup replacement",
+                    lambda: validate_bootstrap_ordinary_cleanup_replacement_smoke(
+                        module, errors
+                    ),
+                ),
+                (
+                    "bootstrap replacement before unlink",
+                    lambda: validate_bootstrap_stage_replacement_before_unlink_smoke(
+                        module, errors
+                    ),
+                ),
+                (
+                    "bootstrap target stage adversarial",
+                    lambda: validate_bootstrap_stage_adversarial_smoke(module, errors),
+                ),
+                (
                     "same-process bootstrap thread denial",
                     lambda: validate_same_process_thread_bootstrap_denial_smoke(
                         module, errors
@@ -2276,6 +3046,11 @@ def main() -> int:
         if "lock_parent_mode_while_launching" in transaction:
             errors.append("build/manifest.json: transaction lock mode must not be launch-only")
         if (
+            transaction.get("bootstrap_product_lock")
+            != "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/global.lock"
+        ):
+            errors.append("build/manifest.json: bootstrap product lock path mismatch")
+        if (
             transaction.get("bootstrap_lock")
             != "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target)>.lock"
         ):
@@ -2340,6 +3115,11 @@ def main() -> int:
             errors.append("config/nddev-contract.json: lock parent locked mode mismatch")
         if "lock_parent_mode_while_launching" in safety:
             errors.append("config/nddev-contract.json: safety lock mode must not be launch-only")
+        if (
+            safety.get("bootstrap_product_lock")
+            != "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/global.lock"
+        ):
+            errors.append("config/nddev-contract.json: bootstrap product lock path mismatch")
         if (
             safety.get("bootstrap_lock")
             != "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target)>.lock"

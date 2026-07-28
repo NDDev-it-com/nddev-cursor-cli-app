@@ -135,6 +135,7 @@
     "lock_type": "persistent flock file",
     "lock_file_mode": "0600",
     "lock_parent_mode_while_locked": "0500",
+    "bootstrap_product_lock": "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/global.lock",
     "bootstrap_lock": "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target)>.lock",
     "bootstrap_lock_file_mode": "0600",
     "bootstrap_lock_binding": "schema/product/canonical-target/product-target-sha256 JSON",
