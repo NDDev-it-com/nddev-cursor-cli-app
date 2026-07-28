@@ -374,6 +374,7 @@ def capture_exact_tree_snapshot(root: Path, label: str) -> dict[str, dict[str, A
             "inode": info.st_ino,
             "mode": stat.S_IMODE(info.st_mode),
             "mtime_ns": info.st_mtime_ns,
+            "size": info.st_size,
         }
         if stat.S_ISLNK(info.st_mode):
             record["kind"] = "symlink"
@@ -447,6 +448,52 @@ def restore_snapshot_metadata(path: Path, record: dict[str, Any], label: str) ->
         ns=(info.st_atime_ns, record["mtime_ns"]),
         follow_symlinks=False,
     )
+
+
+def capture_existing_directory_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail(f"{label} must be a real directory")
+    return {
+        "kind": "dir",
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "mtime_ns": info.st_mtime_ns,
+        "size": info.st_size,
+    }
+
+
+def restore_existing_directory_object(
+    path: Path, snapshot: dict[str, Any], label: str
+) -> None:
+    errors: list[str] = []
+    for _ in range(4):
+        try:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail(f"{label} rollback path kind changed")
+            if (info.st_dev, info.st_ino) != (snapshot["device"], snapshot["inode"]):
+                fail(f"{label} inode changed before exact rollback")
+            if stat.S_IMODE(info.st_mode) != snapshot["mode"]:
+                os.chmod(path, snapshot["mode"])
+            if path.lstat().st_mtime_ns != snapshot["mtime_ns"]:
+                os.utime(
+                    path,
+                    ns=(path.lstat().st_atime_ns, snapshot["mtime_ns"]),
+                    follow_symlinks=False,
+                )
+            fsync_directory(path)
+            current = capture_existing_directory_object(path, label)
+            if current == snapshot:
+                return
+            errors.append(f"current={current!r}, expected={snapshot!r}")
+        except BaseException as exc:  # noqa: BLE001 - retry exact restoration.
+            errors.append(str(exc))
+    fail(f"{label} exact directory rollback verification failed: {errors[-5:]}")
 
 
 def current_snapshot_paths(root: Path) -> set[str]:
@@ -849,7 +896,23 @@ def bootstrap_lock_system_root() -> Path:
     return Path("/tmp").resolve(strict=True)
 
 
-def bootstrap_lock_root() -> Path:
+def capture_bootstrap_lock_envelope(root: Path) -> dict[str, Any]:
+    return {
+        "parent": capture_existing_directory_object(root.parent, "bootstrap lock parent"),
+        "root": capture_exact_tree_snapshot(root, "bootstrap lock root"),
+    }
+
+
+def restore_bootstrap_lock_envelope(root: Path, envelope: dict[str, Any]) -> None:
+    restore_exact_tree_snapshot(root, envelope["root"], "bootstrap lock root")
+    restore_existing_directory_object(root.parent, envelope["parent"], "bootstrap lock parent")
+    if capture_exact_tree_snapshot(root, "bootstrap lock root") != envelope["root"]:
+        fail("bootstrap lock root exact rollback verification failed")
+    if capture_existing_directory_object(root.parent, "bootstrap lock parent") != envelope["parent"]:
+        fail("bootstrap lock parent exact rollback verification failed")
+
+
+def prepare_bootstrap_lock_root() -> tuple[Path, dict[str, Any]]:
     uid = current_user_id()
     if uid is None:
         fail("bootstrap lifecycle locks require POSIX current-user identity")
@@ -863,13 +926,31 @@ def bootstrap_lock_root() -> Path:
     if not (parent_info.st_mode & stat.S_ISVTX):
         fail("system temp root must be sticky")
     root = parent / f"{BOOTSTRAP_LOCK_ROOT_PREFIX}-{uid}"
+    envelope = capture_bootstrap_lock_envelope(root)
+    created_root = False
     try:
         root.mkdir(mode=OWNER_DIRECTORY_MODE)
+        created_root = True
     except FileExistsError:
         require_owner_private_directory(root, "bootstrap lock root")
     else:
-        root.chmod(OWNER_DIRECTORY_MODE)
-        require_owner_private_directory(root, "bootstrap lock root")
+        try:
+            root.chmod(OWNER_DIRECTORY_MODE)
+            require_owner_private_directory(root, "bootstrap lock root")
+        except BaseException:
+            restore_bootstrap_lock_envelope(root, envelope)
+            raise
+    if created_root:
+        try:
+            require_owner_private_directory(root, "bootstrap lock root")
+        except BaseException:
+            restore_bootstrap_lock_envelope(root, envelope)
+            raise
+    return root, envelope
+
+
+def bootstrap_lock_root() -> Path:
+    root, _envelope = prepare_bootstrap_lock_root()
     return root
 
 
@@ -877,6 +958,13 @@ def bootstrap_lock_path(target: Any) -> tuple[Path, str, str]:
     lexical = lexical_target_text(target)
     digest = sha256_bytes(PRODUCT_NAME.encode("utf-8") + b"\0" + lexical.encode("utf-8"))
     return bootstrap_lock_root() / f"{PRODUCT_NAME}-{digest}.lock", lexical, digest
+
+
+def bootstrap_lock_path_for_acquire(target: Any) -> tuple[Path, str, str, dict[str, Any]]:
+    lexical = lexical_target_text(target)
+    digest = sha256_bytes(PRODUCT_NAME.encode("utf-8") + b"\0" + lexical.encode("utf-8"))
+    root, envelope = prepare_bootstrap_lock_root()
+    return root / f"{PRODUCT_NAME}-{digest}.lock", lexical, digest, envelope
 
 
 def open_bootstrap_lock_file(path: Path) -> int:
@@ -978,10 +1066,11 @@ def validate_or_write_bootstrap_binding(
 
 @contextlib.contextmanager
 def bootstrap_lifecycle_lock(target: Any) -> Iterator[None]:
-    path, lexical, digest = bootstrap_lock_path(target)
+    path, lexical, digest, envelope = bootstrap_lock_path_for_acquire(target)
     owner = (os.getpid(), threading.get_ident())
     descriptor: int | None = None
     locked = False
+    published = False
     reentrant = False
     with _BOOTSTRAP_STATE_LOCK:
         for key, held in list(_BOOTSTRAP_LOCKS.items()):
@@ -1032,6 +1121,7 @@ def bootstrap_lifecycle_lock(target: Any) -> Iterator[None]:
             held["depth"] = 1
             held["descriptor"] = descriptor
             held["path"] = path
+            published = True
         try:
             yield
         finally:
@@ -1048,10 +1138,13 @@ def bootstrap_lifecycle_lock(target: Any) -> Iterator[None]:
         if descriptor is not None:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+            descriptor = None
         with _BOOTSTRAP_STATE_LOCK:
             held = _BOOTSTRAP_LOCKS.get(lexical)
             if held is not None and held.get("owner") == owner and held["depth"] == 0:
                 del _BOOTSTRAP_LOCKS[lexical]
+        if not published:
+            restore_bootstrap_lock_envelope(path.parent, envelope)
 
 
 def bootstrap_locked(function: Any) -> Any:
@@ -1080,10 +1173,17 @@ def with_bootstrap_target(target_input: Any, function: Any, *args: Any, **kwargs
 @contextlib.contextmanager
 def exact_target_lifecycle_guard(target: Path, label: str) -> Iterator[None]:
     snapshot = capture_exact_tree_snapshot(target, label)
+    parent_snapshot = capture_existing_directory_object(target.parent, f"{label} target parent")
     try:
         yield
     except BaseException:
         restore_exact_tree_snapshot(target, snapshot, label)
+        fsync_directory(target.parent)
+        restore_existing_directory_object(
+            target.parent, parent_snapshot, f"{label} target parent"
+        )
+        if capture_exact_tree_snapshot(target, label) != snapshot:
+            fail(f"{label} target exact rollback verification failed")
         raise
 
 
