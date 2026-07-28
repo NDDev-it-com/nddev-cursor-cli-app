@@ -117,7 +117,9 @@ BLOCKED_LAUNCH_LONG_FLAGS = {
     "--sandbox",
     "--skip-worktree-setup",
     "--trust",
+    "--workspace",
     "--worktree",
+    "--worktree-base",
     "--yolo",
 }
 BLOCKED_LAUNCH_SHORT_FLAGS = {
@@ -3088,6 +3090,22 @@ def normalized_launch_args(cursor_args: list[str]) -> list[str]:
     return list(cursor_args)
 
 
+def resolve_launch_workspace(workspace: str | Path | None) -> Path:
+    if workspace is None:
+        candidate = Path.cwd()
+    else:
+        candidate = Path(workspace).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        fail("launch workspace must already exist")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail("launch workspace must be a real directory")
+    return candidate.resolve(strict=True)
+
+
 def restore_managed_config_after_launch_locked(target: Path) -> None:
     stamp = load_stamp(target)
     if stamp is None:
@@ -3169,9 +3187,14 @@ def revalidate_executable_identity(
 
 
 def run_cursor_child(
-    executable: Path, forwarded: list[str], environment: dict[str, str]
+    executable: Path, forwarded: list[str], environment: dict[str, str], workspace: Path
 ) -> subprocess.CompletedProcess[Any]:
-    return subprocess.run([str(executable), *forwarded], env=environment, check=False)
+    return subprocess.run(
+        [str(executable), *forwarded],
+        env=environment,
+        cwd=str(workspace),
+        check=False,
+    )
 
 
 def report_cleanup_failure_after_child_exception(
@@ -3289,9 +3312,11 @@ def launch_write_protection(launch_image_root: Path) -> Iterator[None]:
 
 
 @bootstrap_locked
-def launch_cursor(target: Path, cursor_args: list[str]) -> int:
+def launch_cursor(target: Path, cursor_args: list[str], workspace: Path | None = None) -> int:
     forwarded = list(cursor_args)
     reject_managed_launch_overrides(forwarded)
+    launch_workspace = resolve_launch_workspace(workspace)
+    child_args = ["--workspace", str(launch_workspace), *forwarded]
     prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target, protect_lock_parent=True):
         require_clean_managed(target)
@@ -3329,7 +3354,9 @@ def launch_cursor(target: Path, cursor_args: list[str]) -> int:
                         str(launch_image["entrypoint_sha256"]),
                         "Cursor launch image executable",
                     )
-                    completed = run_cursor_child(executable, forwarded, environment)
+                    completed = run_cursor_child(
+                        executable, child_args, environment, launch_workspace
+                    )
                 except BaseException as exc:
                     child_error = exc
                     raise
@@ -3428,6 +3455,10 @@ def build_parser() -> argparse.ArgumentParser:
         "launch", help="Launch Cursor Agent with an isolated config root."
     )
     add_target(launch_parser)
+    launch_parser.add_argument(
+        "--workspace",
+        help="Project workspace directory passed to Cursor Agent as native --workspace.",
+    )
     launch_parser.add_argument("cursor_args", nargs=argparse.REMAINDER)
     return parser
 
@@ -3446,6 +3477,9 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
             "default_setup": DEFAULT_CONTENT_SETUP_ID,
             "default_profile": DEFAULT_PROFILE_ID,
         }
+    launch_workspace = None
+    if args.command == "launch":
+        launch_workspace = resolve_launch_workspace(args.workspace)
     target = resolve_target(args.target)
     if args.command == "status":
         return {
@@ -3469,7 +3503,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
     if args.command == "remove":
         return remove_setup(target)
     if args.command == "launch":
-        return launch_cursor(target, normalized_launch_args(list(args.cursor_args)))
+        return launch_cursor(
+            target,
+            normalized_launch_args(list(args.cursor_args)),
+            launch_workspace,
+        )
     fail(f"unsupported command: {args.command}")
 
 

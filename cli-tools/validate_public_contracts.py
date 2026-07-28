@@ -101,8 +101,10 @@ BLOCKED_LAUNCH_OVERRIDES = [
     "--sandbox",
     "--skip-worktree-setup",
     "--trust",
+    "--workspace",
     "--worktree",
     "-w",
+    "--worktree-base",
     "--yolo",
     "acp",
     "install-shell-integration",
@@ -234,6 +236,15 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch must reject legacy setup stamps")
     if launch.get("managed_override_args_blocked") != BLOCKED_LAUNCH_OVERRIDES:
         errors.append(f"{owner}: runtime_launch managed override block list mismatch")
+    if (
+        launch.get("workspace_source")
+        != "default captures the manager caller cwd once; optional manager --workspace selects an existing real directory"
+    ):
+        errors.append(f"{owner}: runtime_launch workspace_source mismatch")
+    if launch.get("native_workspace_arg") != "--workspace <path>":
+        errors.append(f"{owner}: runtime_launch native workspace arg mismatch")
+    if launch.get("child_cwd") != "same resolved directory passed to native --workspace":
+        errors.append(f"{owner}: runtime_launch child cwd mismatch")
     if launch.get("target_lock_scope") != "preflight-through-child-and-managed-config-restore":
         errors.append(f"{owner}: runtime_launch target lock scope mismatch")
     if (
@@ -908,6 +919,15 @@ def validate_artifact_source_smokes(module: Any, errors: list[str]) -> None:
         if needle not in manager_source:
             errors.append(f"nddev_cursor_cli.py must keep verified lock fd evidence: {needle}")
     for needle in (
+        "def resolve_launch_workspace",
+        "\"--workspace\", str(launch_workspace)",
+        "cwd=str(workspace)",
+        "launch_parser.add_argument(",
+        "launch_workspace = resolve_launch_workspace(args.workspace)",
+    ):
+        if needle not in manager_source:
+            errors.append(f"nddev_cursor_cli.py must keep explicit launch workspace evidence: {needle}")
+    for needle in (
         "bootstrap_lifecycle_lock",
         "BOOTSTRAP_LOCK_ROOT_PREFIX",
         "CONTROL_LOCKS_NAME",
@@ -1304,9 +1324,9 @@ def validate_launch_exception_restore_smoke(module: Any, errors: list[str]) -> N
         )
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path, forwarded: list[str], environment: dict[str, str], workspace: Path
         ) -> Any:
-            del executable, forwarded
+            del executable, forwarded, workspace
             seen_environment.update(environment)
             control = module.control_root(target)
             lock_root = module.control_lock_root(target)
@@ -1376,10 +1396,10 @@ def validate_launch_swap_at_exec_smoke(module: Any, errors: list[str]) -> None:
             return image
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path, forwarded: list[str], environment: dict[str, str], workspace: Path
         ) -> Any:
             nonlocal child_ran
-            del executable, forwarded, environment
+            del executable, forwarded, environment, workspace
             child_ran = True
             return type("Completed", (), {"returncode": 0})()
 
@@ -1440,10 +1460,10 @@ def validate_launch_lock_file_and_write_protection_smoke(module: Any, errors: li
         )
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path, forwarded: list[str], environment: dict[str, str], workspace: Path
         ) -> Any:
             nonlocal seen_image_root
-            del forwarded
+            del forwarded, workspace
             control = module.control_root(target)
             lock_root = module.control_lock_root(target)
             lock = module.target_lock_path(target)
@@ -1570,9 +1590,9 @@ def validate_external_bootstrap_lock_smoke(module: Any, errors: list[str]) -> No
         )
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path, forwarded: list[str], environment: dict[str, str], workspace: Path
         ) -> Any:
-            del executable, forwarded
+            del executable, forwarded, workspace
             if any(module.BOOTSTRAP_LOCK_ROOT_PREFIX in value for value in environment.values()):
                 errors.append("bootstrap lock path leaked into child environment")
             control = module.control_root(target)
@@ -1616,6 +1636,8 @@ def validate_launch_separator_argv_smoke(module: Any, errors: list[str]) -> None
                 "launch",
                 "--target",
                 str(target),
+                "--workspace",
+                str(root),
                 "--",
                 "--",
                 "-p",
@@ -1627,18 +1649,62 @@ def validate_launch_separator_argv_smoke(module: Any, errors: list[str]) -> None
         seen: list[str] = []
 
         def fake_run_cursor_child(
-            executable: Path, forwarded: list[str], environment: dict[str, str]
+            executable: Path, forwarded: list[str], environment: dict[str, str], workspace: Path
         ) -> Any:
             del executable, environment
             seen.extend(forwarded)
+            seen.append(f"cwd={workspace}")
             return type("Completed", (), {"returncode": 0})()
 
         with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
             result = module.run(parsed)
         if result != 0:
             errors.append(f"launch argv smoke returned {result}")
-        if seen != ["--", "-p", "literal"]:
+        expected = ["--workspace", str(root.resolve(strict=True)), "--", "-p", "literal"]
+        if seen != [*expected, f"cwd={root.resolve(strict=True)}"]:
             errors.append(f"launch argv smoke forwarded unexpected args: {seen}")
+
+
+def validate_launch_workspace_override_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-launch-workspace-block-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        install_smoke_current_software(module, target)
+        blocked_cases = (
+            ["--workspace", str(root)],
+            [f"--workspace={root}"],
+            ["--worktree-base", "main"],
+            ["--worktree-base=main"],
+            ["-wproject"],
+            ["--skip-worktree-setup"],
+        )
+        for cursor_args in blocked_cases:
+            child_ran = False
+
+            def fake_run_cursor_child(
+                executable: Path,
+                forwarded: list[str],
+                environment: dict[str, str],
+                workspace: Path,
+            ) -> Any:
+                nonlocal child_ran
+                del executable, forwarded, environment, workspace
+                child_ran = True
+                return type("Completed", (), {"returncode": 0})()
+
+            with with_restored_attr(module, "run_cursor_child", fake_run_cursor_child):
+                try:
+                    module.launch_cursor(target, cursor_args, root)
+                except module.CursorSetupError as exc:
+                    if "launch refuses managed Cursor override option" not in str(exc):
+                        errors.append(
+                            f"launch override {cursor_args} failed with unexpected error: {exc}"
+                        )
+                else:
+                    errors.append(f"launch override {cursor_args} unexpectedly succeeded")
+            if child_ran:
+                errors.append(f"launch override {cursor_args} reached child subprocess")
 
 
 def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> None:
@@ -1853,10 +1919,10 @@ def expect_launch_blocked_without_child(
     child_ran = False
 
     def fake_run_cursor_child(
-        executable: Path, forwarded: list[str], environment: dict[str, str]
+        executable: Path, forwarded: list[str], environment: dict[str, str], workspace: Path
     ) -> Any:
         nonlocal child_ran
-        del executable, forwarded, environment
+        del executable, forwarded, environment, workspace
         child_ran = True
         return type("Completed", (), {"returncode": 0})()
 
@@ -2014,6 +2080,10 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                 (
                     "launch separator argv",
                     lambda: validate_launch_separator_argv_smoke(module, errors),
+                ),
+                (
+                    "launch workspace override",
+                    lambda: validate_launch_workspace_override_smoke(module, errors),
                 ),
                 (
                     "bootstrap lock handover",
