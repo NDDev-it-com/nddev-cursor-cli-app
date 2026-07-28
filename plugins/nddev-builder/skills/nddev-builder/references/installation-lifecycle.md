@@ -10,9 +10,8 @@ migration, restore, or removal.
   read-only change plan.
 - `install --target <absolute-target> [--setup <id>] [--profile <id>] [--json]`:
   write current setup/profile into an empty or missing target.
-- `update --target <absolute-target> [--setup <id>] [--profile <id>] [--json]`:
-  refresh an existing target whose installed setup/profile identity matches the
-  selected identity.
+- `update --target <absolute-target> [--json]`: refresh an existing target using
+  its installed setup/profile identity.
 - `switch --target <absolute-target> [--setup <id>] [--profile <id>] [--json]`:
   switch an existing current managed target.
 - `migrate --target <absolute-target> [--setup <id>] [--profile <id>] [--json]`:

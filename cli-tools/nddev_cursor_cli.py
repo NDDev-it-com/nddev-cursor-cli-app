@@ -173,6 +173,7 @@ BLOCKED_LAUNCH_COMMANDS = {
     "update",
     "worker",
 }
+PRODUCT_LIFECYCLE_LOCK_KEY = f"/__{PRODUCT_NAME}_product_lifecycle__"
 _PARSER_JSON_ERROR_REQUESTED = False
 SETUP_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 MANAGED_CONFIG_KEYS = (
@@ -246,7 +247,7 @@ SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 BOOTSTRAP_LOCK_KEYS_V1 = {
     "schema_version",
     "product_name",
-    "lexical_target",
+    "lock_key",
     "target_sha256",
 }
 _BOOTSTRAP_LOCKS: dict[str, dict[str, Any]] = {}
@@ -931,7 +932,7 @@ def fd_write_all(descriptor: int, content: bytes) -> None:
 
 
 def read_valid_bootstrap_binding(
-    descriptor: int, path: Path, lexical: str, digest: str
+    descriptor: int, path: Path, lock_key: str, digest: str
 ) -> dict[str, Any] | None:
     require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
     content = fd_read_bounded(descriptor, "bootstrap lock", BOOTSTRAP_LOCK_MAX_BYTES)
@@ -948,22 +949,22 @@ def read_valid_bootstrap_binding(
         loaded["schema_version"] != 1
         or loaded["product_name"] != PRODUCT_NAME
         or loaded["target_sha256"] != digest
-        or loaded["lexical_target"] != lexical
+        or loaded["lock_key"] != lock_key
     ):
         fail("bootstrap lock target binding mismatch")
     return loaded
 
 
 def validate_or_write_bootstrap_binding(
-    descriptor: int, path: Path, lexical: str, digest: str
+    descriptor: int, path: Path, lock_key: str, digest: str
 ) -> None:
-    if read_valid_bootstrap_binding(descriptor, path, lexical, digest) is not None:
+    if read_valid_bootstrap_binding(descriptor, path, lock_key, digest) is not None:
         return
     binding = canonical_json(
         {
             "schema_version": 1,
             "product_name": PRODUCT_NAME,
-            "lexical_target": lexical,
+            "lock_key": lock_key,
             "target_sha256": digest,
         }
     )
@@ -971,7 +972,7 @@ def validate_or_write_bootstrap_binding(
         fail("bootstrap lock binding exceeds the size limit")
     fd_write_all(descriptor, binding)
     require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
-    if read_valid_bootstrap_binding(descriptor, path, lexical, digest) is None:
+    if read_valid_bootstrap_binding(descriptor, path, lock_key, digest) is None:
         fail("bootstrap lock binding was not persisted")
 
 
@@ -1061,12 +1062,19 @@ def bootstrap_locked(function: Any) -> Any:
     return wrapped
 
 
+@contextlib.contextmanager
+def product_lifecycle_lock() -> Iterator[None]:
+    with bootstrap_lifecycle_lock(PRODUCT_LIFECYCLE_LOCK_KEY):
+        yield
+
+
 def with_bootstrap_target(target_input: Any, function: Any, *args: Any, **kwargs: Any) -> Any:
     require_current_host_supported()
     lexical = lexical_target_text(target_input)
-    with bootstrap_lifecycle_lock(lexical):
+    with product_lifecycle_lock():
         target = resolve_target(lexical)
-        return function(target, *args, **kwargs)
+        with bootstrap_lifecycle_lock(str(target)):
+            return function(target, *args, **kwargs)
 
 
 @contextlib.contextmanager
@@ -1378,7 +1386,10 @@ def drift_for_target(target: Path, stamp: dict[str, Any]) -> list[str]:
 
 
 def inspect_target(target: Path) -> dict[str, Any]:
-    require_current_host_supported()
+    return with_bootstrap_target(target, _inspect_target_locked)
+
+
+def _inspect_target_locked(target: Path) -> dict[str, Any]:
     if not target.exists() and not target.is_symlink():
         return {
             "state": "missing",
@@ -1458,7 +1469,7 @@ def inspect_target(target: Path) -> dict[str, Any]:
 
 def require_clean_managed(target: Path) -> dict[str, Any]:
     require_owner_private_directory(target, "--target")
-    state = inspect_target(target)
+    state = _inspect_target_locked(target)
     if state["state"] != "managed":
         fail(f"target is not managed (state={state['state']})")
     if state.get("legacy"):
@@ -2549,9 +2560,12 @@ def restore_files_from_backup(envelope: dict[str, Any]) -> dict[str, bytes | Non
 
 
 def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str, Any]:
-    require_current_host_supported()
+    return with_bootstrap_target(target, _plan_setup_locked, content_setup_id, profile_id)
+
+
+def _plan_setup_locked(target: Path, content_setup_id: str, profile_id: str) -> dict[str, Any]:
     render_selection(content_setup_id, profile_id)
-    state = inspect_target(target)
+    state = _inspect_target_locked(target)
     operation = "install"
     backup_required = False
     changes: list[str] = []
@@ -2618,24 +2632,25 @@ def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str
 def mutate_setup(
     target: Path, content_setup_id: str, profile_id: str, command: str
 ) -> dict[str, Any]:
-    require_current_host_supported()
-    return _mutate_setup_locked(target, content_setup_id, profile_id, command)
+    return with_bootstrap_target(
+        target, _mutate_setup_locked, content_setup_id, profile_id, command
+    )
 
 
-@bootstrap_locked
 def _mutate_setup_locked(
     target: Path, content_setup_id: str, profile_id: str, command: str
 ) -> dict[str, Any]:
-    render_selection(content_setup_id, profile_id)
     if command not in {"install", "update", "switch"}:
         fail(f"unsupported setup mutation command: {command}")
+    if command != "update":
+        render_selection(content_setup_id, profile_id)
     with exact_target_lifecycle_guard(target, f"setup {command}"):
         if command == "update" and not (target.exists() or target.is_symlink()):
             fail("update requires an existing managed target")
         created_target = prepare_lifecycle_target(target, create_missing=command == "install")
         try:
             with target_lock(target, cleanup_empty_target_on_error=created_target):
-                state = inspect_target(target)
+                state = _inspect_target_locked(target)
                 if state["state"] == "unmanaged":
                     fail("unmanaged target contains Cursor CLI state; refusing to overwrite")
                 if state["state"] == "managed" and state.get("legacy"):
@@ -2650,16 +2665,28 @@ def _mutate_setup_locked(
                     fail(f"managed target has drift: {', '.join(state['drift'])}")
                 current_setup = state["content_setup_id"] if state["state"] == "managed" else None
                 current_profile = state["profile_id"] if state["state"] == "managed" else None
-                selected_current = current_setup == content_setup_id and current_profile == profile_id
+                if command == "update":
+                    if current_setup is None or current_profile is None:
+                        fail("update requires an installed setup/profile identity")
+                    content_setup_id = str(current_setup)
+                    profile_id = str(current_profile)
+                    render_selection(content_setup_id, profile_id)
+                selected_current = (
+                    current_setup == content_setup_id and current_profile == profile_id
+                )
                 if command == "switch" and selected_current:
                     fail("switch requires a different setup or profile")
-                if command == "update" and not selected_current:
-                    fail("update requires the selected setup/profile to match the installed identity")
-                existing_config = load_target_config(target) if state["state"] == "managed" else None
-                desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
+                existing_config = (
+                    load_target_config(target) if state["state"] == "managed" else None
+                )
+                desired = desired_for_selection(
+                    target, content_setup_id, profile_id, existing_config
+                )
                 before = capture_managed_files(target)
                 changed = [
-                    relative for relative, content in desired.items() if before.get(relative) != content
+                    relative
+                    for relative, content in desired.items()
+                    if before.get(relative) != content
                 ]
                 backup_publication: BackupPublication | None = None
                 if state["state"] == "managed" and not selected_current:
@@ -2667,9 +2694,11 @@ def _mutate_setup_locked(
                 managed_transaction: ManagedStateTransaction | None = None
                 try:
                     if changed:
-                        managed_transaction = begin_managed_state_transaction(target, desired, before)
+                        managed_transaction = begin_managed_state_transaction(
+                            target, desired, before
+                        )
                         managed_transaction.publish()
-                    final = inspect_target(target)
+                    final = _inspect_target_locked(target)
                     if (
                         final["state"] != "managed"
                         or final.get("legacy")
@@ -2705,11 +2734,11 @@ def _mutate_setup_locked(
 def migrate_setup(
     target: Path, content_setup_id: str, requested_profile_id: str | None
 ) -> dict[str, Any]:
-    require_current_host_supported()
-    return _migrate_setup_locked(target, content_setup_id, requested_profile_id)
+    return with_bootstrap_target(
+        target, _migrate_setup_locked, content_setup_id, requested_profile_id
+    )
 
 
-@bootstrap_locked
 def _migrate_setup_locked(
     target: Path, content_setup_id: str, requested_profile_id: str | None
 ) -> dict[str, Any]:
@@ -2717,13 +2746,15 @@ def _migrate_setup_locked(
     with exact_target_lifecycle_guard(target, "setup migrate"):
         prepare_lifecycle_target(target, create_missing=False)
         with target_lock(target):
-            state = inspect_target(target)
+            state = _inspect_target_locked(target)
             if state["state"] != "managed" or not state.get("legacy"):
                 fail("migrate requires a legacy managed target")
             legacy_setup_id = state["legacy_setup_id"]
             profile_id = requested_profile_id or LEGACY_SETUP_PROFILE_IDS.get(str(legacy_setup_id))
             if profile_id is None:
-                fail("legacy review targets require an explicit --profile full-auto or --profile safe")
+                fail(
+                    "legacy review targets require an explicit --profile full-auto or --profile safe"
+                )
             render_selection(content_setup_id, profile_id)
             if state["drift"]:
                 fail(f"legacy managed target has drift: {', '.join(state['drift'])}")
@@ -2738,7 +2769,7 @@ def _migrate_setup_locked(
             try:
                 managed_transaction = begin_managed_state_transaction(target, desired, before)
                 managed_transaction.publish()
-                final = inspect_target(target)
+                final = _inspect_target_locked(target)
                 if (
                     final["state"] != "managed"
                     or final.get("legacy")
@@ -2768,17 +2799,15 @@ def _migrate_setup_locked(
 
 
 def restore_slot(target: Path, slot: int) -> dict[str, Any]:
-    require_current_host_supported()
-    return _restore_slot_locked(target, slot)
+    return with_bootstrap_target(target, _restore_slot_locked, slot)
 
 
-@bootstrap_locked
 def _restore_slot_locked(target: Path, slot: int) -> dict[str, Any]:
     with exact_target_lifecycle_guard(target, "setup restore"):
         prepare_lifecycle_target(target, create_missing=False)
         with target_lock(target):
             envelope = load_backup(target, slot)
-            state = inspect_target(target)
+            state = _inspect_target_locked(target)
             if state["state"] == "managed" and state["drift"] and not state.get("legacy"):
                 fail(f"managed target has drift: {', '.join(state['drift'])}")
             before = capture_managed_files(target)
@@ -2787,7 +2816,7 @@ def _restore_slot_locked(target: Path, slot: int) -> dict[str, Any]:
             try:
                 managed_transaction = begin_managed_state_transaction(target, desired, before)
                 managed_transaction.publish()
-                final = inspect_target(target)
+                final = _inspect_target_locked(target)
                 if final["state"] != "managed" or final["drift"]:
                     fail("restore postcondition failed")
                 managed_transaction.commit()
@@ -2808,16 +2837,14 @@ def _restore_slot_locked(target: Path, slot: int) -> dict[str, Any]:
 
 
 def remove_setup(target: Path) -> dict[str, Any]:
-    require_current_host_supported()
-    return _remove_setup_locked(target)
+    return with_bootstrap_target(target, _remove_setup_locked)
 
 
-@bootstrap_locked
 def _remove_setup_locked(target: Path) -> dict[str, Any]:
     with exact_target_lifecycle_guard(target, "setup remove"):
         prepare_lifecycle_target(target, create_missing=False)
         with target_lock(target):
-            state = inspect_target(target)
+            state = _inspect_target_locked(target)
             if state["state"] != "managed":
                 fail(f"target is not managed (state={state['state']})")
             before = capture_managed_files(target)
@@ -2908,18 +2935,31 @@ def existing_path_label(path: Path, label: str) -> str | None:
 
 
 def software_presence(target: Path) -> list[str]:
-    labels = (
+    file_labels = (
         (software_transaction_path(target), SOFTWARE_TRANSACTION_NAME),
         (software_stamp_path(target), SOFTWARE_STAMP_NAME),
+        (managed_agent_path(target), "bin/agent"),
+    )
+    directory_labels = (
         (software_container(target), ".nddev-software"),
         (software_root(target), ".nddev-software/cursor-cli"),
         (
             software_version_dir(target),
             ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
         ),
-        (managed_agent_path(target), "bin/agent"),
     )
-    return sorted(label for path, label in labels if existing_path_label(path, label) is not None)
+    presence = [
+        label for path, label in file_labels if existing_path_label(path, label) is not None
+    ]
+    for path, label in directory_labels:
+        if not (path.exists() or path.is_symlink()):
+            continue
+        if path.is_symlink() or not path.is_dir():
+            presence.append(label)
+            continue
+        if any(child.is_symlink() or child.is_file() for child in path.rglob("*")):
+            presence.append(label)
+    return sorted(presence)
 
 
 def parse_os_release(content: str) -> dict[str, str]:
@@ -3694,7 +3734,10 @@ def software_tree_object_matches(
 
 
 def software_status(target: Path) -> dict[str, Any]:
-    require_current_host_supported()
+    return with_bootstrap_target(target, _software_status_locked)
+
+
+def _software_status_locked(target: Path) -> dict[str, Any]:
     if not target.exists() and not target.is_symlink():
         return {
             "schema_version": 1,
@@ -3872,11 +3915,9 @@ def prepare_cursor_artifact() -> dict[str, Any]:
 def install_cursor_cli(target: Path, command: str) -> dict[str, Any]:
     if command not in {"install-cli", "update-cli"}:
         fail(f"unsupported Cursor software command: {command}")
-    require_current_host_supported()
-    return _install_cursor_cli_locked(target, command)
+    return with_bootstrap_target(target, _install_cursor_cli_locked, command)
 
 
-@bootstrap_locked
 def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
     with exact_target_lifecycle_guard(target, f"software {command}"):
         before_target_exists = target.exists() or target.is_symlink()
@@ -3884,7 +3925,7 @@ def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
             fail("update-cli requires existing target-owned Cursor CLI software presence")
         created_target = prepare_lifecycle_target(target, create_missing=command == "install-cli")
         with target_lock(target, cleanup_empty_target_on_error=created_target):
-            status = software_status(target)
+            status = _software_status_locked(target)
             if command == "install-cli" and status["present"]:
                 fail(
                     "install-cli requires absent target-owned Cursor CLI software presence; "
@@ -4014,7 +4055,7 @@ def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
                     fsync_existing_parent(stamp_path)
                 atomic_write(stamp_path, stamp_bytes)
                 clear_software_transaction_marker(target)
-                final_status = software_status(target)
+                final_status = _software_status_locked(target)
                 if not final_status["installed"]:
                     fail(
                         "Cursor software install did not produce a structurally complete "
@@ -4095,7 +4136,7 @@ def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
                 with contextlib.suppress(FileNotFoundError):
                     shutil.rmtree(rollback_parent)
                     fsync_directory(versions)
-            final_status = software_status(target)
+            final_status = _software_status_locked(target)
             return {
                 "schema_version": 1,
                 "command": command,
@@ -4132,11 +4173,9 @@ def cleanup_software_remove_empty_parents(target: Path) -> None:
 
 
 def remove_cursor_cli(target: Path) -> dict[str, Any]:
-    require_current_host_supported()
-    return _remove_cursor_cli_locked(target)
+    return with_bootstrap_target(target, _remove_cursor_cli_locked)
 
 
-@bootstrap_locked
 def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
     with exact_target_lifecycle_guard(target, "software remove-cli"):
         if not target.exists() and not target.is_symlink():
@@ -4152,7 +4191,7 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
             }
         prepare_lifecycle_target(target, create_missing=False)
         with target_lock(target):
-            initial_status = software_status(target)
+            initial_status = _software_status_locked(target)
             initial_presence = list(initial_status["presence"])
             if not initial_presence:
                 return {
@@ -4199,6 +4238,7 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
             rollback_binary: Path | None = None
             rollback_stamp: Path | None = None
             rollback_marker: Path | None = None
+            final_status: dict[str, Any] | None = None
 
             def matches_before() -> bool:
                 return (
@@ -4224,11 +4264,12 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
             try:
                 ensure_real_directory_path(container, "Cursor software container")
                 ensure_real_directory_path(root, "Cursor software root")
+                rollback_root = ensure_control_root(target)
                 rollback_parent = Path(
-                    tempfile.mkdtemp(prefix=SOFTWARE_REMOVE_ROLLBACK_PREFIX, dir=str(root))
+                    tempfile.mkdtemp(prefix=SOFTWARE_REMOVE_ROLLBACK_PREFIX, dir=str(rollback_root))
                 )
                 rollback_parent.chmod(OWNER_DIRECTORY_MODE)
-                fsync_directory(root)
+                fsync_directory(rollback_root)
                 if before_version_identity is not None:
                     ensure_real_directory_path(versions, "Cursor software versions directory")
                     rollback_version = rollback_parent / "version"
@@ -4260,13 +4301,13 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
                     or (marker_path.exists() or marker_path.is_symlink())
                 ):
                     fail("remove-cli software tree postcondition failed")
-                shutil.rmtree(rollback_parent)
-                fsync_directory(root)
-                rollback_parent = None
-                cleanup_software_remove_empty_parents(target)
-                final_status = software_status(target)
+                final_status = _software_status_locked(target)
                 if final_status["installed"] or final_status["current"]:
                     fail("remove-cli software status postcondition failed")
+                shutil.rmtree(rollback_parent)
+                fsync_directory(rollback_root)
+                rollback_parent = None
+                cleanup_software_remove_empty_parents(target)
             except BaseException:
                 rollback_exact = False
                 for _ in range(4):
@@ -4280,6 +4321,11 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
                                 and rollback_version is not None
                                 and (rollback_version.exists() or rollback_version.is_symlink())
                             ):
+                                ensure_real_directory_path(container, "Cursor software container")
+                                ensure_real_directory_path(root, "Cursor software root")
+                                ensure_real_directory_path(
+                                    versions, "Cursor software versions directory"
+                                )
                                 os.rename(rollback_version, version_dir)
                                 fsync_directory(versions)
                         if not software_tree_object_matches(
@@ -4291,6 +4337,7 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
                                 and rollback_launch is not None
                                 and (rollback_launch.exists() or rollback_launch.is_symlink())
                             ):
+                                ensure_real_directory_path(root, "Cursor software root")
                                 os.rename(rollback_launch, launch_root)
                                 fsync_directory(root)
                         if not software_file_object_matches(
@@ -4316,6 +4363,7 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
                             if rollback_stamp is not None and (
                                 rollback_stamp.exists() or rollback_stamp.is_symlink()
                             ):
+                                ensure_real_directory_path(root, "Cursor software root")
                                 os.rename(rollback_stamp, stamp_path)
                                 fsync_existing_parent(stamp_path)
                         if not software_file_object_matches(
@@ -4327,6 +4375,7 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
                             if rollback_marker is not None and (
                                 rollback_marker.exists() or rollback_marker.is_symlink()
                             ):
+                                ensure_real_directory_path(root, "Cursor software root")
                                 os.rename(rollback_marker, marker_path)
                                 fsync_existing_parent(marker_path)
                         if matches_before():
@@ -4339,14 +4388,15 @@ def _remove_cursor_cli_locked(target: Path) -> dict[str, Any]:
                 ):
                     with contextlib.suppress(FileNotFoundError):
                         shutil.rmtree(rollback_parent)
-                        fsync_directory(root)
+                        fsync_directory(rollback_parent.parent)
                 if rollback_exact:
                     remove_empty_directory_if_created(versions, before_versions_exists)
                     remove_empty_directory_if_created(root, before_root_exists)
                     remove_empty_directory_if_created(container, before_container_exists)
                     remove_empty_directory_if_created(binary_path.parent, before_bin_dir_exists)
                 raise
-            final_status = software_status(target)
+            if final_status is None:
+                fail("remove-cli software status postcondition did not run")
             return {
                 "schema_version": 1,
                 "command": "remove-cli",
@@ -4582,18 +4632,16 @@ def launch_write_protection(launch_image_root: Path) -> Iterator[None]:
 
 
 def launch_cursor(target: Path, cursor_args: list[str]) -> int:
-    require_current_host_supported()
-    return _launch_cursor_locked(target, cursor_args)
+    return with_bootstrap_target(target, _launch_cursor_locked, cursor_args)
 
 
-@bootstrap_locked
 def _launch_cursor_locked(target: Path, cursor_args: list[str]) -> int:
     forwarded = list(cursor_args)
     reject_managed_launch_overrides(forwarded)
     prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target, protect_lock_parent=True):
         require_clean_managed(target)
-        software = software_status(target)
+        software = _software_status_locked(target)
         if not software["installed"] or not software["current"]:
             fail("launch requires current target-owned Cursor CLI software")
         child_home = require_target_local_directory_chain(
@@ -4714,10 +4762,15 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Inspect an explicit target.")
     add_target(status_parser)
 
-    for command in ("plan", "install", "update", "switch"):
+    for command in ("plan", "install", "switch"):
         command_parser = subparsers.add_parser(command, help=f"{command.title()} a setup.")
         add_setup_profile(command_parser)
         add_target(command_parser)
+
+    update_parser = subparsers.add_parser(
+        "update", help="Refresh the installed setup/profile identity."
+    )
+    add_target(update_parser)
 
     migrate_parser = subparsers.add_parser(
         "migrate", help="Migrate a legacy managed target to the setup/profile contract."
@@ -4761,26 +4814,28 @@ def run_target_command(target: Path, args: argparse.Namespace) -> dict[str, Any]
             "schema_version": 2,
             "command": "status",
             "target": str(target),
-            **inspect_target(target),
+            **_inspect_target_locked(target),
         }
     if args.command == "plan":
-        return plan_setup(target, args.setup, args.profile)
-    if args.command in {"install", "update", "switch"}:
-        return mutate_setup(target, args.setup, args.profile, args.command)
+        return _plan_setup_locked(target, args.setup, args.profile)
+    if args.command in {"install", "switch"}:
+        return _mutate_setup_locked(target, args.setup, args.profile, args.command)
+    if args.command == "update":
+        return _mutate_setup_locked(target, DEFAULT_CONTENT_SETUP_ID, DEFAULT_PROFILE_ID, "update")
     if args.command == "migrate":
-        return migrate_setup(target, args.setup, args.profile)
+        return _migrate_setup_locked(target, args.setup, args.profile)
     if args.command == "software-status":
-        return software_status(target)
+        return _software_status_locked(target)
     if args.command in {"install-cli", "update-cli"}:
-        return install_cursor_cli(target, args.command)
+        return _install_cursor_cli_locked(target, args.command)
     if args.command == "remove-cli":
-        return remove_cursor_cli(target)
+        return _remove_cursor_cli_locked(target)
     if args.command == "restore":
-        return restore_slot(target, args.backup)
+        return _restore_slot_locked(target, args.backup)
     if args.command == "remove":
-        return remove_setup(target)
+        return _remove_setup_locked(target)
     if args.command == "launch":
-        return launch_cursor(target, normalized_launch_args(list(args.cursor_args)))
+        return _launch_cursor_locked(target, normalized_launch_args(list(args.cursor_args)))
     fail(f"unsupported command: {args.command}")
 
 

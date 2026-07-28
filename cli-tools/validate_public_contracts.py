@@ -23,14 +23,14 @@ ROOT = Path(__file__).resolve().parent.parent
 CURSOR_RELEASE_ID = "2026.07.23-e383d2b"
 PYTHON_REQUIRES = ">=3.9"
 BOOTSTRAP_LOCK_SCOPE = (
-    "external product-and-lexical-target flock before target creation or inspection "
-    "through full operation and child cleanup"
+    "external product-wide coordination before target observation, then canonical-target flock "
+    "before any read, mutation, runtime handoff, or child cleanup"
 )
 BOOTSTRAP_LOCK_PATH = (
     "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/"
-    "nddev-cursor-cli-app-<sha256(product-name NUL lexical-target)>.lock"
+    "nddev-cursor-cli-app-<sha256(product-name NUL product-or-canonical-target-key)>.lock"
 )
-BOOTSTRAP_LOCK_BINDING = "schema/product/lexical-target/product-target-sha256 JSON"
+BOOTSTRAP_LOCK_BINDING = "schema/product/lock-key/product-target-sha256 JSON"
 CONTENT_SETUP_IDS = ["nddev-builder"]
 PROFILE_IDS = ["full-auto", "safe"]
 BUILDER_TARGET_PATH = ".nddev-cursor-home/.cursor/plugins/local/nddev-builder"
@@ -365,7 +365,9 @@ def validate_python39_syntax(errors: list[str]) -> None:
         try:
             source = path.read_text(encoding="utf-8")
         except OSError as exc:
-            errors.append(f"{path.relative_to(ROOT)}: unreadable for Python 3.9 syntax check: {exc}")
+            errors.append(
+                f"{path.relative_to(ROOT)}: unreadable for Python 3.9 syntax check: {exc}"
+            )
             continue
         try:
             ast.parse(source, filename=str(path), feature_version=(3, 9))
@@ -415,10 +417,7 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch managed override block list mismatch")
     if launch.get("target_lock_scope") != "preflight-through-child-and-managed-config-restore":
         errors.append(f"{owner}: runtime_launch target lock scope mismatch")
-    if (
-        launch.get("bootstrap_lock_scope")
-        != BOOTSTRAP_LOCK_SCOPE
-    ):
+    if launch.get("bootstrap_lock_scope") != BOOTSTRAP_LOCK_SCOPE:
         errors.append(f"{owner}: runtime_launch bootstrap lock scope mismatch")
     if launch.get("bootstrap_lock_exposed_to_child") is not False:
         errors.append(f"{owner}: runtime_launch bootstrap lock must not be exposed to child")
@@ -1064,13 +1063,13 @@ def start_bootstrap_lock_holder(
     if pid == 0:
         try:
             with module.bootstrap_lifecycle_lock(target):
-                path, lexical, digest = module.bootstrap_lock_path(target)
+                path, lock_key, digest = module.bootstrap_lock_path(target)
                 info = path.lstat()
                 result.write_text(
                     json.dumps(
                         {
                             "path": str(path),
-                            "lexical": lexical,
+                            "lock_key": lock_key,
                             "digest": digest,
                             "device": info.st_dev,
                             "inode": info.st_ino,
@@ -1509,7 +1508,7 @@ def hidden_residue_names(root: Path, prefixes: tuple[str, ...]) -> list[str]:
 
 def validate_managed_transaction_rollback_fault_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-managed-txn-smoke-") as tmp:
-        target = Path(tmp) / "target"
+        target = (Path(tmp) / "target").resolve(strict=False)
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
         before = managed_object_snapshot(module, target)
         real_rename = module.os.rename
@@ -1586,22 +1585,25 @@ def validate_setup_update_smoke(module: Any, errors: list[str]) -> None:
 
         target = root / "target"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
-        wrong_profile = module.mutate_setup(target, "nddev-builder", "full-auto", "update")
-        if wrong_profile.get("command") != "update" or wrong_profile.get("changed") != []:
+        current_update = module.mutate_setup(target, "nddev-builder", "full-auto", "update")
+        if current_update.get("command") != "update" or current_update.get("changed") != []:
             errors.append(
-                f"setup update current no-op returned unexpected payload: {wrong_profile}"
+                f"setup update current no-op returned unexpected payload: {current_update}"
             )
-        try:
-            module.mutate_setup(target, "nddev-builder", "safe", "update")
-        except module.CursorSetupError as exc:
-            if "match the installed identity" not in str(exc):
-                errors.append(f"setup update wrong identity failed unexpectedly: {exc}")
-        else:
-            errors.append("setup update accepted a different selected identity")
+        ignored_selection = module.mutate_setup(target, "nddev-builder", "safe", "update")
+        if (
+            ignored_selection.get("command") != "update"
+            or ignored_selection.get("profile_id") != "full-auto"
+            or ignored_selection.get("changed") != []
+        ):
+            errors.append(
+                "setup update did not use installed identity when a direct caller supplied "
+                f"a different selection: {ignored_selection}"
+            )
 
         builder_readme = target / module.BUILDER_TARGET_ROOT / "README.md"
         builder_readme.write_bytes(b"stale builder projection\n")
-        refreshed = module.mutate_setup(target, "nddev-builder", "full-auto", "update")
+        refreshed = module.mutate_setup(target, "nddev-builder", "safe", "update")
         if builder_readme.relative_to(target).as_posix() not in refreshed["changed"]:
             errors.append("setup update did not report refreshed builder projection")
         state = module.inspect_target(target)
@@ -1628,7 +1630,7 @@ def fake_runtime(module: Any, seed: bytes) -> dict[str, Any]:
 
 def validate_software_transaction_rollback_fault_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-software-txn-smoke-") as tmp:
-        target = Path(tmp) / "target"
+        target = (Path(tmp) / "target").resolve(strict=False)
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
         install_smoke_current_software(module, target)
         binary_path = module.managed_agent_path(target)
@@ -1746,7 +1748,7 @@ def backup_residue(module: Any, target: Path) -> list[str]:
 
 def validate_backup_publication_transaction_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-backup-publish-smoke-") as tmp:
-        target = Path(tmp) / "target"
+        target = (Path(tmp) / "target").resolve(strict=False)
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
         profile = "safe"
         for _ in range(10):
@@ -1832,7 +1834,7 @@ def install_smoke_current_software(module: Any, target: Path) -> None:
 
 def validate_remove_cli_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-remove-cli-smoke-") as tmp:
-        root = Path(tmp)
+        root = Path(tmp).resolve(strict=True)
         target = root / "target"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
         auth = target / module.ISOLATED_HOME_ROOT / "auth.json"
@@ -2324,7 +2326,7 @@ def validate_launch_separator_argv_smoke(module: Any, errors: list[str]) -> None
 
 def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="nddev-cursor-bootstrap-handover-smoke-") as tmp:
-        root = Path(tmp)
+        root = Path(tmp).resolve(strict=True)
         target = root / "target"
         module.mutate_setup(target, "nddev-builder", "full-auto", "install")
 
@@ -2356,7 +2358,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
         if not lock_path.name.startswith(f"{module.PRODUCT_NAME}-"):
             errors.append("bootstrap handover lock filename lacks product namespace")
         expected_digest = module.sha256_bytes(
-            module.PRODUCT_NAME.encode("utf-8") + b"\0" + first["lexical"].encode("utf-8")
+            module.PRODUCT_NAME.encode("utf-8") + b"\0" + first["lock_key"].encode("utf-8")
         )
         if first["digest"] != expected_digest:
             errors.append("bootstrap handover digest did not bind product and target")
@@ -2403,7 +2405,7 @@ def validate_bootstrap_lock_handover_smoke(module: Any, errors: list[str]) -> No
                 {
                     "schema_version": 1,
                     "product_name": module.PRODUCT_NAME,
-                    "lexical_target": first["lexical"],
+                    "lock_key": first["lock_key"],
                     "target_sha256": "0" * 64,
                 },
                 sort_keys=True,
@@ -2681,62 +2683,100 @@ def validate_target_command_external_lock_order_smoke(module: Any, errors: list[
         root = Path(tmp)
         target = root / "target"
         command_argvs: tuple[tuple[str, list[str], str], ...] = (
-            ("status", ["status", "--target", str(target)], "inspect_target"),
-            ("plan", ["plan", "--target", str(target)], "plan_setup"),
-            ("install", ["install", "--target", str(target)], "mutate_setup"),
-            ("update", ["update", "--target", str(target)], "mutate_setup"),
-            ("switch", ["switch", "--target", str(target)], "mutate_setup"),
+            ("status", ["status", "--target", str(target)], "_inspect_target_locked"),
+            ("plan", ["plan", "--target", str(target)], "_plan_setup_locked"),
+            ("install", ["install", "--target", str(target)], "_mutate_setup_locked"),
+            ("update", ["update", "--target", str(target)], "_mutate_setup_locked"),
+            ("switch", ["switch", "--target", str(target)], "_mutate_setup_locked"),
             (
                 "migrate",
                 ["migrate", "--profile", "safe", "--target", str(target)],
-                "migrate_setup",
+                "_migrate_setup_locked",
             ),
-            ("restore", ["restore", "--backup", "0", "--target", str(target)], "restore_slot"),
-            ("remove", ["remove", "--target", str(target)], "remove_setup"),
-            ("software-status", ["software-status", "--target", str(target)], "software_status"),
-            ("install-cli", ["install-cli", "--target", str(target)], "install_cursor_cli"),
-            ("update-cli", ["update-cli", "--target", str(target)], "install_cursor_cli"),
-            ("remove-cli", ["remove-cli", "--target", str(target)], "remove_cursor_cli"),
-            ("launch", ["launch", "--target", str(target), "--", "--help"], "launch_cursor"),
+            (
+                "restore",
+                ["restore", "--backup", "0", "--target", str(target)],
+                "_restore_slot_locked",
+            ),
+            ("remove", ["remove", "--target", str(target)], "_remove_setup_locked"),
+            (
+                "software-status",
+                ["software-status", "--target", str(target)],
+                "_software_status_locked",
+            ),
+            (
+                "install-cli",
+                ["install-cli", "--target", str(target)],
+                "_install_cursor_cli_locked",
+            ),
+            (
+                "update-cli",
+                ["update-cli", "--target", str(target)],
+                "_install_cursor_cli_locked",
+            ),
+            ("remove-cli", ["remove-cli", "--target", str(target)], "_remove_cursor_cli_locked"),
+            (
+                "launch",
+                ["launch", "--target", str(target), "--", "--help"],
+                "_launch_cursor_locked",
+            ),
         )
 
         for command, argv, work_attr in command_argvs:
             events: list[str] = []
-            locked = {"value": False}
+            product_locked = {"value": False}
+            canonical_locked = {"value": False}
 
             def fake_host() -> None:
                 events.append("host")
 
             def fake_lexical(raw: Any) -> str:
                 if events != ["host"]:
-                    errors.append(f"{command}: lexical target validation ran out of order: {events}")
+                    errors.append(
+                        f"{command}: lexical target validation ran out of order: {events}"
+                    )
                 events.append("lexical")
                 return os.fspath(raw)
 
             @contextlib.contextmanager
-            def fake_bootstrap(raw: Any) -> Any:
+            def fake_product() -> Any:
                 if events != ["host", "lexical"]:
-                    errors.append(f"{command}: bootstrap lock ran out of order: {events}")
-                events.append("bootstrap-enter")
-                locked["value"] = True
+                    errors.append(f"{command}: product lock ran out of order: {events}")
+                events.append("product-enter")
+                product_locked["value"] = True
                 try:
                     yield
                 finally:
-                    locked["value"] = False
-                    events.append("bootstrap-exit")
+                    product_locked["value"] = False
+                    events.append("product-exit")
+
+            @contextlib.contextmanager
+            def fake_bootstrap(raw: Any) -> Any:
+                del raw
+                if events != ["host", "lexical", "product-enter", "resolve"]:
+                    errors.append(f"{command}: canonical lock ran out of order: {events}")
+                events.append("canonical-enter")
+                canonical_locked["value"] = True
+                try:
+                    yield
+                finally:
+                    canonical_locked["value"] = False
+                    events.append("canonical-exit")
 
             def fake_resolve(raw: str) -> Path:
-                if not locked["value"]:
-                    raise AssertionError("resolve_target ran before bootstrap lock")
+                if not product_locked["value"]:
+                    raise AssertionError("resolve_target ran before product lock")
+                if canonical_locked["value"]:
+                    raise AssertionError("resolve_target ran inside canonical lock")
                 events.append("resolve")
                 return Path(raw)
 
             def fake_work(*args: Any, **kwargs: Any) -> Any:
                 del args, kwargs
-                if not locked["value"]:
-                    raise AssertionError(f"{work_attr} ran before bootstrap lock")
+                if not canonical_locked["value"]:
+                    raise AssertionError(f"{work_attr} ran before canonical lock")
                 events.append(work_attr)
-                if work_attr == "inspect_target":
+                if work_attr == "_inspect_target_locked":
                     return {
                         "state": "missing",
                         "setup_id": None,
@@ -2753,6 +2793,7 @@ def validate_target_command_external_lock_order_smoke(module: Any, errors: list[
             with (
                 with_restored_attr(module, "require_current_host_supported", fake_host),
                 with_restored_attr(module, "lexical_target_text", fake_lexical),
+                with_restored_attr(module, "product_lifecycle_lock", fake_product),
                 with_restored_attr(module, "bootstrap_lifecycle_lock", fake_bootstrap),
                 with_restored_attr(module, "resolve_target", fake_resolve),
                 with_restored_attr(module, work_attr, fake_work),
@@ -2766,8 +2807,17 @@ def validate_target_command_external_lock_order_smoke(module: Any, errors: list[
                     errors.append(f"{command}: {exc}")
                 except BaseException as exc:  # noqa: BLE001 - public smoke serializes failures.
                     errors.append(f"{command}: lock-order trace raised unexpectedly: {exc}")
-            expected_events = ["host", "lexical", "bootstrap-enter", "resolve", work_attr]
-            if events[:5] != expected_events or events[-1:] != ["bootstrap-exit"]:
+            expected_events = [
+                "host",
+                "lexical",
+                "product-enter",
+                "resolve",
+                "canonical-enter",
+                work_attr,
+                "canonical-exit",
+                "product-exit",
+            ]
+            if events != expected_events:
                 errors.append(f"{command}: target command lock order mismatch: {events}")
 
 
@@ -2809,6 +2859,42 @@ def validate_parser_json_error_smoke(errors: list[str]) -> None:
         errors.append(f"JSON parser smoke error payload mismatch: {payload}")
     if completed.stderr.strip():
         errors.append(f"JSON parser smoke emitted stderr usage: {completed.stderr!r}")
+    update_completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "cli-tools" / "nddev_cursor_cli.py"),
+            "update",
+            "--target",
+            str(ROOT),
+            "--setup",
+            "nddev-builder",
+            "--json",
+        ],
+        cwd=ROOT,
+        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True,
+        capture_output=True,
+        check=False,
+        close_fds=True,
+        timeout=10,
+    )
+    if update_completed.returncode != 2:
+        errors.append(
+            f"update parser rejection smoke returned {update_completed.returncode}, expected 2"
+        )
+    try:
+        update_payload = json.loads(update_completed.stdout)
+    except json.JSONDecodeError as exc:
+        errors.append(
+            f"update parser rejection stdout was not JSON: {exc}; {update_completed.stdout!r}"
+        )
+    else:
+        if update_payload.get("schema_version") != 1 or "--setup" not in str(
+            update_payload.get("error", "")
+        ):
+            errors.append(f"update parser rejection payload mismatch: {update_payload}")
+    if update_completed.stderr.strip():
+        errors.append(f"update parser rejection emitted stderr usage: {update_completed.stderr!r}")
 
 
 def validate_public_manager_smokes(errors: list[str]) -> None:
@@ -3111,17 +3197,11 @@ def main() -> int:
             errors.append("build/manifest.json: lock parent locked mode mismatch")
         if "lock_parent_mode_while_launching" in transaction:
             errors.append("build/manifest.json: transaction lock mode must not be launch-only")
-        if (
-            transaction.get("bootstrap_lock")
-            != BOOTSTRAP_LOCK_PATH
-        ):
+        if transaction.get("bootstrap_lock") != BOOTSTRAP_LOCK_PATH:
             errors.append("build/manifest.json: bootstrap lock path mismatch")
         if transaction.get("bootstrap_lock_file_mode") != "0600":
             errors.append("build/manifest.json: bootstrap lock mode mismatch")
-        if (
-            transaction.get("bootstrap_lock_binding")
-            != BOOTSTRAP_LOCK_BINDING
-        ):
+        if transaction.get("bootstrap_lock_binding") != BOOTSTRAP_LOCK_BINDING:
             errors.append("build/manifest.json: bootstrap lock binding mismatch")
         if transaction.get("mutable_runtime_tmp") != ".nddev-cursor-runtime/tmp":
             errors.append("build/manifest.json: mutable runtime TMPDIR mismatch")
@@ -3194,6 +3274,10 @@ def main() -> int:
             errors.append("config/nddev-contract.json: profile_ids mismatch")
         if " update " not in f" {setup_system.get('update_command', '')} ":
             errors.append("config/nddev-contract.json: setup update_command mismatch")
+        if "--setup" in str(setup_system.get("update_command", "")) or "--profile" in str(
+            setup_system.get("update_command", "")
+        ):
+            errors.append("config/nddev-contract.json: setup update_command must be target-only")
         validate_runtime_compatibility(
             "config/nddev-contract.json", contract.get("runtime_compatibility", {}), errors
         )
@@ -3222,17 +3306,11 @@ def main() -> int:
             errors.append("config/nddev-contract.json: lock parent locked mode mismatch")
         if "lock_parent_mode_while_launching" in safety:
             errors.append("config/nddev-contract.json: safety lock mode must not be launch-only")
-        if (
-            safety.get("bootstrap_lock")
-            != BOOTSTRAP_LOCK_PATH
-        ):
+        if safety.get("bootstrap_lock") != BOOTSTRAP_LOCK_PATH:
             errors.append("config/nddev-contract.json: bootstrap lock path mismatch")
         if safety.get("bootstrap_lock_file_mode") != "0600":
             errors.append("config/nddev-contract.json: bootstrap lock mode mismatch")
-        if (
-            safety.get("bootstrap_lock_binding")
-            != BOOTSTRAP_LOCK_BINDING
-        ):
+        if safety.get("bootstrap_lock_binding") != BOOTSTRAP_LOCK_BINDING:
             errors.append("config/nddev-contract.json: bootstrap lock binding mismatch")
         if safety.get("backup_path") != ".nddev-cursor-cli/backups":
             errors.append("config/nddev-contract.json: backup path mismatch")
