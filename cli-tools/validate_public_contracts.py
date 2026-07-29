@@ -1196,9 +1196,34 @@ def validate_backup_rotation_and_binding_smoke(module: Any, errors: list[str]) -
         pool = module.backup_pool(target)
         if pool.parent != module.control_root(target):
             errors.append("backup rotation smoke backup pool is not control-root internal")
-        real_slots = sorted(path.name for path in pool.iterdir() if path.is_dir() and not path.is_symlink())
+        canonical_slots: list[str] = []
+        old_holds: list[str] = []
+        for path in pool.iterdir():
+            if path.is_symlink() or not path.is_dir():
+                errors.append(f"backup rotation smoke found unsafe backup pool entry: {path.name}")
+                continue
+            if path.name in {str(slot) for slot in range(10)}:
+                canonical_slots.append(path.name)
+                continue
+            if re.fullmatch(r"\.[0-9]+\.nddev-backup-old-[0-9]+-[0-9a-f]{16}", path.name):
+                old_holds.append(path.name)
+                try:
+                    module.require_owner_private_directory(path, "backup old hold")
+                    envelope_path = path / module.BACKUP_NAME
+                    module.require_backup_envelope_file(envelope_path, "backup old hold envelope")
+                    envelope = module.load_json_object(envelope_path, "backup old hold")
+                except module.CursorSetupError as exc:
+                    errors.append(f"backup old hold is invalid: {exc}")
+                    continue
+                if envelope.get("canonical_target") != str(target.resolve(strict=False)):
+                    errors.append("backup old hold canonical target mismatch")
+                continue
+            errors.append(f"backup rotation smoke found unknown backup pool entry: {path.name}")
+        real_slots = sorted(canonical_slots)
         if real_slots != [str(slot) for slot in range(10)]:
-            errors.append(f"backup rotation smoke expected slots 0..9, got {real_slots}")
+            errors.append(f"backup rotation smoke expected canonical slots 0..9, got {real_slots}")
+        if not old_holds:
+            errors.append("backup rotation smoke did not preserve a rotated old slot for cleanup C")
         if len(set(slots)) != 10 or len(slots) != 11:
             errors.append(f"backup rotation smoke did not rotate bounded slots: {slots}")
         for slot in range(10):
@@ -1228,6 +1253,180 @@ def validate_backup_rotation_and_binding_smoke(module: Any, errors: list[str]) -
                 errors.append("backup canonical binding failed with unexpected error")
         else:
             errors.append("backup canonical binding accepted another target's backup")
+
+
+def validate_exact_managed_lifecycle_smoke(module: Any, errors: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="nddev-cursor-exact-managed-smoke-") as tmp:
+        root = Path(tmp)
+        target = root / "target"
+        module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        config = target / module.CONFIG_NAME
+        stamp = target / module.STAMP_NAME
+        original = {
+            "config": snapshot_bootstrap_path(config),
+            "stamp": snapshot_bootstrap_path(stamp),
+            "target": snapshot_bootstrap_path(target),
+        }
+        current = module.mutate_setup(target, "nddev-builder", "full-auto", "install")
+        if current.get("changed"):
+            errors.append(f"same-content install reported changes: {current.get('changed')}")
+        if {
+            "config": snapshot_bootstrap_path(config),
+            "stamp": snapshot_bootstrap_path(stamp),
+            "target": snapshot_bootstrap_path(target),
+        } != original:
+            errors.append("same-content install changed managed object identity")
+
+        real_replace = module.os.replace
+
+        def fail_config_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            destination_path = Path(destination)
+            if destination_path.name == module.CONFIG_NAME:
+                raise module.CursorSetupError("injected managed publish failure")
+            real_replace(source, destination)
+
+        with with_restored_attr(module.os, "replace", fail_config_replace):
+            try:
+                module.mutate_setup(target, "nddev-builder", "safe", "switch")
+            except module.CursorSetupError as exc:
+                if "injected managed publish failure" not in str(exc):
+                    errors.append(f"managed publish failure returned unexpected error: {exc}")
+            else:
+                errors.append("managed publish failure unexpectedly succeeded")
+        if {
+            "config": snapshot_bootstrap_path(config),
+            "stamp": snapshot_bootstrap_path(stamp),
+            "target": snapshot_bootstrap_path(target),
+        } != original:
+            errors.append("managed publish failure did not restore original object graph")
+
+        symlink_target = root / "symlink-target"
+        module.mutate_setup(symlink_target, "nddev-builder", "full-auto", "install")
+        symlink_config = symlink_target / module.CONFIG_NAME
+        graph = module.capture_managed_object_graph(symlink_target, (module.CONFIG_NAME,))
+        displaced = root / "displaced-config"
+        symlink_config.rename(displaced)
+        symlink_config.symlink_to(displaced)
+        symlink_snapshot = snapshot_bootstrap_path(symlink_config)
+        try:
+            module.replace_managed_state(
+                symlink_target,
+                {module.CONFIG_NAME: b"{}\n"},
+                graph,
+                names=(module.CONFIG_NAME,),
+            )
+        except module.CursorSetupError:
+            pass
+        else:
+            errors.append("managed symlink replacement was accepted")
+        if snapshot_bootstrap_path(symlink_config) != symlink_snapshot:
+            errors.append("managed symlink replacement was mutated")
+
+        backup_target = root / "backup-target"
+        module.mutate_setup(backup_target, "nddev-builder", "full-auto", "install")
+        backup_config = backup_target / module.CONFIG_NAME
+        backup_stamp = backup_target / module.STAMP_NAME
+        backup_original = {
+            "config": snapshot_bootstrap_path(backup_config),
+            "stamp": snapshot_bootstrap_path(backup_stamp),
+            "pool": snapshot_bootstrap_path(module.backup_pool(backup_target)),
+        }
+        real_rename_no_replace = module.rename_no_replace
+
+        def fail_backup_publish(
+            source: Path, destination: Path, label: str
+        ) -> bool:
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                destination_path.name == "0"
+                and source_path.name.startswith(".0.nddev-backup-tmp-")
+            ):
+                raise module.CursorSetupError("injected backup publication failure")
+            return real_rename_no_replace(source_path, destination_path, label)
+
+        with with_restored_attr(module, "rename_no_replace", fail_backup_publish):
+            try:
+                module.mutate_setup(backup_target, "nddev-builder", "safe", "switch")
+            except module.CursorSetupError as exc:
+                if "injected backup publication failure" not in str(exc):
+                    errors.append(f"backup publication failure returned unexpected error: {exc}")
+            else:
+                errors.append("backup publication failure unexpectedly succeeded")
+        if {
+            "config": snapshot_bootstrap_path(backup_config),
+            "stamp": snapshot_bootstrap_path(backup_stamp),
+            "pool": snapshot_bootstrap_path(module.backup_pool(backup_target)),
+        } != backup_original:
+            errors.append("backup publication failure did not restore exact pre-state")
+
+        result = module.mutate_setup(backup_target, "nddev-builder", "safe", "switch")
+        slot = result.get("backup_slot")
+        if not isinstance(slot, int):
+            errors.append("backup success did not report an integer slot")
+        else:
+            envelope = module.load_backup(backup_target, slot)
+            if envelope.get("schema_version") != 3:
+                errors.append("backup success did not publish schema_version 3")
+            if set(envelope.get("files", {})) != set(envelope.get("file_records", {})):
+                errors.append("backup success file_records path set mismatch")
+
+        created_parent_target = root / "created-parent-target"
+        created_parent_target.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+        created_parent_target.chmod(module.OWNER_DIRECTORY_MODE)
+        created_directories: list[dict[str, Any]] = []
+        module.ensure_real_directory(
+            created_parent_target,
+            Path("new-parent"),
+            created_directories,
+        )
+        created_path = created_parent_target / "new-parent"
+        created_path.rmdir()
+        created_path.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+        created_path.chmod(module.OWNER_DIRECTORY_MODE)
+        replacement_snapshot = snapshot_bootstrap_path(created_path)
+        try:
+            module.remove_empty_created_parents(created_directories)
+        except module.CursorSetupError:
+            pass
+        else:
+            errors.append("created-parent replacement cleanup unexpectedly succeeded")
+        finally:
+            module.close_held_directory_signatures(created_directories)
+        if snapshot_bootstrap_path(created_path) != replacement_snapshot:
+            errors.append("created-parent replacement was removed or mutated")
+
+        winner_target = root / "backup-winner"
+        module.mutate_setup(winner_target, "nddev-builder", "full-auto", "install")
+        winner_pool = module.backup_pool(winner_target)
+
+        def backup_winner_publish(source: Path, destination: Path, label: str) -> bool:
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                destination_path.name == "0"
+                and source_path.name.startswith(".0.nddev-backup-tmp-")
+            ):
+                destination_path.mkdir(mode=module.OWNER_DIRECTORY_MODE)
+                destination_path.chmod(module.OWNER_DIRECTORY_MODE)
+                (destination_path / "winner").write_bytes(b"winner\n")
+                return False
+            return real_rename_no_replace(source_path, destination_path, label)
+
+        with with_restored_attr(module, "rename_no_replace", backup_winner_publish):
+            try:
+                module.mutate_setup(winner_target, "nddev-builder", "safe", "switch")
+            except module.CursorSetupError as exc:
+                if (
+                    "no-replace race" not in str(exc)
+                    and "backup pool changed before metadata restore" not in str(exc)
+                ):
+                    errors.append(f"backup winner returned unexpected error: {exc}")
+            else:
+                errors.append("backup winner race unexpectedly succeeded")
+        winner_slot = winner_pool / "0"
+        if not (winner_slot / "winner").is_file():
+            errors.append("backup winner replacement was not preserved")
 
 
 def install_smoke_current_software(module: Any, target: Path) -> None:
@@ -2765,6 +2964,10 @@ def validate_public_manager_smokes(errors: list[str]) -> None:
                 (
                     "backup rotation and binding",
                     lambda: validate_backup_rotation_and_binding_smoke(module, errors),
+                ),
+                (
+                    "exact managed lifecycle",
+                    lambda: validate_exact_managed_lifecycle_smoke(module, errors),
                 ),
                 ("target mode", lambda: validate_target_mode_smokes(module, errors)),
                 (

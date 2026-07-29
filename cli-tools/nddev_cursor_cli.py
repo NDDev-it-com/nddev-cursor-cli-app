@@ -214,6 +214,20 @@ BACKUP_KEYS_V2 = {
     "created_at",
     "files",
 }
+BACKUP_KEYS_V3 = {
+    "schema_version",
+    "product_name",
+    "build_version",
+    "slot",
+    "canonical_target",
+    "source_content_setup_id",
+    "source_profile_id",
+    "source_legacy_setup_id",
+    "managed_files",
+    "created_at",
+    "files",
+    "file_records",
+}
 BOOTSTRAP_LOCK_KEYS_V1 = {
     "schema_version",
     "product_name",
@@ -2390,6 +2404,18 @@ def remove_backup_slot(slot_path: Path) -> None:
     slot_path.rmdir()
 
 
+def remove_backup_slot_exact(
+    slot_signature: dict[str, Any], envelope_signature: dict[str, Any], label: str
+) -> None:
+    slot_path = Path(slot_signature["path"])
+    envelope_path = slot_path / BACKUP_NAME
+    if not current_file_matches_signature(envelope_path, envelope_signature, f"{label} envelope"):
+        fail(f"{label} envelope changed before cleanup")
+    envelope_path.unlink()
+    fsync_directory(slot_path, label)
+    rmdir_held_directory(slot_signature, label)
+
+
 def choose_backup_slot(pool: Path) -> int:
     ensure_backup_pool(pool)
     for slot in range(10):
@@ -2416,17 +2442,385 @@ def capture_managed_files(target: Path) -> dict[str, bytes | None]:
     return captured
 
 
+def relative_parent_chain(relative: Path) -> list[Path]:
+    parents: list[Path] = [Path(".")]
+    parent = relative.parent
+    chain: list[Path] = []
+    while parent != Path("."):
+        chain.append(parent)
+        parent = parent.parent
+    parents.extend(reversed(chain))
+    return parents
+
+
+def file_record(path: Path, label: str, *, max_bytes: int) -> dict[str, Any]:
+    before = require_regular_file(path, label, max_bytes=max_bytes)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            fail(f"{label} changed while it was being opened")
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != OWNER_FILE_MODE
+        ):
+            fail(f"{label} changed to an unsafe file")
+        uid = current_user_id()
+        if uid is not None and opened.st_uid != uid:
+            fail(f"{label} must be owned by the current user")
+        content = fd_read_bounded(descriptor, label, max_bytes)
+    finally:
+        os.close(descriptor)
+    after = require_regular_file(path, label, max_bytes=max_bytes)
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_size != after.st_size
+    ):
+        fail(f"{label} changed during validation")
+    return {
+        "kind": "file",
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mode": stat.S_IMODE(after.st_mode),
+        "uid": after.st_uid,
+        "gid": after.st_gid,
+        "nlink": after.st_nlink,
+        "size": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
+        "payload": content,
+        "sha256": sha256_bytes(content),
+    }
+
+
+def open_owner_directory_descriptor(path: Path, label: str) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened: {exc}")
+    try:
+        info = require_directory_matches_fd(path, descriptor, label, {OWNER_DIRECTORY_MODE})
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, info
+
+
+def list_directory_descriptor(descriptor: int, label: str) -> list[str]:
+    try:
+        children = os.listdir(descriptor)
+    except OSError as exc:
+        fail(f"{label} could not be listed: {exc}")
+    return sorted(str(child) for child in children)
+
+
+def directory_record(path: Path, label: str) -> dict[str, Any]:
+    descriptor, info = open_owner_directory_descriptor(path, label)
+    try:
+        children = list_directory_descriptor(descriptor, label)
+        opened = os.fstat(descriptor)
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            fail(f"{label} disappeared while it was being listed")
+        if (
+            current.st_dev != info.st_dev
+            or current.st_ino != info.st_ino
+            or opened.st_dev != info.st_dev
+            or opened.st_ino != info.st_ino
+            or current.st_uid != info.st_uid
+            or current.st_gid != info.st_gid
+            or current.st_nlink != info.st_nlink
+            or current.st_size != info.st_size
+            or current.st_mtime_ns != info.st_mtime_ns
+            or opened.st_uid != info.st_uid
+            or opened.st_gid != info.st_gid
+            or opened.st_nlink != info.st_nlink
+            or opened.st_size != info.st_size
+            or opened.st_mtime_ns != info.st_mtime_ns
+        ):
+            fail(f"{label} changed while it was being captured")
+    finally:
+        os.close(descriptor)
+    return {
+        "kind": "directory",
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "children": children,
+    }
+
+
+def held_directory_signature(path: Path, label: str) -> dict[str, Any]:
+    descriptor, info = open_owner_directory_descriptor(path, label)
+    try:
+        children = list_directory_descriptor(descriptor, label)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return {
+        "kind": "directory",
+        "path": path,
+        "descriptor": descriptor,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "children": children,
+    }
+
+
+def close_held_directory_signature(signature: dict[str, Any]) -> None:
+    descriptor = signature.get("descriptor")
+    if isinstance(descriptor, int):
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        signature["descriptor"] = None
+
+
+def close_held_directory_signatures(signatures: list[dict[str, Any]]) -> None:
+    for signature in signatures:
+        close_held_directory_signature(signature)
+
+
+def require_held_directory_signature(
+    signature: dict[str, Any], label: str, *, expected_children: list[str] | None = None
+) -> os.stat_result:
+    path = Path(signature["path"])
+    descriptor = signature.get("descriptor")
+    if not isinstance(descriptor, int):
+        fail(f"{label} directory descriptor is closed")
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} disappeared")
+    fd_info = os.fstat(descriptor)
+    if (
+        path_info.st_dev != signature["device"]
+        or path_info.st_ino != signature["inode"]
+        or fd_info.st_dev != signature["device"]
+        or fd_info.st_ino != signature["inode"]
+        or stat.S_ISLNK(path_info.st_mode)
+        or not stat.S_ISDIR(fd_info.st_mode)
+        or path_info.st_uid != signature["uid"]
+        or path_info.st_gid != signature["gid"]
+        or fd_info.st_uid != signature["uid"]
+        or fd_info.st_gid != signature["gid"]
+        or stat.S_IMODE(path_info.st_mode) != signature["mode"]
+        or stat.S_IMODE(fd_info.st_mode) != signature["mode"]
+        or path_info.st_nlink != signature["nlink"]
+        or fd_info.st_nlink != signature["nlink"]
+        or path_info.st_nlink != fd_info.st_nlink
+        or path_info.st_size != fd_info.st_size
+    ):
+        fail(f"{label} changed before directory cleanup")
+    children = list_directory_descriptor(descriptor, label)
+    if expected_children is not None and children != expected_children:
+        fail(f"{label} contains unexpected entries")
+    if expected_children is None and children != signature["children"]:
+        fail(f"{label} children changed")
+    return path_info
+
+
+def rmdir_held_directory(signature: dict[str, Any], label: str) -> None:
+    path = Path(signature["path"])
+    require_held_directory_signature(signature, label, expected_children=[])
+    path.rmdir()
+    fsync_directory(path.parent, f"{label} parent")
+    close_held_directory_signature(signature)
+
+
+def absent_record(path: Path) -> dict[str, Any]:
+    if path.exists() or path.is_symlink():
+        fail(f"expected absent path exists: {path}")
+    return {"kind": "absent"}
+
+
+def capture_managed_object_graph(target: Path, names: tuple[str, ...] | None = None) -> dict[str, Any]:
+    selected = tuple(path.as_posix() for path in managed_paths()) if names is None else names
+    parents: dict[str, dict[str, Any]] = {}
+    files: dict[str, dict[str, Any]] = {}
+    for relative_name in selected:
+        relative = safe_relative(relative_name)
+        for parent_relative in relative_parent_chain(relative):
+            parent = target if parent_relative == Path(".") else target / parent_relative
+            key = parent_relative.as_posix()
+            if key == ".":
+                key = ""
+            if key not in parents:
+                parents[key] = (
+                    directory_record(parent, "managed parent")
+                    if parent.exists() or parent.is_symlink()
+                    else absent_record(parent)
+                )
+        path = target / relative
+        files[relative_name] = (
+            file_record(
+                path,
+                f"managed path {relative_name}",
+                max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+            )
+            if path.exists() or path.is_symlink()
+            else absent_record(path)
+        )
+    return {"parents": parents, "files": files}
+
+
+def records_match(expected: dict[str, Any], current: dict[str, Any]) -> bool:
+    return expected == current
+
+
+def revalidate_managed_object_graph(
+    target: Path, graph: dict[str, Any], names: tuple[str, ...] | None = None
+) -> None:
+    selected = tuple(graph["files"]) if names is None else names
+    current = capture_managed_object_graph(target, selected)
+    for section in ("parents", "files"):
+        for key, expected in graph[section].items():
+            if not records_match(expected, current[section].get(key, {"kind": "absent"})):
+                fail(f"managed object graph changed before transition: {key or '.'}")
+
+
+def managed_graph_to_files(graph: dict[str, Any]) -> dict[str, bytes | None]:
+    return {
+        relative: None if record["kind"] == "absent" else bytes(record["payload"])
+        for relative, record in graph["files"].items()
+    }
+
+
+def write_exclusive_file_synced(path: Path, content: bytes, mode: int, label: str) -> dict[str, Any]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened: {exc}")
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                fail(f"{label} write made no progress")
+            view = view[written:]
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        info = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    return {
+        "path": path,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "sha256": sha256_bytes(content),
+    }
+
+
+def current_file_matches_signature(path: Path, signature: dict[str, Any], label: str) -> bool:
+    try:
+        current = file_record(path, label, max_bytes=MANAGED_PAYLOAD_MAX_BYTES)
+    except CursorSetupError:
+        return False
+    return (
+        current["device"] == signature["device"]
+        and current["inode"] == signature["inode"]
+        and current["mode"] == signature["mode"]
+        and current["uid"] == signature["uid"]
+        and current["gid"] == signature["gid"]
+        and current["nlink"] == signature["nlink"]
+        and current["size"] == signature["size"]
+        and current["mtime_ns"] == signature["mtime_ns"]
+        and current["sha256"] == signature["sha256"]
+    )
+
+
+def restore_parent_metadata(target: Path, graph: dict[str, Any]) -> None:
+    for relative_name, record in sorted(
+        graph["parents"].items(), key=lambda item: item[0].count("/"), reverse=True
+    ):
+        if record["kind"] != "directory":
+            continue
+        path = target if relative_name == "" else target / relative_name
+        restore_directory_record_metadata(path, record, f"managed parent {relative_name or '.'}")
+
+
+def restore_directory_record_metadata(path: Path, record: dict[str, Any], label: str) -> None:
+    current = directory_record(path, label)
+    topology_record = dict(record)
+    topology_record["mode"] = current["mode"]
+    topology_record["mtime_ns"] = current["mtime_ns"]
+    if not records_match(topology_record, current):
+        fail(f"{label} changed before metadata restore")
+    if current["mode"] != record["mode"]:
+        os.chmod(path, int(record["mode"]))
+    os.utime(path, ns=(path.lstat().st_atime_ns, int(record["mtime_ns"])))
+    restored = directory_record(path, label)
+    if not records_match(record, restored):
+        fail(f"{label} metadata could not be restored")
+
+
+def remove_empty_created_parents(created_directories: list[dict[str, Any]]) -> None:
+    for signature in reversed(created_directories):
+        rmdir_held_directory(signature, "created managed parent")
+
+
 def write_backup(target: Path, source_state: dict[str, Any]) -> int:
     pool = backup_pool(target)
+    pool_existed = path_exists_no_follow(pool)
+    pool_parent_snapshot = directory_record(pool.parent, "control root")
     slot = choose_backup_slot(pool)
     slot_path = pool / str(slot)
-    if path_exists_no_follow(slot_path):
-        remove_backup_slot(slot_path)
-    slot_path.mkdir(mode=OWNER_DIRECTORY_MODE)
-    slot_path.chmod(OWNER_DIRECTORY_MODE)
     files = capture_managed_files(target)
+    file_records = {
+        relative: (
+            {"present": False, "size": None, "sha256": None}
+            if content is None
+            else {"present": True, "size": len(content), "sha256": sha256_bytes(content)}
+        )
+        for relative, content in files.items()
+    }
     envelope = {
-        "schema_version": 2,
+        "schema_version": 3,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "slot": slot,
@@ -2440,9 +2834,63 @@ def write_backup(target: Path, source_state: dict[str, Any]) -> int:
             relative: None if content is None else base64.b64encode(content).decode("ascii")
             for relative, content in files.items()
         },
+        "file_records": file_records,
     }
-    (slot_path / BACKUP_NAME).write_bytes(canonical_json(envelope))
-    (slot_path / BACKUP_NAME).chmod(OWNER_FILE_MODE)
+    payload = canonical_json(envelope)
+    pool_snapshot = directory_record(pool, "backup pool")
+    temp_slot = pool / f".{slot}.nddev-backup-tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    old_slot = pool / f".{slot}.nddev-backup-old-{os.getpid()}-{secrets.token_hex(8)}"
+    temp_slot_signature: dict[str, Any] | None = None
+    envelope_signature: dict[str, Any] | None = None
+    old_moved = False
+    published = False
+    try:
+        temp_slot.mkdir(mode=OWNER_DIRECTORY_MODE)
+        temp_slot_signature = held_directory_signature(temp_slot, "backup temporary slot")
+        temp_slot.chmod(OWNER_DIRECTORY_MODE)
+        backup_path = temp_slot / BACKUP_NAME
+        envelope_signature = write_exclusive_file_synced(
+            backup_path, payload, OWNER_FILE_MODE, "backup envelope"
+        )
+        fsync_directory(temp_slot, "backup slot")
+        if path_exists_no_follow(slot_path):
+            require_owner_private_directory(slot_path, f"backup slot {slot}")
+            if not rename_no_replace(slot_path, old_slot, "backup old slot hold"):
+                fail("backup old slot hold already exists")
+            old_moved = True
+            fsync_directory(pool, "backup pool")
+        if not rename_no_replace(temp_slot, slot_path, "backup slot"):
+            fail("backup slot publication lost a no-replace race")
+        if temp_slot_signature is not None:
+            temp_slot_signature["path"] = slot_path
+        published = True
+        fsync_directory(pool, "backup pool")
+        load_backup(target, slot)
+    except BaseException:
+        if temp_slot_signature is not None and envelope_signature is not None:
+            cleanup_path = slot_path if published else temp_slot
+            temp_slot_signature["path"] = cleanup_path
+            if path_exists_no_follow(cleanup_path):
+                with contextlib.suppress(BaseException):
+                    remove_backup_slot_exact(
+                        temp_slot_signature,
+                        envelope_signature,
+                        "backup published slot" if published else "backup temporary slot",
+                    )
+        if old_moved and path_exists_no_follow(old_slot) and not path_exists_no_follow(slot_path):
+            if not rename_no_replace(old_slot, slot_path, "backup old slot restore"):
+                fail("backup old slot restore lost a no-replace race")
+            fsync_directory(pool, "backup pool")
+        restore_directory_record_metadata(pool, pool_snapshot, "backup pool")
+        if not pool_existed and path_exists_no_follow(pool):
+            with contextlib.suppress(OSError):
+                pool.rmdir()
+            fsync_directory(pool.parent, "control root")
+            restore_directory_record_metadata(pool.parent, pool_parent_snapshot, "control root")
+        raise
+    finally:
+        if temp_slot_signature is not None:
+            close_held_directory_signature(temp_slot_signature)
     return slot
 
 
@@ -2457,6 +2905,8 @@ def load_backup(target: Path, slot: int) -> dict[str, Any]:
         require_exact_keys(envelope, BACKUP_KEYS_V1, f"backup slot {slot}")
     elif schema_version == 2:
         require_exact_keys(envelope, BACKUP_KEYS_V2, f"backup slot {slot}")
+    elif schema_version == 3:
+        require_exact_keys(envelope, BACKUP_KEYS_V3, f"backup slot {slot}")
     else:
         fail("backup is not owned by nddev-cursor-cli-app")
     if envelope["product_name"] != PRODUCT_NAME:
@@ -2465,7 +2915,39 @@ def load_backup(target: Path, slot: int) -> dict[str, Any]:
         fail("backup belongs to a different canonical target")
     if envelope["slot"] != slot:
         fail("backup slot identity mismatch")
+    if schema_version == 3:
+        validate_backup_file_records(envelope)
     return envelope
+
+
+def validate_backup_file_records(envelope: dict[str, Any]) -> None:
+    files = envelope.get("files")
+    records = envelope.get("file_records")
+    if not isinstance(files, dict) or not isinstance(records, dict):
+        fail("backup file records must be objects")
+    if set(files) != set(records):
+        fail("backup file records path set mismatch")
+    for relative, encoded in files.items():
+        record = records[relative]
+        if not isinstance(record, dict):
+            fail(f"backup file record for {relative} must be an object")
+        require_exact_keys(record, {"present", "size", "sha256"}, f"backup file record {relative}")
+        if encoded is None:
+            if record != {"present": False, "size": None, "sha256": None}:
+                fail(f"backup absent file record mismatch: {relative}")
+            continue
+        if not isinstance(encoded, str):
+            fail(f"backup payload for {relative} must be a base64 string")
+        try:
+            content = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, UnicodeEncodeError) as exc:
+            fail(f"backup payload for {relative} is invalid: {exc}")
+        if (
+            record.get("present") is not True
+            or record.get("size") != len(content)
+            or record.get("sha256") != sha256_bytes(content)
+        ):
+            fail(f"backup file record digest mismatch: {relative}")
 
 
 def safe_relative(relative: str) -> Path:
@@ -2483,7 +2965,9 @@ def remove_empty_parents(target: Path, path: Path) -> None:
         parent = parent.parent
 
 
-def ensure_real_directory(root: Path, relative: Path) -> None:
+def ensure_real_directory(
+    root: Path, relative: Path, created_directories: list[dict[str, Any]] | None = None
+) -> None:
     current = root
     uid = current_user_id()
     for part in relative.parts:
@@ -2501,6 +2985,10 @@ def ensure_real_directory(root: Path, relative: Path) -> None:
                 fail(f"managed directory must have mode 0700: {current}")
             continue
         current.mkdir(mode=OWNER_DIRECTORY_MODE)
+        if created_directories is not None:
+            created_directories.append(
+                held_directory_signature(current, "created managed parent")
+            )
         current.chmod(OWNER_DIRECTORY_MODE)
 
 
@@ -2530,39 +3018,148 @@ def replace_managed_state(
     *,
     names: tuple[str, ...] | None = None,
 ) -> None:
-    del expected
     selected = tuple(desired) if names is None else names
-    for relative_name in selected:
-        relative = safe_relative(relative_name)
-        destination = target / relative
-        content = desired.get(relative_name)
-        if content is None:
-            if destination.exists() or destination.is_symlink():
-                require_regular_file(
+    if isinstance(expected, dict) and "files" in expected and "parents" in expected:
+        prestate = expected
+    else:
+        prestate = capture_managed_object_graph(target, selected)
+    revalidate_managed_object_graph(target, prestate, selected)
+    if all(
+        (
+            prestate["files"][relative_name]["kind"] == "absent"
+            and desired.get(relative_name) is None
+        )
+        or (
+            prestate["files"][relative_name]["kind"] == "file"
+            and desired.get(relative_name) == prestate["files"][relative_name]["payload"]
+        )
+        for relative_name in selected
+    ):
+        return
+
+    ensure_control_root(target)
+    transaction_root = control_root(target) / f".managed-txn-{os.getpid()}-{secrets.token_hex(8)}"
+    held_root = transaction_root / "held"
+    directory_signatures: list[dict[str, Any]] = []
+    created_directories: list[dict[str, Any]] = []
+    transaction_signature: dict[str, Any] | None = None
+    held_signature: dict[str, Any] | None = None
+    new_records: dict[str, dict[str, Any]] = {}
+    held_records: dict[str, Path] = {}
+    committed = False
+    try:
+        transaction_root.mkdir(mode=OWNER_DIRECTORY_MODE)
+        transaction_signature = held_directory_signature(transaction_root, "managed transaction root")
+        directory_signatures.append(transaction_signature)
+        transaction_root.chmod(OWNER_DIRECTORY_MODE)
+        held_root.mkdir(mode=OWNER_DIRECTORY_MODE)
+        held_signature = held_directory_signature(held_root, "managed held root")
+        directory_signatures.append(held_signature)
+        held_root.chmod(OWNER_DIRECTORY_MODE)
+        for relative_name in selected:
+            relative = safe_relative(relative_name)
+            destination = target / relative
+            content = desired.get(relative_name)
+            before_record = prestate["files"][relative_name]
+            if before_record["kind"] == "file":
+                if content == before_record["payload"]:
+                    continue
+                hold_name = base64.urlsafe_b64encode(relative_name.encode("utf-8")).decode("ascii")
+                held_path = held_root / hold_name
+                current = file_record(
                     destination,
-                    f"managed path {relative.as_posix()}",
+                    f"managed path {relative_name}",
                     max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
                 )
+                if current != before_record:
+                    fail(f"managed path changed before transition: {relative_name}")
+                os.rename(destination, held_path)
+                fsync_directory(destination.parent, "managed parent")
+                held_records[relative_name] = held_path
+            elif content is None:
+                continue
+            if content is not None:
+                ensure_real_directory(target, relative.parent, created_directories)
+                if destination.exists() or destination.is_symlink():
+                    fail(f"managed destination changed before publication: {relative_name}")
+                temporary = destination.with_name(
+                    f".{destination.name}.nddev-tmp-{os.getpid()}-{secrets.token_hex(8)}"
+                )
+                try:
+                    signature = write_exclusive_file_synced(
+                        temporary,
+                        content,
+                        OWNER_FILE_MODE,
+                        f"managed path {relative_name}",
+                    )
+                    os.replace(temporary, destination)
+                    fsync_directory(destination.parent, "managed parent")
+                    signature["path"] = destination
+                    new_records[relative_name] = signature
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        temporary.unlink()
+        committed = True
+    except BaseException:
+        for relative_name, signature in reversed(list(new_records.items())):
+            destination = target / safe_relative(relative_name)
+            if current_file_matches_signature(
+                destination, signature, f"managed path {relative_name}"
+            ):
                 destination.unlink()
-                remove_empty_parents(target, destination)
-            continue
-        ensure_real_directory(target, relative.parent)
-        if destination.exists() or destination.is_symlink():
-            require_regular_file(
-                destination,
-                f"managed path {relative.as_posix()}",
+                fsync_directory(destination.parent, "managed parent")
+        for relative_name, held_path in reversed(list(held_records.items())):
+            destination = target / safe_relative(relative_name)
+            original = prestate["files"][relative_name]
+            if destination.exists() or destination.is_symlink():
+                fail(f"managed rollback refused to overwrite replacement: {relative_name}")
+            current = file_record(
+                held_path,
+                f"held managed path {relative_name}",
                 max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
             )
-        temporary = destination.with_name(
-            f".{destination.name}.nddev-tmp-{os.getpid()}-{secrets.token_hex(8)}"
-        )
-        try:
-            write_exclusive_file(temporary, content)
-            os.replace(temporary, destination)
-            destination.chmod(OWNER_FILE_MODE)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                temporary.unlink()
+            if current != original:
+                fail(f"held managed path changed before rollback: {relative_name}")
+            ensure_real_directory(target, safe_relative(relative_name).parent, created_directories)
+            os.rename(held_path, destination)
+            os.chmod(destination, int(original["mode"]))
+            os.utime(destination, ns=(time.time_ns(), int(original["mtime_ns"])))
+            fsync_directory(destination.parent, "managed parent")
+        remove_empty_created_parents(created_directories)
+        restore_parent_metadata(target, prestate)
+        if held_signature is not None:
+            rmdir_held_directory(held_signature, "managed held root")
+        if transaction_signature is not None:
+            rmdir_held_directory(transaction_signature, "managed transaction root")
+        raise
+    finally:
+        if committed:
+            cleanup_errors: list[str] = []
+            for relative_name, held_path in reversed(list(held_records.items())):
+                original = prestate["files"][relative_name]
+                try:
+                    if not current_file_matches_signature(
+                        held_path, original, f"held managed path {relative_name}"
+                    ):
+                        fail(f"held managed path changed before cleanup: {relative_name}")
+                    held_path.unlink()
+                    fsync_directory(held_path.parent, "managed held root")
+                except BaseException as exc:
+                    cleanup_errors.append(str(exc))
+            if held_signature is not None:
+                try:
+                    rmdir_held_directory(held_signature, "managed held root")
+                except BaseException as exc:
+                    cleanup_errors.append(str(exc))
+            if transaction_signature is not None:
+                try:
+                    rmdir_held_directory(transaction_signature, "managed transaction root")
+                except BaseException as exc:
+                    cleanup_errors.append(str(exc))
+            if cleanup_errors:
+                fail(f"managed transaction cleanup failed: {cleanup_errors[0]}")
+        close_held_directory_signatures(directory_signatures)
+        close_held_directory_signatures(created_directories)
 
 
 def desired_for_selection(
@@ -2704,6 +3301,7 @@ def mutate_setup(
             existing_config = load_target_config(target) if state["state"] == "managed" else None
             desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
             before = capture_managed_files(target)
+            before_graph = capture_managed_object_graph(target, tuple(desired))
             changed = [
                 relative for relative, content in desired.items() if before.get(relative) != content
             ]
@@ -2712,7 +3310,7 @@ def mutate_setup(
                 backup_slot = write_backup(target, state)
             try:
                 if changed:
-                    replace_managed_state(target, desired, before)
+                    replace_managed_state(target, desired, before_graph)
                 final = inspect_target(target)
                 if (
                     final["state"] != "managed"
@@ -2723,7 +3321,6 @@ def mutate_setup(
                 ):
                     fail("setup mutation postcondition failed")
             except BaseException:
-                replace_managed_state(target, before, None)
                 raise
     except BaseException:
         if created_target:
@@ -2761,12 +3358,13 @@ def migrate_setup(
         existing_config = load_target_config(target)
         desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
         before = capture_managed_files(target)
+        before_graph = capture_managed_object_graph(target, tuple(desired))
         changed = [
             relative for relative, content in desired.items() if before.get(relative) != content
         ]
         backup_slot = write_backup(target, state)
         try:
-            replace_managed_state(target, desired, before)
+            replace_managed_state(target, desired, before_graph)
             final = inspect_target(target)
             if (
                 final["state"] != "managed"
@@ -2777,7 +3375,6 @@ def migrate_setup(
             ):
                 fail("migrate postcondition failed")
         except BaseException:
-            replace_managed_state(target, before, None)
             raise
     return {
         "schema_version": 2,
@@ -2801,14 +3398,14 @@ def restore_slot(target: Path, slot: int) -> dict[str, Any]:
         if state["state"] == "managed" and state["drift"] and not state.get("legacy"):
             fail(f"managed target has drift: {', '.join(state['drift'])}")
         before = capture_managed_files(target)
+        before_graph = capture_managed_object_graph(target, tuple(before))
         desired = restore_files_from_backup(envelope)
         try:
-            replace_managed_state(target, desired, before)
+            replace_managed_state(target, desired, before_graph)
             final = inspect_target(target)
             if final["state"] != "managed" or final["drift"]:
                 fail("restore postcondition failed")
         except BaseException:
-            replace_managed_state(target, before, None)
             raise
     return {
         "schema_version": 2,
@@ -2832,11 +3429,11 @@ def remove_setup(target: Path) -> dict[str, Any]:
         if state["state"] != "managed":
             fail(f"target is not managed (state={state['state']})")
         before = capture_managed_files(target)
+        before_graph = capture_managed_object_graph(target, tuple(before))
         desired = desired_for_remove(target)
         try:
-            replace_managed_state(target, desired, before)
+            replace_managed_state(target, desired, before_graph)
         except BaseException:
-            replace_managed_state(target, before, None)
             raise
     return {
         "schema_version": 2,
