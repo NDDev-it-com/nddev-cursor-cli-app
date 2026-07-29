@@ -1,130 +1,7 @@
 {
-  "contract_version": 3,
-  "product_name": "nddev-cursor-cli-app",
-  "display_name": "NDDev Cursor CLI Setup Manager",
-  "description": "Portable, target-explicit manager for Cursor CLI configuration, target-owned Cursor Agent software, and a default-on native nddev-builder Cursor plugin projection.",
-  "github_repository": "NDDev-it-com/nddev-cursor-cli-app",
-  "license": "AGPL-3.0-or-later",
-  "manifest_ref": "build/manifest.json",
-  "version_ref": "build/version.json",
-  "source_roots": {
-    "setups": "setups",
-    "profiles": "profiles"
-  },
-  "managed_state": {
-    "managed_files": ["cli-config.json"],
-    "managed_file_mode": "0600",
-    "preserve_other_state": true,
-    "preserve_unmanaged_config_keys": true,
-    "stamp_file": "NDDEV-CURSOR-CLI-SETUP.json",
-    "stamp_schema": 2
-  },
-  "setup_system": {
-    "catalog_root": "setups",
-    "profile_root": "profiles",
-    "content_setup_ids": ["nddev-builder"],
-    "profile_ids": ["full-auto", "safe"],
-    "default_content_setup_id": "nddev-builder",
-    "default_profile_id": "full-auto",
-    "identity_source": "setups/<id>/setup.json:id and profiles/<id>/profile.json:id",
-    "list_command": "python3 cli-tools/nddev_cursor_cli.py list [--json]",
-    "selection_options": ["--setup <id>", "--profile <id>"],
-    "status_command": "python3 cli-tools/nddev_cursor_cli.py status --target <absolute-dir> [--json]",
-    "migrate_command": "python3 cli-tools/nddev_cursor_cli.py migrate --target <absolute-dir> [--profile <id>] [--json]"
-  },
-  "legacy_policy": {
-    "readable_for": ["status", "migrate", "restore", "remove"],
-    "launch_denied": true,
-    "install_switch_denied": true
-  },
-  "runtime_compatibility": {
-    "baseline_ref": "references/cursor-cli-baseline.json",
-    "version_ref": "build/version.json"
-  },
-  "runtime_launch": {
-    "command": "agent",
-    "managed_command": "bin/agent",
-    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> HOME=<absolute-target>/.nddev-cursor-home <absolute-target>/bin/agent --workspace <workspace> [args...]",
-    "environment_variable": "CURSOR_CONFIG_DIR",
-    "isolated_home": ".nddev-cursor-home",
-    "isolated_home_parent_validation": "component real current-user-owned 0700 before subprocess",
-    "tmpdir": ".nddev-cursor-runtime/tmp",
-    "tmpdir_source": "target-internal real current-user-owned 0700 directory; ambient TMPDIR is not inherited",
-    "path_policy": "fixed-minimal-system-path",
-    "path_value": "/usr/bin:/bin",
-    "launcher_shell": "/bin/bash",
-    "forwards_arguments": true,
-    "forwards_child_exit_code": true,
-    "json_manager_errors_supported": true,
-    "manager_command": "python3 cli-tools/nddev_cursor_cli.py launch --target <absolute-target> [--workspace <workspace>] -- [args...]",
-    "workspace_source": "default captures the manager caller cwd once; optional manager --workspace selects an existing real directory",
-    "native_workspace_arg": "--workspace <path>",
-    "child_cwd": "same resolved directory passed to native --workspace",
-    "managed_override_args_blocked": ["--approve-mcps", "--force", "-f", "--network", "--sandbox", "--skip-worktree-setup", "--trust", "--workspace", "--worktree", "-w", "--worktree-base", "--yolo", "acp", "install-shell-integration", "sandbox", "uninstall-shell-integration", "update", "worker"],
-    "requires_clean_managed_target": true,
-    "requires_current_target_owned_software": true,
-    "requires_non_legacy_setup_stamp": true,
-    "path_fallback": false,
-    "streams_child_stdio": true,
-    "successful_child_output_wrapped": false,
-    "target_environment_scope": "child-process-only",
-    "target_lock_scope": "preflight-through-child-and-managed-config-restore",
-    "bootstrap_lock_scope": "external product-and-canonical-target flock before target creation or inspection through full operation and child cleanup",
-    "bootstrap_lock_exposed_to_child": false,
-    "lock_mechanism": "persistent 0600 file opened with O_NOFOLLOW and held by nonblocking fcntl.flock",
-    "lock_parent_mode_while_launching": "0500",
-    "protected_directory_scope": "dedicated lock parent and ephemeral verified launch image only; control root, backup pool, target root, isolated HOME, TMPDIR, config/session paths, and installed runtime tree remain writable",
-    "launch_image": ".nddev-software/cursor-cli/launch-images/<ephemeral>",
-    "launch_image_mode_while_launching": "0500",
-    "exec_handoff_revalidation": "verified launch-image executable inode and digest immediately before subprocess",
-    "exec_handoff_boundary": "write-protected verified-path handoff under no-sandbox same-UID limits; no portable fd execution claimed"
-  },
-  "software_install": {
-    "supported": true,
-    "mechanism": "official-cursor-agent-artifact",
-    "official_installer": "https://cursor.com/install",
-    "official_source": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/{os}/{arch}/agent-cli-package.tar.gz",
-    "command": "agent",
-    "version": "2026.07.23-e383d2b",
-    "managed_command": "bin/agent",
-    "status_command": "python3 cli-tools/nddev_cursor_cli.py software-status --target <absolute-target> [--json]",
-    "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target <absolute-target> [--json]",
-    "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target <absolute-target> [--json]",
-    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
-    "status_fields": ["installed", "current", "present", "presence", "drift"],
-    "install_precondition": "absent target-owned software presence",
-    "update_precondition": "existing target-owned software presence, including repairable missing or corrupt identity stamp",
-    "update_current_behavior": "idempotent no-op without downloading",
-    "stage_and_atomic_swap": true,
-    "rollback_on_failure": true,
-    "artifact_reader": "bounded dist-package runtime-tree extraction; requires cursor-agent, node, and index.js; rejects traversal, symlink, hardlink, device, duplicate, unsafe mode, and oversize members",
-    "npm": null,
-    "pip": null
-  },
-  "software_lifecycle": {
-    "stamp_file": "NDDEV-CURSOR-CLI-SOFTWARE.json",
-    "stamp_schema": 1,
-    "status_command": "python3 cli-tools/nddev_cursor_cli.py software-status --target /absolute/target --json",
-    "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target /absolute/target --json",
-    "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target /absolute/target --json",
-    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
-    "install_precondition": "install-cli refuses any existing target-owned software presence; use update-cli for partial or existing state",
-    "update_precondition": "update-cli repairs existing target-owned software presence and refuses absent software state",
-    "target_owned": true,
-    "software_root": ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
-    "entrypoint": "bin/agent",
-    "status_executes_binary": false,
-    "private_modes": {
-      "directories": "0700",
-      "stamp": "0600",
-      "binary": "0700"
-    },
-    "stage_and_atomic_swap": true,
-    "rollback_on_swap_failure": true,
-    "credential_inheritance": "provider secrets are not inherited by installer subprocesses or launch"
-  },
   "builder_projection": {
     "default_on": true,
+    "hooks_installed": false,
     "installation": {
       "cache_owner": "nddev-cursor-cli-app",
       "install_command": "python3 cli-tools/nddev_cursor_cli.py install --target <absolute-target> [--profile <id>] [--json]",
@@ -134,6 +11,12 @@
       "preserved_on_switch_restore": true,
       "status_command": "python3 cli-tools/nddev_cursor_cli.py status --target <absolute-target> [--json]"
     },
+    "marketplace": {
+      "module_installs_marketplace": false,
+      "status": "unsupported-by-this-manager",
+      "team_marketplace_supported_by_cursor": true
+    },
+    "mcp_servers_installed": false,
     "official_documentation": {
       "agents": "https://cursor.com/docs/subagents",
       "hooks": "https://cursor.com/docs/hooks",
@@ -143,41 +26,304 @@
       "rules": "https://cursor.com/docs/rules",
       "skills": "https://cursor.com/docs/skills"
     },
-    "marketplace": {
-      "module_installs_marketplace": false,
-      "status": "unsupported-by-this-manager",
-      "team_marketplace_supported_by_cursor": true
+    "surfaces": [
+      "plugin",
+      "rules",
+      "skills",
+      "agents",
+      "commands"
+    ]
+  },
+  "contract_version": 3,
+  "description": "Portable, target-explicit manager for Cursor CLI configuration, target-owned Cursor Agent software, and a default-on native nddev-builder Cursor plugin projection.",
+  "display_name": "NDDev Cursor CLI Setup Manager",
+  "github_repository": "NDDev-it-com/nddev-cursor-cli-app",
+  "legacy_policy": {
+    "install_switch_denied": true,
+    "launch_denied": true,
+    "readable_for": [
+      "status",
+      "migrate",
+      "restore",
+      "remove"
+    ]
+  },
+  "license": "AGPL-3.0-or-later",
+  "managed_state": {
+    "managed_file_mode": "0600",
+    "managed_files": [
+      "cli-config.json"
+    ],
+    "preserve_other_state": true,
+    "preserve_unmanaged_config_keys": true,
+    "stamp_file": "NDDEV-CURSOR-CLI-SETUP.json",
+    "stamp_schema": 2
+  },
+  "manifest_ref": "build/manifest.json",
+  "product_name": "nddev-cursor-cli-app",
+  "runtime_compatibility": {
+    "baseline_ref": "references/cursor-cli-baseline.json",
+    "supported_host_ids": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ],
+    "ubuntu_distribution_id": "ubuntu",
+    "ubuntu_glibc_version_floor": null,
+    "ubuntu_glibc_version_floor_status": "no-official-floor",
+    "ubuntu_libc": "glibc",
+    "ubuntu_systems": [
+      "desktop",
+      "server"
+    ],
+    "unsupported_host_categories": [
+      "windows",
+      "non-ubuntu-linux",
+      "linux-musl",
+      "unsupported-architecture"
+    ],
+    "vendor_asset_mapping": {
+      "macos-arm64": {
+        "asset_path": "darwin/arm64/agent-cli-package.tar.gz",
+        "vendor_arch": "arm64",
+        "vendor_os": "darwin"
+      },
+      "macos-x64": {
+        "asset_path": "darwin/x64/agent-cli-package.tar.gz",
+        "vendor_arch": "x64",
+        "vendor_os": "darwin"
+      },
+      "ubuntu-glibc-arm64": {
+        "asset_path": "linux/arm64/agent-cli-package.tar.gz",
+        "vendor_arch": "arm64",
+        "vendor_os": "linux"
+      },
+      "ubuntu-glibc-x64": {
+        "asset_path": "linux/x64/agent-cli-package.tar.gz",
+        "vendor_arch": "x64",
+        "vendor_os": "linux"
+      }
     },
-    "surfaces": ["plugin", "rules", "skills", "agents", "commands"],
-    "hooks_installed": false,
-    "mcp_servers_installed": false
+    "version_ref": "build/version.json"
+  },
+  "runtime_launch": {
+    "bootstrap_lock_exposed_to_child": false,
+    "bootstrap_lock_scope": "mutations publish or open the product anchor before target observation, then hand off to the canonical mutation anchor; read-only commands create no anchors and use cold no-anchor double-check with whole product-namespace emptiness or shared product/canonical coordination",
+    "command": "agent",
+    "direct_command": "CURSOR_CONFIG_DIR=<absolute-target> HOME=<absolute-target>/.nddev-cursor-home <absolute-target>/bin/agent [args...]",
+    "environment_variable": "CURSOR_CONFIG_DIR",
+    "exec_handoff_boundary": "write-protected verified-path handoff with child-held launch-image lease fd under no-sandbox same-UID limits; no portable fd execution claimed",
+    "exec_handoff_revalidation": "verified launch-image executable inode and digest immediately before subprocess",
+    "forwards_arguments": true,
+    "forwards_child_exit_code": true,
+    "isolated_home": ".nddev-cursor-home",
+    "isolated_home_parent_validation": "component real current-user-owned 0700 before subprocess",
+    "json_manager_errors_supported": true,
+    "launch_image": ".nddev-software/cursor-cli/launch-images/.launch-<bounded>",
+    "launch_image_lease": ".nddev-software/cursor-cli/launch-images/.launch-<bounded>/.lease.lock",
+    "launch_image_max_count": 8,
+    "launch_image_max_total_size": 314572800,
+    "launch_image_metadata": ".nddev-software/cursor-cli/launch-images/.launch-<bounded>/NDDEV-CURSOR-CLI-LAUNCH.json",
+    "launch_image_mode_while_launching": "0500",
+    "launch_image_residue_semantics": "read-only status validates and exposes active/stale lease-bound images without mutation; mutations drain stale images with bounded no-follow cleanup before active work and fail closed while a lease is active",
+    "launcher_shell": "/bin/bash",
+    "lock_mechanism": "persistent 0600 monotonic anchors opened with O_NOFOLLOW and held by nonblocking fcntl.flock; product anchor uses exclusive/shared coordination and canonical target anchors use exclusive mutation/shared read coordination",
+    "lock_parent_mode_while_launching": "0500",
+    "managed_command": "bin/agent",
+    "managed_override_args_blocked": [
+      "--approve-mcps",
+      "--force",
+      "-f",
+      "--network",
+      "--sandbox",
+      "--skip-worktree-setup",
+      "--trust",
+      "--worktree",
+      "-w",
+      "--yolo",
+      "acp",
+      "install-shell-integration",
+      "sandbox",
+      "uninstall-shell-integration",
+      "update",
+      "worker"
+    ],
+    "manager_command": "python3 cli-tools/nddev_cursor_cli.py launch --target <absolute-target> -- [args...]",
+    "path_fallback": false,
+    "path_policy": "fixed-minimal-system-path",
+    "path_value": "/usr/bin:/bin",
+    "protected_directory_scope": "dedicated lock parent and lease-bound verified launch image only; control root, backup pool, target root, isolated HOME, TMPDIR, config/session paths, and installed runtime tree remain writable",
+    "requires_clean_managed_target": true,
+    "requires_current_target_owned_software": true,
+    "requires_non_legacy_setup_stamp": true,
+    "streams_child_stdio": true,
+    "successful_child_output_wrapped": false,
+    "target_environment_scope": "child-process-only",
+    "target_lock_scope": "preflight-through-child-and-managed-config-restore",
+    "tmpdir": ".nddev-cursor-runtime/tmp",
+    "tmpdir_source": "target-internal real current-user-owned 0700 directory; ambient TMPDIR is not inherited"
   },
   "safety": {
     "absolute_target_required": true,
+    "backup_digest_authenticates_same_uid_payloads": false,
+    "backup_digest_capability": "corruption-and-incoherent-tamper-detection",
+    "backup_envelope_schema": 3,
+    "backup_file_record_schema": "payload plus sha256 over canonical declared path and payload bytes",
+    "backup_path": ".nddev-cursor-cli/backups",
+    "backup_restore_digest_required": true,
+    "bootstrap_anchor_publication": "atomic no-replace final-path publication of a complete fsynced binding; final anchor is monotonic immediately when visible, parent sync or handoff failure leaves it in place and removes only unpublished temporary aliases; existing anchors open no-create/no-follow and are never truncated, rebound, replaced, or unlinked; a crashed hard-link publication alias is recovered only after locking final and proving one bounded machine-named same-inode alias in the same private parent",
+    "bootstrap_canonical_mutation_anchor": "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target-key)>.lock",
+    "bootstrap_lock_binding": "schema/product/lock-key/product-target-sha256 JSON",
+    "bootstrap_lock_file_mode": "0600",
+    "bootstrap_product_anchor": "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/global.lock",
     "canonical_target_binding": true,
-    "default_target": null,
-    "explicit_target_required": ["status", "plan", "install", "switch", "migrate", "restore", "remove", "software-status", "install-cli", "update-cli", "launch"],
-    "max_backups": 10,
-    "missing_target_argument_rejected": true,
-    "new_target_mode": "0700",
-    "initial_target_parent": "current-user non-writable-by-others or sticky",
-    "existing_target_required_owner": "current-user",
-    "existing_target_required_mode": "0700",
+    "cleanup_journal_max_bytes": 2097152,
+    "cleanup_pending_intent": ".nddev-cursor-cli/cleanup-pending/intent.json",
+    "cleanup_pending_journal": ".nddev-cursor-cli/cleanup-pending/journal.json",
+    "cleanup_pending_path": ".nddev-cursor-cli/cleanup-pending",
+    "cleanup_pending_semantics": "schema-1 cleanup journal plus durable pre-move intent with fixed-anchor relative sources; read-only validates and reports cleanup_pending without mutation; mutations drain before active changes; malformed or orphaned cleanup state fails closed",
     "control_root": ".nddev-cursor-cli",
+    "default_target": null,
+    "existing_target_required_mode": "0700",
+    "existing_target_required_owner": "current-user",
+    "explicit_target_required": [
+      "status",
+      "plan",
+      "install",
+      "update",
+      "switch",
+      "migrate",
+      "restore",
+      "remove",
+      "software-status",
+      "install-cli",
+      "update-cli",
+      "remove-cli",
+      "launch"
+    ],
+    "initial_target_parent": "current-user non-writable-by-others or sticky",
+    "lock_file_mode": "0600",
     "lock_parent": ".nddev-cursor-cli/locks",
+    "lock_parent_mode_while_locked": "0500",
     "lock_path": ".nddev-cursor-cli/locks/target.lock",
     "lock_type": "persistent flock file",
-    "lock_file_mode": "0600",
-    "lock_parent_mode_while_locked": "0500",
-    "bootstrap_product_lock": "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/global.lock",
-    "bootstrap_lock": "/tmp-or-resolved-system-temp/nddev-cursor-cli-app-locks-<uid>/nddev-cursor-cli-app-<sha256(product-name NUL canonical-target)>.lock",
-    "bootstrap_lock_file_mode": "0600",
-    "bootstrap_lock_binding": "schema/product/canonical-target/product-target-sha256 JSON",
-    "backup_path": ".nddev-cursor-cli/backups",
+    "max_backups": 10,
+    "missing_target_argument_rejected": true,
     "mutable_runtime_tmp": ".nddev-cursor-runtime/tmp",
-    "target_local_directory_parents": "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed",
+    "new_target_mode": "0700",
+    "read_only_anchor_commands": [
+      "status",
+      "plan",
+      "software-status"
+    ],
+    "read_only_anchor_creation": false,
+    "read_only_cold_no_anchor_double_check": true,
+    "read_only_orphan_canonical_anchor": "fail-closed",
     "relative_target_rejected": true,
     "rollback_on_failure": true,
+    "target_local_directory_parents": "existing builder and runtime parents must be real current-user-owned 0700; symlinks are drift/fail-closed",
     "target_symlinks_rejected": true
-  }
+  },
+  "setup_system": {
+    "catalog_root": "setups",
+    "content_setup_ids": [
+      "nddev-builder"
+    ],
+    "default_content_setup_id": "nddev-builder",
+    "default_profile_id": "full-auto",
+    "identity_source": "setups/<id>/setup.json:id and profiles/<id>/profile.json:id",
+    "install_command": "python3 cli-tools/nddev_cursor_cli.py install --target <absolute-dir> [--setup <id>] [--profile <id>] [--json]",
+    "list_command": "python3 cli-tools/nddev_cursor_cli.py list [--json]",
+    "migrate_command": "python3 cli-tools/nddev_cursor_cli.py migrate --target <absolute-dir> [--profile <id>] [--json]",
+    "profile_ids": [
+      "full-auto",
+      "safe"
+    ],
+    "profile_root": "profiles",
+    "selection_options": [
+      "--setup <id>",
+      "--profile <id>"
+    ],
+    "status_command": "python3 cli-tools/nddev_cursor_cli.py status --target <absolute-dir> [--json]",
+    "switch_command": "python3 cli-tools/nddev_cursor_cli.py switch --target <absolute-dir> [--setup <id>] [--profile <id>] [--json]",
+    "update_command": "python3 cli-tools/nddev_cursor_cli.py update --target <absolute-dir> [--json]"
+  },
+  "software_install": {
+    "artifact_reader": "bounded dist-package runtime-tree extraction; requires cursor-agent, node, and index.js; rejects traversal, symlink, hardlink, device, duplicate, unsafe mode, and oversize members",
+    "command": "agent",
+    "host_platform_preflight": "Supported NDDev host IDs are macos-arm64, macos-x64, ubuntu-glibc-arm64, and ubuntu-glibc-x64. Ubuntu desktop/server hosts must report ID=ubuntu and glibc; Cursor publishes no official Ubuntu/glibc version floor. Upstream darwin/* and linux/* artifact paths remain vendor IDs. windows, non-ubuntu-linux, linux-musl, and unsupported-architecture fail before bootstrap lock, target lock, target creation, download, stage, or launch",
+    "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target <absolute-target> [--json]",
+    "install_precondition": "absent target-owned software presence",
+    "managed_command": "bin/agent",
+    "mechanism": "official-cursor-agent-artifact",
+    "npm": null,
+    "official_installer": "https://cursor.com/install",
+    "official_source": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/{os}/{arch}/agent-cli-package.tar.gz",
+    "pip": null,
+    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/launch-images, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
+    "remove_command": "python3 cli-tools/nddev_cursor_cli.py remove-cli --target <absolute-target> [--json]",
+    "remove_precondition": "absent, current, or partial target-owned software presence",
+    "rollback_on_failure": true,
+    "stage_and_atomic_swap": true,
+    "status_command": "python3 cli-tools/nddev_cursor_cli.py software-status --target <absolute-target> [--json]",
+    "status_fields": [
+      "installed",
+      "current",
+      "present",
+      "presence",
+      "drift",
+      "cleanup_pending",
+      "cleanup",
+      "launch_image_residue_pending",
+      "launch_image_residue"
+    ],
+    "supported": true,
+    "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target <absolute-target> [--json]",
+    "update_current_behavior": "idempotent no-op without downloading",
+    "update_precondition": "existing target-owned software presence, including repairable missing or corrupt identity stamp",
+    "version": "2026.07.23-e383d2b"
+  },
+  "software_lifecycle": {
+    "credential_inheritance": "provider secrets are not inherited by installer subprocesses or launch",
+    "entrypoint": "bin/agent",
+    "failure_current_behavior": "exact rollback or transaction marker forces current=false",
+    "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target /absolute/target --json",
+    "install_precondition": "install-cli refuses any existing target-owned software presence; use update-cli for partial or existing state",
+    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/launch-images, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
+    "private_modes": {
+      "binary": "0700",
+      "directories": "0700",
+      "stamp": "0600"
+    },
+    "remove_command": "python3 cli-tools/nddev_cursor_cli.py remove-cli --target /absolute/target --json",
+    "remove_precondition": "remove-cli accepts absent, current, or partial target-owned software state and removes only manager-owned software paths",
+    "rollback_on_swap_failure": true,
+    "software_root": ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
+    "stage_and_atomic_swap": true,
+    "stamp_file": "NDDEV-CURSOR-CLI-SOFTWARE.json",
+    "stamp_schema": 1,
+    "status_command": "python3 cli-tools/nddev_cursor_cli.py software-status --target /absolute/target --json",
+    "status_executes_binary": false,
+    "status_fields": [
+      "installed",
+      "current",
+      "present",
+      "presence",
+      "drift",
+      "cleanup_pending",
+      "cleanup",
+      "launch_image_residue_pending",
+      "launch_image_residue"
+    ],
+    "target_owned": true,
+    "transaction_marker": "NDDEV-CURSOR-CLI-TRANSACTION.json",
+    "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target /absolute/target --json",
+    "update_precondition": "update-cli repairs existing target-owned software presence and refuses absent software state"
+  },
+  "source_roots": {
+    "profiles": "profiles",
+    "setups": "setups"
+  },
+  "version_ref": "build/version.json"
 }

@@ -26,6 +26,66 @@
       }
     }
   },
+  "host_platform_scope": {
+    "supported_host_ids": [
+      "macos-arm64",
+      "macos-x64",
+      "ubuntu-glibc-arm64",
+      "ubuntu-glibc-x64"
+    ],
+    "ubuntu": {
+      "distribution_id": "ubuntu",
+      "libc": "glibc",
+      "glibc_version_floor": null,
+      "glibc_version_floor_status": "no-official-floor",
+      "systems": ["desktop", "server"]
+    },
+    "unsupported_host_categories": [
+      "windows",
+      "non-ubuntu-linux",
+      "linux-musl",
+      "unsupported-architecture"
+    ],
+    "vendor_asset_mapping": {
+      "macos-arm64": {
+        "vendor_os": "darwin",
+        "vendor_arch": "arm64",
+        "asset_path": "darwin/arm64/agent-cli-package.tar.gz"
+      },
+      "macos-x64": {
+        "vendor_os": "darwin",
+        "vendor_arch": "x64",
+        "asset_path": "darwin/x64/agent-cli-package.tar.gz"
+      },
+      "ubuntu-glibc-arm64": {
+        "vendor_os": "linux",
+        "vendor_arch": "arm64",
+        "asset_path": "linux/arm64/agent-cli-package.tar.gz"
+      },
+      "ubuntu-glibc-x64": {
+        "vendor_os": "linux",
+        "vendor_arch": "x64",
+        "asset_path": "linux/x64/agent-cli-package.tar.gz"
+      }
+    }
+  },
+  "observed_vendor_assets": {
+    "unsupported_windows": {
+      "product_support": false,
+      "unsupported_host_category": "windows",
+      "source_template": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/{os}/{arch}/agent-cli-package.zip",
+      "provenance": "official Cursor current-release asset observation only; not part of supported NDDev product hosts",
+      "verified_date": "2026-07-28",
+      "assets": {
+        "windows/x64/agent-cli-package.zip": {
+          "size": 63067629
+        },
+        "windows/arm64/agent-cli-package.zip": {
+          "size": 58461383
+        }
+      }
+    }
+  },
   "software_install": {
     "mechanism": "official-cursor-agent-artifact",
     "managed_command": "bin/agent",
@@ -45,9 +105,63 @@
     "documentation": "https://cursor.com/docs/cli/reference/configuration"
   },
   "native_capability_surfaces": {
-    "rules": "https://cursor.com/docs/rules",
-    "skills": "https://cursor.com/docs/skills",
-    "agents": "https://cursor.com/docs/subagents",
-    "plugins": "https://cursor.com/docs/reference/plugins"
+    "commands": {
+      "official_documentation": "https://cursor.com/docs/reference/plugins",
+      "plugin_manifest_key": "commands",
+      "product_projection": "installed"
+    },
+    "hooks": {
+      "official_documentation": "https://cursor.com/docs/hooks",
+      "plugin_manifest_key": "hooks",
+      "product_projection": "not-installed"
+    },
+    "mcpServers": {
+      "official_documentation": "https://cursor.com/docs/mcp",
+      "config_key": "mcpServers",
+      "plugin_manifest_key": "mcpServers",
+      "product_projection": "not-installed"
+    },
+    "marketplace_manifests": {
+      "official_documentation": "https://cursor.com/docs/plugins",
+      "plugin_manifest": ".cursor-plugin/plugin.json",
+      "product_projection": "local-plugin-only"
+    },
+    "plugins": {
+      "official_documentation": "https://cursor.com/docs/reference/plugins",
+      "plugin_manifest": ".cursor-plugin/plugin.json",
+      "product_projection": "installed"
+    },
+    "agents": {
+      "official_documentation": "https://cursor.com/docs/subagents",
+      "plugin_manifest_key": "agents",
+      "product_projection": "installed"
+    },
+    "skills": {
+      "official_documentation": "https://cursor.com/docs/skills",
+      "plugin_manifest_key": "skills",
+      "product_projection": "installed"
+    },
+    "rules_instructions": {
+      "official_documentation": "https://cursor.com/docs/rules",
+      "plugin_manifest_key": "rules",
+      "workspace_instruction_file": "AGENTS.md",
+      "product_projection": "installed"
+    },
+    "permissions_config": {
+      "official_documentation": "https://cursor.com/docs/cli/reference/configuration",
+      "config_file": "cli-config.json",
+      "managed_keys": "profiles/<id>/cli-config.json",
+      "product_projection": "installed"
+    },
+    "auth": {
+      "official_documentation": "https://cursor.com/docs/cli/reference/configuration",
+      "product_projection": "preserved-unmanaged"
+    },
+    "status": {
+      "official_documentation": "https://cursor.com/docs/cli/reference/parameters",
+      "manager_command": "status --target <absolute-target> --json",
+      "software_command": "software-status --target <absolute-target> --json",
+      "product_projection": "observed-by-manager"
+    }
   }
 }
