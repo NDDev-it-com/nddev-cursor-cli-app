@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import ctypes
 import errno
 import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -42,11 +44,25 @@ CONTROL_LOCKS_NAME = "locks"
 CONTROL_LOCK_NAME = "target.lock"
 CONTROL_BACKUPS_NAME = "backups"
 BOOTSTRAP_LOCK_ROOT_PREFIX = "nddev-cursor-cli-app-locks"
+BOOTSTRAP_PRODUCT_ANCHOR_NAME = "global.lock"
+BOOTSTRAP_PRODUCT_ANCHOR_CANONICAL_TARGET = f"{PRODUCT_NAME}:product-anchor:v1"
 BOOTSTRAP_LOCK_MAX_BYTES = 4096
+BOOTSTRAP_LOCK_STAGE_MAX_ALIASES = 4
+BOOTSTRAP_LOCK_STAGE_SCAN_MAX_ENTRIES = 4096
+BOOTSTRAP_LOCK_STAGE_TOKEN_HEX_BYTES = 8
 OWNER_FILE_MODE = 0o600
 OWNER_DIRECTORY_MODE = 0o700
 OWNER_EXEC_MODE = 0o700
 LOCK_HELD_DIRECTORY_MODE = 0o500
+AT_FDCWD_BY_SYSTEM = {"darwin": -2, "linux": -100}
+RENAME_EXCL_DARWIN = 0x00000004
+RENAME_NOREPLACE_LINUX = 1
+RENAMEAT2_SYSCALL_BY_MACHINE = {
+    "amd64": 316,
+    "x86_64": 316,
+    "aarch64": 276,
+    "arm64": 276,
+}
 METADATA_MAX_BYTES = 256 * 1024
 MANAGED_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
 SOFTWARE_ARTIFACT_MAX_BYTES = 300 * 1024 * 1024
@@ -106,7 +122,9 @@ BLOCKED_LAUNCH_LONG_FLAGS = {
     "--sandbox",
     "--skip-worktree-setup",
     "--trust",
+    "--workspace",
     "--worktree",
+    "--worktree-base",
     "--yolo",
 }
 BLOCKED_LAUNCH_SHORT_FLAGS = {
@@ -195,6 +213,20 @@ BACKUP_KEYS_V2 = {
     "managed_files",
     "created_at",
     "files",
+}
+BACKUP_KEYS_V3 = {
+    "schema_version",
+    "product_name",
+    "build_version",
+    "slot",
+    "canonical_target",
+    "source_content_setup_id",
+    "source_profile_id",
+    "source_legacy_setup_id",
+    "managed_files",
+    "created_at",
+    "files",
+    "file_records",
 }
 BOOTSTRAP_LOCK_KEYS_V1 = {
     "schema_version",
@@ -594,6 +626,15 @@ def resolve_target(raw_target: str) -> Path:
     return target
 
 
+def lexical_target_path(raw_target: str | Path) -> Path:
+    expanded = Path(raw_target).expanduser()
+    if not expanded.is_absolute():
+        fail("--target must be an absolute path")
+    if expanded == Path(expanded.anchor):
+        fail("filesystem root cannot be a target")
+    return expanded
+
+
 def canonical_target_text(target: Path) -> str:
     if not target.is_absolute():
         fail("--target must be an absolute path")
@@ -609,6 +650,109 @@ def canonical_target_text(target: Path) -> str:
         if stat.S_ISLNK(target_info.st_mode) or not stat.S_ISDIR(target_info.st_mode):
             fail("--target must be a real directory when it exists")
     return str(parent.resolve(strict=True) / target.name)
+
+
+def fsync_directory(path: Path, label: str) -> None:
+    require_owner_private_directory(path, label)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened for fsync: {exc}")
+    try:
+        require_directory_matches_fd(path, descriptor, label, {OWNER_DIRECTORY_MODE})
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def directory_metadata_snapshot(path: Path, label: str) -> dict[str, Any]:
+    require_owner_private_directory(path, label)
+    info = path.lstat()
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "atime_ns": info.st_atime_ns,
+        "mtime_ns": info.st_mtime_ns,
+    }
+
+
+def restore_directory_metadata(path: Path, snapshot: dict[str, Any], label: str) -> None:
+    info = require_owner_private_directory(path, label)
+    if (info.st_dev, info.st_ino) != (snapshot["device"], snapshot["inode"]):
+        fail(f"{label} identity changed")
+    if stat.S_IMODE(info.st_mode) != snapshot["mode"]:
+        os.chmod(path, int(snapshot["mode"]))
+    os.utime(path, ns=(int(snapshot["atime_ns"]), int(snapshot["mtime_ns"])))
+    fsync_directory(path, label)
+    current = require_owner_private_directory(path, label)
+    if (
+        current.st_dev != snapshot["device"]
+        or current.st_ino != snapshot["inode"]
+        or stat.S_IMODE(current.st_mode) != snapshot["mode"]
+        or current.st_atime_ns != snapshot["atime_ns"]
+        or current.st_mtime_ns != snapshot["mtime_ns"]
+    ):
+        fail(f"{label} metadata could not be restored")
+
+
+def rename_no_replace(source: Path, destination: Path, label: str) -> bool:
+    system = platform.system().lower()
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if system == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = libc.renameatx_np
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            AT_FDCWD_BY_SYSTEM["darwin"],
+            source_bytes,
+            AT_FDCWD_BY_SYSTEM["darwin"],
+            destination_bytes,
+            RENAME_EXCL_DARWIN,
+        )
+    elif system == "linux":
+        machine = platform.machine().lower()
+        syscall_number = RENAMEAT2_SYSCALL_BY_MACHINE.get(machine)
+        if syscall_number is None:
+            fail(f"{label} no-replace publication is unsupported on this architecture")
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+        result = syscall(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(AT_FDCWD_BY_SYSTEM["linux"]),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(AT_FDCWD_BY_SYSTEM["linux"]),
+            ctypes.c_char_p(destination_bytes),
+            ctypes.c_uint(RENAME_NOREPLACE_LINUX),
+        )
+    else:
+        fail(f"{label} no-replace publication is unsupported on this platform")
+    if result == 0:
+        return True
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        return False
+    if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+        fail(f"{label} no-replace publication primitive is unavailable")
+    fail(f"{label} no-replace publication failed: {os.strerror(error)}")
 
 
 def bootstrap_lock_system_root() -> Path:
@@ -639,42 +783,573 @@ def bootstrap_lock_root() -> Path:
     return root
 
 
+def bootstrap_lock_root_no_create() -> Path:
+    uid = current_user_id()
+    if uid is None:
+        fail("bootstrap lifecycle locks require POSIX current-user identity")
+    parent = bootstrap_lock_system_root()
+    try:
+        parent_info = parent.lstat()
+    except FileNotFoundError:
+        fail("system temp root must exist")
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        fail("system temp root must be a real directory")
+    if not (parent_info.st_mode & stat.S_ISVTX):
+        fail("system temp root must be sticky")
+    return parent / f"{BOOTSTRAP_LOCK_ROOT_PREFIX}-{uid}"
+
+
+def bootstrap_lock_digest(canonical: str) -> str:
+    return sha256_bytes(PRODUCT_NAME.encode("utf-8") + b"\0" + canonical.encode("utf-8"))
+
+
+def bootstrap_product_lock_path(*, create_root: bool) -> tuple[Path, str, str]:
+    canonical = BOOTSTRAP_PRODUCT_ANCHOR_CANONICAL_TARGET
+    digest = bootstrap_lock_digest(canonical)
+    root = bootstrap_lock_root() if create_root else bootstrap_lock_root_no_create()
+    return root / BOOTSTRAP_PRODUCT_ANCHOR_NAME, canonical, digest
+
+
+def bootstrap_lock_path_for_canonical(
+    canonical: str, *, create_root: bool
+) -> tuple[Path, str, str]:
+    digest = bootstrap_lock_digest(canonical)
+    root = bootstrap_lock_root() if create_root else bootstrap_lock_root_no_create()
+    return root / f"{PRODUCT_NAME}-{digest}.lock", canonical, digest
+
+
 def bootstrap_lock_path(target: Path) -> tuple[Path, str, str]:
     canonical = canonical_target_text(target)
-    digest = sha256_bytes(PRODUCT_NAME.encode("utf-8") + b"\0" + canonical.encode("utf-8"))
-    return bootstrap_lock_root() / f"{PRODUCT_NAME}-{digest}.lock", canonical, digest
+    return bootstrap_lock_path_for_canonical(canonical, create_root=True)
 
 
-def open_bootstrap_lock_file(path: Path) -> int:
+def bootstrap_lock_path_no_create(target: Path) -> tuple[Path, str, str]:
+    canonical = canonical_target_text(target)
+    return bootstrap_lock_path_for_canonical(canonical, create_root=False)
+
+
+def bootstrap_lock_binding(canonical: str, digest: str) -> bytes:
+    binding = canonical_json(
+        {
+            "schema_version": 1,
+            "product_name": PRODUCT_NAME,
+            "canonical_target": canonical,
+            "target_sha256": digest,
+        }
+    )
+    if len(binding) > BOOTSTRAP_LOCK_MAX_BYTES:
+        fail("bootstrap lock binding exceeds the size limit")
+    return binding
+
+
+def bootstrap_lock_stage_prefix(path: Path) -> str:
+    return f".{path.name}.nddev.tmp."
+
+
+def bootstrap_lock_stage_path(path: Path) -> Path:
+    token = secrets.token_hex(BOOTSTRAP_LOCK_STAGE_TOKEN_HEX_BYTES)
+    return path.with_name(f"{bootstrap_lock_stage_prefix(path)}{os.getpid()}.{time.time_ns()}.{token}")
+
+
+def bootstrap_lock_stage_name_is_valid(path: Path, name: str) -> bool:
+    prefix = bootstrap_lock_stage_prefix(path)
+    if not name.startswith(prefix):
+        return False
+    suffix = name[len(prefix) :]
+    parts = suffix.split(".")
+    if len(parts) != 3:
+        return False
+    pid, timestamp, token = parts
+    return (
+        1 <= len(pid) <= 10
+        and pid.isdecimal()
+        and 1 <= len(timestamp) <= 20
+        and timestamp.isdecimal()
+        and len(token) == BOOTSTRAP_LOCK_STAGE_TOKEN_HEX_BYTES * 2
+        and all(character in "0123456789abcdef" for character in token)
+    )
+
+
+def bootstrap_lock_stage_paths(path: Path) -> list[Path]:
+    require_owner_private_directory(path.parent, "bootstrap lock root")
+    prefix = bootstrap_lock_stage_prefix(path)
+    stages: list[Path] = []
+    scanned = 0
+    try:
+        with os.scandir(path.parent) as entries:
+            for entry in entries:
+                scanned += 1
+                if scanned > BOOTSTRAP_LOCK_STAGE_SCAN_MAX_ENTRIES:
+                    fail("bootstrap lock root has too many entries to scan safely")
+                name = entry.name
+                if not name.startswith(prefix):
+                    continue
+                if not bootstrap_lock_stage_name_is_valid(path, name):
+                    fail("bootstrap lock staged publication has an invalid name")
+                stages.append(path.parent / name)
+                if len(stages) > BOOTSTRAP_LOCK_STAGE_MAX_ALIASES:
+                    fail("bootstrap lock has too many staged publications")
+    except FileNotFoundError:
+        fail("bootstrap lock root disappeared")
+    return sorted(stages, key=lambda item: item.name)
+
+
+def bootstrap_lock_cold_namespace_snapshot(path: Path) -> dict[str, Any]:
+    root = path.parent
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return {"root_exists": False}
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail("bootstrap lock root must be a real directory")
+    uid = current_user_id()
+    if uid is not None and info.st_uid != uid:
+        fail("bootstrap lock root must be owned by the current user")
+    if stat.S_IMODE(info.st_mode) != OWNER_DIRECTORY_MODE:
+        fail("bootstrap lock root must have mode 0700")
+    children: list[tuple[str, int, int, int, int, int]] = []
+    scanned = 0
+    with os.scandir(root) as entries:
+        for entry in entries:
+            scanned += 1
+            if scanned > BOOTSTRAP_LOCK_STAGE_SCAN_MAX_ENTRIES:
+                fail("bootstrap lock root has too many entries to scan safely")
+            child_info = entry.stat(follow_symlinks=False)
+            children.append(
+                (
+                    entry.name,
+                    stat.S_IFMT(child_info.st_mode),
+                    stat.S_IMODE(child_info.st_mode),
+                    child_info.st_dev,
+                    child_info.st_ino,
+                    child_info.st_nlink,
+                )
+            )
+    if children:
+        fail("bootstrap lock namespace is not empty for cold read")
+    return {
+        "root_exists": True,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "mtime_ns": info.st_mtime_ns,
+        "children": children,
+    }
+
+
+def bootstrap_final_anchor_exists_no_create(path: Path, canonical: str, digest: str) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("bootstrap lock path is unsafe")
+    descriptor = open_existing_bootstrap_lock_file(path)
+    try:
+        read_valid_bootstrap_binding(descriptor, path, canonical, digest)
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def validate_bootstrap_lock_stage_file(stage: Path, canonical: str, digest: str) -> dict[str, Any]:
+    expected = bootstrap_lock_binding(canonical, digest)
+    before = require_regular_file(stage, "staged bootstrap lock", max_bytes=BOOTSTRAP_LOCK_MAX_BYTES)
+    uid = current_user_id()
+    if uid is not None and before.st_uid != uid:
+        fail("staged bootstrap lock must be owned by the current user")
+    if stat.S_IMODE(before.st_mode) != OWNER_FILE_MODE:
+        fail("staged bootstrap lock must have mode 0600")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(stage, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("staged bootstrap lock path is unsafe")
+        fail(f"staged bootstrap lock could not be opened: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            fail("staged bootstrap lock changed while it was being opened")
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != OWNER_FILE_MODE
+        ):
+            fail("staged bootstrap lock changed to an unsafe file")
+        if uid is not None and opened.st_uid != uid:
+            fail("staged bootstrap lock must be owned by the current user")
+        content = fd_read_bounded(descriptor, "staged bootstrap lock", BOOTSTRAP_LOCK_MAX_BYTES)
+    finally:
+        os.close(descriptor)
+    if content != expected:
+        fail("staged bootstrap lock target binding mismatch")
+    after = require_regular_file(stage, "staged bootstrap lock", max_bytes=BOOTSTRAP_LOCK_MAX_BYTES)
+    if (before.st_dev, before.st_ino, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mtime_ns,
+    ):
+        fail("staged bootstrap lock changed during validation")
+    return {
+        "path": stage,
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "size": after.st_size,
+        "mode": stat.S_IMODE(after.st_mode),
+        "mtime_ns": after.st_mtime_ns,
+        "payload_sha256": sha256_bytes(expected),
+    }
+
+
+def validated_bootstrap_lock_stage_aliases(
+    path: Path, canonical: str, digest: str
+) -> list[dict[str, Any]]:
+    return [
+        validate_bootstrap_lock_stage_file(stage, canonical, digest)
+        for stage in bootstrap_lock_stage_paths(path)
+    ]
+
+
+def validate_existing_bootstrap_lock_file(path: Path, canonical: str, digest: str) -> None:
+    descriptor = open_existing_bootstrap_lock_file(path)
+    try:
+        read_valid_bootstrap_binding(descriptor, path, canonical, digest)
+    finally:
+        os.close(descriptor)
+
+
+def write_bootstrap_lock_stage_file(stage: Path, content: bytes) -> dict[str, Any]:
+    require_owner_private_directory(stage.parent, "bootstrap lock root")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(stage, flags, OWNER_FILE_MODE)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("staged bootstrap lock path is unsafe")
+        fail(f"staged bootstrap lock could not be opened: {exc}")
+    try:
+        os.fchmod(descriptor, OWNER_FILE_MODE)
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                fail("staged bootstrap lock write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        info = require_lock_file_matches_fd(stage, descriptor, "staged bootstrap lock")
+        return {
+            "path": stage,
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "size": info.st_size,
+            "mode": stat.S_IMODE(info.st_mode),
+            "mtime_ns": info.st_mtime_ns,
+            "payload_sha256": sha256_bytes(content),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def unlink_validated_bootstrap_lock_stage_file(
+    stage: dict[str, Any], canonical: str, digest: str
+) -> None:
+    stage_path = stage["path"]
+    expected = bootstrap_lock_binding(canonical, digest)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(stage_path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail("staged bootstrap lock path is unsafe")
+        fail(f"staged bootstrap lock could not be opened for cleanup: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        current = stage_path.lstat()
+        if (
+            current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or current.st_dev != stage["device"]
+            or current.st_ino != stage["inode"]
+            or current.st_size != stage["size"]
+            or current.st_mtime_ns != stage["mtime_ns"]
+            or stat.S_IMODE(current.st_mode) != stage["mode"]
+        ):
+            fail("staged bootstrap lock changed before cleanup")
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != OWNER_FILE_MODE
+        ):
+            fail("staged bootstrap lock changed to an unsafe file")
+        uid = current_user_id()
+        if uid is not None and opened.st_uid != uid:
+            fail("staged bootstrap lock must be owned by the current user")
+        content = fd_read_bounded(descriptor, "staged bootstrap lock", BOOTSTRAP_LOCK_MAX_BYTES)
+        if content != expected:
+            fail("staged bootstrap lock target binding mismatch")
+        if stage.get("payload_sha256") != sha256_bytes(expected):
+            fail("staged bootstrap lock cleanup binding mismatch")
+        latest = stage_path.lstat()
+        if (
+            latest.st_dev != opened.st_dev
+            or latest.st_ino != opened.st_ino
+            or latest.st_size != opened.st_size
+            or latest.st_mtime_ns != opened.st_mtime_ns
+            or latest.st_nlink != 1
+            or stat.S_IMODE(latest.st_mode) != OWNER_FILE_MODE
+        ):
+            fail("staged bootstrap lock changed at cleanup")
+        stage_path.unlink()
+    finally:
+        os.close(descriptor)
+
+
+def unlink_private_regular_file_by_signature(
+    path: Path, info: os.stat_result, label: str, *, max_bytes: int
+) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened for cleanup: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if (
+            current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or current.st_dev != info.st_dev
+            or current.st_ino != info.st_ino
+            or current.st_size != info.st_size
+            or current.st_mtime_ns != info.st_mtime_ns
+            or stat.S_IMODE(current.st_mode) != stat.S_IMODE(info.st_mode)
+        ):
+            fail(f"{label} changed before cleanup")
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(info.st_mode)
+        ):
+            fail(f"{label} changed to an unsafe file")
+        uid = current_user_id()
+        if uid is not None and opened.st_uid != uid:
+            fail(f"{label} must be owned by the current user")
+        require_bounded_size(opened, label, max_bytes)
+        latest = path.lstat()
+        if (
+            latest.st_dev != opened.st_dev
+            or latest.st_ino != opened.st_ino
+            or latest.st_size != opened.st_size
+            or latest.st_mtime_ns != opened.st_mtime_ns
+            or latest.st_nlink != 1
+            or stat.S_IMODE(latest.st_mode) != stat.S_IMODE(opened.st_mode)
+        ):
+            fail(f"{label} changed at cleanup")
+        path.unlink()
+    finally:
+        os.close(descriptor)
+
+
+def cleanup_bootstrap_lock_stage_file(stage: Path) -> None:
+    if not path_exists_no_follow(stage):
+        return
+    info = require_regular_file(stage, "staged bootstrap lock", max_bytes=BOOTSTRAP_LOCK_MAX_BYTES)
+    unlink_private_regular_file_by_signature(
+        stage,
+        info,
+        "staged bootstrap lock",
+        max_bytes=BOOTSTRAP_LOCK_MAX_BYTES,
+    )
+    fsync_directory(stage.parent, "bootstrap lock root")
+
+
+def publish_missing_bootstrap_lock_file(path: Path, canonical: str, digest: str) -> Path | None:
+    require_owner_private_directory(path.parent, "bootstrap lock root")
+    parent_snapshot = directory_metadata_snapshot(path.parent, "bootstrap lock root")
+    content = bootstrap_lock_binding(canonical, digest)
+    stage = bootstrap_lock_stage_path(path)
+    stage_signature: dict[str, Any] | None = None
+    try:
+        stage_signature = write_bootstrap_lock_stage_file(stage, content)
+        published = rename_no_replace(stage, path, "bootstrap lock")
+    except BaseException:
+        if not path_exists_no_follow(stage):
+            with contextlib.suppress(BaseException):
+                validate_existing_bootstrap_lock_file(path, canonical, digest)
+                return None
+        if stage_signature is not None and path_exists_no_follow(stage):
+            unlink_validated_bootstrap_lock_stage_file(stage_signature, canonical, digest)
+            fsync_directory(path.parent, "bootstrap lock root")
+            restore_directory_metadata(path.parent, parent_snapshot, "bootstrap lock root")
+        raise
+    if not published:
+        try:
+            validate_existing_bootstrap_lock_file(path, canonical, digest)
+        except BaseException:
+            if path_exists_no_follow(stage):
+                unlink_validated_bootstrap_lock_stage_file(stage_signature, canonical, digest)
+                fsync_directory(path.parent, "bootstrap lock root")
+            restore_directory_metadata(path.parent, parent_snapshot, "bootstrap lock root")
+            raise
+        if path_exists_no_follow(stage):
+            return stage
+        return None
+    try:
+        fsync_directory(path.parent, "bootstrap lock root")
+    except BaseException:
+        # Final-path visibility is the anchor publication commit point.  The
+        # complete final rendezvous object is intentionally left in place on
+        # post-publication failures so concurrent waiters never split inodes.
+        with contextlib.suppress(BaseException):
+            require_regular_file(path, "bootstrap lock", max_bytes=BOOTSTRAP_LOCK_MAX_BYTES)
+        raise
+    return None
+
+
+def bootstrap_lock_path_exists(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        fail("bootstrap lock path is unsafe")
+    return True
+
+
+def open_existing_bootstrap_lock_file(path: Path) -> int:
     require_owner_private_directory(path.parent, "bootstrap lock root")
     flags = os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    created = False
     try:
-        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, OWNER_FILE_MODE)
-        created = True
-    except FileExistsError:
-        try:
-            descriptor = os.open(path, flags)
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                fail("bootstrap lock path is unsafe")
-            raise
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        fail("bootstrap lock was not published")
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             fail("bootstrap lock path is unsafe")
         fail(f"bootstrap lock could not be opened: {exc}")
     try:
-        if created:
-            os.fchmod(descriptor, OWNER_FILE_MODE)
         require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
     except BaseException:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def promote_bootstrap_lock_stage_alias(
+    path: Path, canonical: str, digest: str, stages: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    if not stages:
+        return []
+    promoted = stages[0]
+    stage_path = promoted["path"]
+    validate_bootstrap_lock_stage_file(stage_path, canonical, digest)
+    try:
+        published = rename_no_replace(stage_path, path, "bootstrap lock")
+    except CursorSetupError:
+        if not path_exists_no_follow(stage_path) and bootstrap_lock_path_exists(path):
+            return stages[1:]
+        raise
+    if not published:
+        return stages
+    return stages[1:]
+
+
+def drain_bootstrap_lock_stage_aliases(
+    path: Path, descriptor: int, canonical: str, digest: str
+) -> None:
+    stages = validated_bootstrap_lock_stage_aliases(path, canonical, digest)
+    if not stages:
+        return
+    parent_snapshot = directory_metadata_snapshot(path.parent, "bootstrap lock root")
+    final_before = require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+    read_valid_bootstrap_binding(descriptor, path, canonical, digest)
+    for stage in stages:
+        unlink_validated_bootstrap_lock_stage_file(stage, canonical, digest)
+        fsync_directory(path.parent, "bootstrap lock root")
+        read_valid_bootstrap_binding(descriptor, path, canonical, digest)
+    restore_directory_metadata(path.parent, parent_snapshot, "bootstrap lock root")
+    final_after = require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+    if (
+        final_before.st_dev != final_after.st_dev
+        or final_before.st_ino != final_after.st_ino
+        or final_after.st_nlink != 1
+        or stat.S_IMODE(final_after.st_mode) != OWNER_FILE_MODE
+    ):
+        fail("bootstrap lock final anchor changed during staged cleanup")
+    read_valid_bootstrap_binding(descriptor, path, canonical, digest)
+
+
+def open_bootstrap_lock_file(
+    path: Path,
+    canonical: str,
+    digest: str,
+    *,
+    recover_stages: bool,
+    create_missing: bool,
+) -> int:
+    require_owner_private_directory(path.parent, "bootstrap lock root")
+    stages = validated_bootstrap_lock_stage_aliases(path, canonical, digest)
+    if stages and not recover_stages:
+        fail("bootstrap lock staged publication is pending")
+    if not bootstrap_lock_path_exists(path):
+        if stages:
+            stages = promote_bootstrap_lock_stage_alias(path, canonical, digest, stages)
+        elif create_missing:
+            residue = publish_missing_bootstrap_lock_file(path, canonical, digest)
+            if residue is not None:
+                stages = validated_bootstrap_lock_stage_aliases(path, canonical, digest)
+        else:
+            fail("bootstrap lock is absent")
+        if not bootstrap_lock_path_exists(path):
+            fail("bootstrap lock was not published")
+    descriptor = open_existing_bootstrap_lock_file(path)
+    try:
+        require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
+        read_valid_bootstrap_binding(descriptor, path, canonical, digest)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def acquire_flock(descriptor: int, label: str, *, exclusive: bool, blocking: bool) -> None:
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    if not blocking:
+        operation |= fcntl.LOCK_NB
+    try:
+        fcntl.flock(descriptor, operation)
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            fail(f"{label} is already locked")
+        fail(f"{label} could not be acquired: {exc}")
+
+
+def release_flock(descriptor: int) -> None:
+    with contextlib.suppress(OSError):
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def fd_read_bounded(descriptor: int, label: str, max_bytes: int) -> bytes:
@@ -685,25 +1360,13 @@ def fd_read_bounded(descriptor: int, label: str, max_bytes: int) -> bytes:
     return content
 
 
-def fd_write_all(descriptor: int, content: bytes) -> None:
-    os.ftruncate(descriptor, 0)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    view = memoryview(content)
-    while view:
-        written = os.write(descriptor, view)
-        if written == 0:
-            fail("bootstrap lock write made no progress")
-        view = view[written:]
-    os.fsync(descriptor)
-
-
 def read_valid_bootstrap_binding(
     descriptor: int, path: Path, canonical: str, digest: str
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
     content = fd_read_bounded(descriptor, "bootstrap lock", BOOTSTRAP_LOCK_MAX_BYTES)
     if not content.strip():
-        return None
+        fail("bootstrap lock binding is missing")
     try:
         loaded = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -721,34 +1384,22 @@ def read_valid_bootstrap_binding(
     return loaded
 
 
-def validate_or_write_bootstrap_binding(
-    descriptor: int, path: Path, canonical: str, digest: str
-) -> None:
-    if read_valid_bootstrap_binding(descriptor, path, canonical, digest) is not None:
-        return
-    binding = canonical_json(
-        {
-            "schema_version": 1,
-            "product_name": PRODUCT_NAME,
-            "canonical_target": canonical,
-            "target_sha256": digest,
-        }
-    )
-    if len(binding) > BOOTSTRAP_LOCK_MAX_BYTES:
-        fail("bootstrap lock binding exceeds the size limit")
-    fd_write_all(descriptor, binding)
-    require_lock_file_matches_fd(path, descriptor, "bootstrap lock")
-    if read_valid_bootstrap_binding(descriptor, path, canonical, digest) is None:
-        fail("bootstrap lock binding was not persisted")
-
-
 @contextlib.contextmanager
-def bootstrap_lifecycle_lock(target: Path) -> Iterator[None]:
-    path, canonical, digest = bootstrap_lock_path(target)
+def bootstrap_lifecycle_lock(
+    target: str | Path, *, recover_stages: bool = True, create_missing: bool = True
+) -> Iterator[Path]:
+    lexical_target = lexical_target_path(target)
+    product_path, product_canonical, product_digest = bootstrap_product_lock_path(create_root=True)
     owner = (os.getpid(), threading.get_ident())
+    product_descriptor: int | None = None
     descriptor: int | None = None
+    product_locked = False
     locked = False
-    reentrant = False
+    canonical: str | None = None
+    path: Path | None = None
+    resolved_target: Path | None = None
+    reentrant_key: str | None = None
+    reentrant_target: Path | None = None
     with _BOOTSTRAP_STATE_LOCK:
         for key, held in list(_BOOTSTRAP_LOCKS.items()):
             held_owner = held.get("owner")
@@ -758,39 +1409,90 @@ def bootstrap_lifecycle_lock(target: Path) -> Iterator[None]:
                     with contextlib.suppress(OSError):
                         os.close(int(inherited_descriptor))
                 del _BOOTSTRAP_LOCKS[key]
-        held = _BOOTSTRAP_LOCKS.get(canonical)
-        if held is not None:
-            if held.get("owner") == owner and held.get("descriptor") is not None:
-                held["depth"] += 1
-                reentrant = True
-            else:
-                fail("target is already locked")
-        else:
-            _BOOTSTRAP_LOCKS[canonical] = {
-                "depth": 0,
-                "descriptor": None,
-                "owner": owner,
-                "path": path,
-            }
-    if reentrant:
+        lexical_key = str(lexical_target)
+        held = _BOOTSTRAP_LOCKS.get(lexical_key)
+        if held is not None and held.get("owner") == owner and held.get("descriptor") is not None:
+            held["depth"] += 1
+            reentrant_key = lexical_key
+            reentrant_target = Path(str(held["target"]))
+    if reentrant_target is not None and reentrant_key is not None:
         try:
-            yield
+            yield reentrant_target
         finally:
             with _BOOTSTRAP_STATE_LOCK:
-                held = _BOOTSTRAP_LOCKS.get(canonical)
+                held = _BOOTSTRAP_LOCKS.get(reentrant_key)
                 if held is not None and held.get("owner") == owner:
                     held["depth"] -= 1
         return
     try:
-        descriptor = open_bootstrap_lock_file(path)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in {errno.EACCES, errno.EAGAIN}:
-                fail("target is already locked")
-            fail(f"bootstrap lock could not be acquired: {exc}")
+        product_descriptor = open_bootstrap_lock_file(
+            product_path,
+            product_canonical,
+            product_digest,
+            recover_stages=True,
+            create_missing=True,
+        )
+        acquire_flock(product_descriptor, "bootstrap product lock", exclusive=True, blocking=True)
+        product_locked = True
+        read_valid_bootstrap_binding(
+            product_descriptor, product_path, product_canonical, product_digest
+        )
+        drain_bootstrap_lock_stage_aliases(
+            product_path, product_descriptor, product_canonical, product_digest
+        )
+        resolved_target = resolve_target(str(lexical_target))
+        path, canonical, digest = bootstrap_lock_path_for_canonical(
+            canonical_target_text(resolved_target),
+            create_root=True,
+        )
+        with _BOOTSTRAP_STATE_LOCK:
+            held = _BOOTSTRAP_LOCKS.get(canonical)
+            if held is not None:
+                if held.get("owner") == owner and held.get("descriptor") is not None:
+                    held["depth"] += 1
+                    reentrant_key = canonical
+                    reentrant_target = Path(str(held["target"]))
+                else:
+                    fail("target is already locked")
+            else:
+                _BOOTSTRAP_LOCKS[canonical] = {
+                    "depth": 0,
+                    "descriptor": None,
+                    "owner": owner,
+                    "path": path,
+                    "target": str(resolved_target),
+                }
+        if reentrant_target is not None and reentrant_key is not None:
+            release_flock(product_descriptor)
+            product_locked = False
+            os.close(product_descriptor)
+            product_descriptor = None
+            try:
+                yield reentrant_target
+            finally:
+                with _BOOTSTRAP_STATE_LOCK:
+                    held = _BOOTSTRAP_LOCKS.get(reentrant_key)
+                    if held is not None and held.get("owner") == owner:
+                        held["depth"] -= 1
+            return
+        descriptor = open_bootstrap_lock_file(
+            path,
+            canonical,
+            digest,
+            recover_stages=recover_stages,
+            create_missing=create_missing,
+        )
+        acquire_flock(descriptor, "target", exclusive=True, blocking=False)
         locked = True
-        validate_or_write_bootstrap_binding(descriptor, path, canonical, digest)
+        read_valid_bootstrap_binding(descriptor, path, canonical, digest)
+        if recover_stages:
+            drain_bootstrap_lock_stage_aliases(path, descriptor, canonical, digest)
+        elif validated_bootstrap_lock_stage_aliases(path, canonical, digest):
+            fail("bootstrap lock staged publication is pending")
+        release_flock(product_descriptor)
+        product_locked = False
+        os.close(product_descriptor)
+        product_descriptor = None
         with _BOOTSTRAP_STATE_LOCK:
             held = _BOOTSTRAP_LOCKS.get(canonical)
             if held is None or held.get("owner") != owner:
@@ -798,8 +1500,9 @@ def bootstrap_lifecycle_lock(target: Path) -> Iterator[None]:
             held["depth"] = 1
             held["descriptor"] = descriptor
             held["path"] = path
+            held["target"] = str(resolved_target)
         try:
-            yield
+            yield resolved_target
         finally:
             with _BOOTSTRAP_STATE_LOCK:
                 held = _BOOTSTRAP_LOCKS.get(canonical)
@@ -809,21 +1512,115 @@ def bootstrap_lifecycle_lock(target: Path) -> Iterator[None]:
                         del _BOOTSTRAP_LOCKS[canonical]
     finally:
         if locked:
-            with contextlib.suppress(OSError):
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            release_flock(descriptor)
         if descriptor is not None:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
-        with _BOOTSTRAP_STATE_LOCK:
-            held = _BOOTSTRAP_LOCKS.get(canonical)
-            if held is not None and held.get("owner") == owner and held["depth"] == 0:
-                del _BOOTSTRAP_LOCKS[canonical]
+        if product_locked and product_descriptor is not None:
+            release_flock(product_descriptor)
+        if product_descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(product_descriptor)
+        if canonical is not None:
+            with _BOOTSTRAP_STATE_LOCK:
+                held = _BOOTSTRAP_LOCKS.get(canonical)
+                if held is not None and held.get("owner") == owner and held["depth"] == 0:
+                    del _BOOTSTRAP_LOCKS[canonical]
+
+
+def run_under_product_shared_lock(
+    function: Any, target: str | Path, *args: Any, **kwargs: Any
+) -> Any:
+    lexical_target = lexical_target_path(target)
+    product_path, product_canonical, product_digest = bootstrap_product_lock_path(create_root=False)
+    product_descriptor = open_existing_bootstrap_lock_file(product_path)
+    product_locked = False
+    target_descriptor: int | None = None
+    target_locked = False
+    try:
+        read_valid_bootstrap_binding(
+            product_descriptor, product_path, product_canonical, product_digest
+        )
+        if validated_bootstrap_lock_stage_aliases(
+            product_path, product_canonical, product_digest
+        ):
+            fail("bootstrap product lock staged publication is pending")
+        acquire_flock(product_descriptor, "bootstrap product lock", exclusive=False, blocking=True)
+        product_locked = True
+        resolved_target = resolve_target(str(lexical_target))
+        path, canonical, digest = bootstrap_lock_path_for_canonical(
+            canonical_target_text(resolved_target),
+            create_root=False,
+        )
+        if validated_bootstrap_lock_stage_aliases(path, canonical, digest):
+            fail("bootstrap lock staged publication is pending")
+        if bootstrap_lock_path_exists(path):
+            target_descriptor = open_existing_bootstrap_lock_file(path)
+            read_valid_bootstrap_binding(target_descriptor, path, canonical, digest)
+            acquire_flock(target_descriptor, "target", exclusive=True, blocking=False)
+            target_locked = True
+            release_flock(product_descriptor)
+            product_locked = False
+            return function(resolved_target, *args, **kwargs)
+        return function(resolved_target, *args, **kwargs)
+    finally:
+        if target_locked and target_descriptor is not None:
+            release_flock(target_descriptor)
+        if target_descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(target_descriptor)
+        if product_locked:
+            release_flock(product_descriptor)
+        os.close(product_descriptor)
+
+
+def run_cold_bootstrap_read(function: Any, target: str | Path, *args: Any, **kwargs: Any) -> Any:
+    lexical_target = lexical_target_path(target)
+    product_path, product_canonical, product_digest = bootstrap_product_lock_path(create_root=False)
+    if bootstrap_final_anchor_exists_no_create(product_path, product_canonical, product_digest):
+        return run_under_product_shared_lock(function, lexical_target, *args, **kwargs)
+    before = bootstrap_lock_cold_namespace_snapshot(product_path)
+    resolved_target = resolve_target(str(lexical_target))
+    result = function(resolved_target, *args, **kwargs)
+    if bootstrap_final_anchor_exists_no_create(product_path, product_canonical, product_digest):
+        return run_under_product_shared_lock(function, lexical_target, *args, **kwargs)
+    after = bootstrap_lock_cold_namespace_snapshot(product_path)
+    if before != after:
+        fail("bootstrap lock namespace changed during cold read")
+    return result
 
 
 def bootstrap_locked(function: Any) -> Any:
-    def wrapped(target: Path, *args: Any, **kwargs: Any) -> Any:
-        with bootstrap_lifecycle_lock(target):
-            return function(target, *args, **kwargs)
+    def wrapped(target: str | Path, *args: Any, **kwargs: Any) -> Any:
+        with bootstrap_lifecycle_lock(target) as resolved_target:
+            return function(resolved_target, *args, **kwargs)
+
+    return wrapped
+
+
+def bootstrap_read_locked(function: Any) -> Any:
+    def wrapped(target: str | Path, *args: Any, **kwargs: Any) -> Any:
+        lexical_target = lexical_target_path(target)
+        lexical_key = str(lexical_target)
+        owner = (os.getpid(), threading.get_ident())
+        with _BOOTSTRAP_STATE_LOCK:
+            held = _BOOTSTRAP_LOCKS.get(lexical_key)
+            if held is not None and held.get("owner") == owner and held.get("descriptor") is not None:
+                held["depth"] += 1
+                reentrant = True
+                reentrant_target = Path(str(held["target"]))
+            else:
+                reentrant = False
+                reentrant_target = None
+        if reentrant:
+            try:
+                return function(reentrant_target, *args, **kwargs)
+            finally:
+                with _BOOTSTRAP_STATE_LOCK:
+                    held = _BOOTSTRAP_LOCKS.get(lexical_key)
+                    if held is not None and held.get("owner") == owner:
+                        held["depth"] -= 1
+        return run_cold_bootstrap_read(function, lexical_target, *args, **kwargs)
 
     return wrapped
 
@@ -1126,11 +1923,12 @@ def drift_for_target(target: Path, stamp: dict[str, Any]) -> list[str]:
     return drift
 
 
-@bootstrap_locked
+@bootstrap_read_locked
 def inspect_target(target: Path) -> dict[str, Any]:
     if not target.exists() and not target.is_symlink():
         return {
             "state": "missing",
+            "target": str(target),
             "setup_id": None,
             "content_setup_id": None,
             "profile_id": None,
@@ -1152,6 +1950,7 @@ def inspect_target(target: Path) -> dict[str, Any]:
         drift = [*target_safety, *builder_findings, *runtime_findings, *control_findings]
         return {
             "state": "unmanaged" if config_exists else "empty",
+            "target": str(target),
             "setup_id": None,
             "content_setup_id": None,
             "profile_id": None,
@@ -1194,6 +1993,7 @@ def inspect_target(target: Path) -> dict[str, Any]:
     legacy_setup_id = stamp_legacy_setup_id(stamp)
     return {
         "state": "managed",
+        "target": str(target),
         "setup_id": content_setup_id if content_setup_id is not None else legacy_setup_id,
         "content_setup_id": content_setup_id,
         "profile_id": profile_id,
@@ -1604,6 +2404,18 @@ def remove_backup_slot(slot_path: Path) -> None:
     slot_path.rmdir()
 
 
+def remove_backup_slot_exact(
+    slot_signature: dict[str, Any], envelope_signature: dict[str, Any], label: str
+) -> None:
+    slot_path = Path(slot_signature["path"])
+    envelope_path = slot_path / BACKUP_NAME
+    if not current_file_matches_signature(envelope_path, envelope_signature, f"{label} envelope"):
+        fail(f"{label} envelope changed before cleanup")
+    envelope_path.unlink()
+    fsync_directory(slot_path, label)
+    rmdir_held_directory(slot_signature, label)
+
+
 def choose_backup_slot(pool: Path) -> int:
     ensure_backup_pool(pool)
     for slot in range(10):
@@ -1630,17 +2442,385 @@ def capture_managed_files(target: Path) -> dict[str, bytes | None]:
     return captured
 
 
+def relative_parent_chain(relative: Path) -> list[Path]:
+    parents: list[Path] = [Path(".")]
+    parent = relative.parent
+    chain: list[Path] = []
+    while parent != Path("."):
+        chain.append(parent)
+        parent = parent.parent
+    parents.extend(reversed(chain))
+    return parents
+
+
+def file_record(path: Path, label: str, *, max_bytes: int) -> dict[str, Any]:
+    before = require_regular_file(path, label, max_bytes=max_bytes)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            fail(f"{label} changed while it was being opened")
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != OWNER_FILE_MODE
+        ):
+            fail(f"{label} changed to an unsafe file")
+        uid = current_user_id()
+        if uid is not None and opened.st_uid != uid:
+            fail(f"{label} must be owned by the current user")
+        content = fd_read_bounded(descriptor, label, max_bytes)
+    finally:
+        os.close(descriptor)
+    after = require_regular_file(path, label, max_bytes=max_bytes)
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_size != after.st_size
+    ):
+        fail(f"{label} changed during validation")
+    return {
+        "kind": "file",
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mode": stat.S_IMODE(after.st_mode),
+        "uid": after.st_uid,
+        "gid": after.st_gid,
+        "nlink": after.st_nlink,
+        "size": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
+        "payload": content,
+        "sha256": sha256_bytes(content),
+    }
+
+
+def open_owner_directory_descriptor(path: Path, label: str) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened: {exc}")
+    try:
+        info = require_directory_matches_fd(path, descriptor, label, {OWNER_DIRECTORY_MODE})
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, info
+
+
+def list_directory_descriptor(descriptor: int, label: str) -> list[str]:
+    try:
+        children = os.listdir(descriptor)
+    except OSError as exc:
+        fail(f"{label} could not be listed: {exc}")
+    return sorted(str(child) for child in children)
+
+
+def directory_record(path: Path, label: str) -> dict[str, Any]:
+    descriptor, info = open_owner_directory_descriptor(path, label)
+    try:
+        children = list_directory_descriptor(descriptor, label)
+        opened = os.fstat(descriptor)
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            fail(f"{label} disappeared while it was being listed")
+        if (
+            current.st_dev != info.st_dev
+            or current.st_ino != info.st_ino
+            or opened.st_dev != info.st_dev
+            or opened.st_ino != info.st_ino
+            or current.st_uid != info.st_uid
+            or current.st_gid != info.st_gid
+            or current.st_nlink != info.st_nlink
+            or current.st_size != info.st_size
+            or current.st_mtime_ns != info.st_mtime_ns
+            or opened.st_uid != info.st_uid
+            or opened.st_gid != info.st_gid
+            or opened.st_nlink != info.st_nlink
+            or opened.st_size != info.st_size
+            or opened.st_mtime_ns != info.st_mtime_ns
+        ):
+            fail(f"{label} changed while it was being captured")
+    finally:
+        os.close(descriptor)
+    return {
+        "kind": "directory",
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "children": children,
+    }
+
+
+def held_directory_signature(path: Path, label: str) -> dict[str, Any]:
+    descriptor, info = open_owner_directory_descriptor(path, label)
+    try:
+        children = list_directory_descriptor(descriptor, label)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return {
+        "kind": "directory",
+        "path": path,
+        "descriptor": descriptor,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "children": children,
+    }
+
+
+def close_held_directory_signature(signature: dict[str, Any]) -> None:
+    descriptor = signature.get("descriptor")
+    if isinstance(descriptor, int):
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        signature["descriptor"] = None
+
+
+def close_held_directory_signatures(signatures: list[dict[str, Any]]) -> None:
+    for signature in signatures:
+        close_held_directory_signature(signature)
+
+
+def require_held_directory_signature(
+    signature: dict[str, Any], label: str, *, expected_children: list[str] | None = None
+) -> os.stat_result:
+    path = Path(signature["path"])
+    descriptor = signature.get("descriptor")
+    if not isinstance(descriptor, int):
+        fail(f"{label} directory descriptor is closed")
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} disappeared")
+    fd_info = os.fstat(descriptor)
+    if (
+        path_info.st_dev != signature["device"]
+        or path_info.st_ino != signature["inode"]
+        or fd_info.st_dev != signature["device"]
+        or fd_info.st_ino != signature["inode"]
+        or stat.S_ISLNK(path_info.st_mode)
+        or not stat.S_ISDIR(fd_info.st_mode)
+        or path_info.st_uid != signature["uid"]
+        or path_info.st_gid != signature["gid"]
+        or fd_info.st_uid != signature["uid"]
+        or fd_info.st_gid != signature["gid"]
+        or stat.S_IMODE(path_info.st_mode) != signature["mode"]
+        or stat.S_IMODE(fd_info.st_mode) != signature["mode"]
+        or path_info.st_nlink != signature["nlink"]
+        or fd_info.st_nlink != signature["nlink"]
+        or path_info.st_nlink != fd_info.st_nlink
+        or path_info.st_size != fd_info.st_size
+    ):
+        fail(f"{label} changed before directory cleanup")
+    children = list_directory_descriptor(descriptor, label)
+    if expected_children is not None and children != expected_children:
+        fail(f"{label} contains unexpected entries")
+    if expected_children is None and children != signature["children"]:
+        fail(f"{label} children changed")
+    return path_info
+
+
+def rmdir_held_directory(signature: dict[str, Any], label: str) -> None:
+    path = Path(signature["path"])
+    require_held_directory_signature(signature, label, expected_children=[])
+    path.rmdir()
+    fsync_directory(path.parent, f"{label} parent")
+    close_held_directory_signature(signature)
+
+
+def absent_record(path: Path) -> dict[str, Any]:
+    if path.exists() or path.is_symlink():
+        fail(f"expected absent path exists: {path}")
+    return {"kind": "absent"}
+
+
+def capture_managed_object_graph(target: Path, names: tuple[str, ...] | None = None) -> dict[str, Any]:
+    selected = tuple(path.as_posix() for path in managed_paths()) if names is None else names
+    parents: dict[str, dict[str, Any]] = {}
+    files: dict[str, dict[str, Any]] = {}
+    for relative_name in selected:
+        relative = safe_relative(relative_name)
+        for parent_relative in relative_parent_chain(relative):
+            parent = target if parent_relative == Path(".") else target / parent_relative
+            key = parent_relative.as_posix()
+            if key == ".":
+                key = ""
+            if key not in parents:
+                parents[key] = (
+                    directory_record(parent, "managed parent")
+                    if parent.exists() or parent.is_symlink()
+                    else absent_record(parent)
+                )
+        path = target / relative
+        files[relative_name] = (
+            file_record(
+                path,
+                f"managed path {relative_name}",
+                max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
+            )
+            if path.exists() or path.is_symlink()
+            else absent_record(path)
+        )
+    return {"parents": parents, "files": files}
+
+
+def records_match(expected: dict[str, Any], current: dict[str, Any]) -> bool:
+    return expected == current
+
+
+def revalidate_managed_object_graph(
+    target: Path, graph: dict[str, Any], names: tuple[str, ...] | None = None
+) -> None:
+    selected = tuple(graph["files"]) if names is None else names
+    current = capture_managed_object_graph(target, selected)
+    for section in ("parents", "files"):
+        for key, expected in graph[section].items():
+            if not records_match(expected, current[section].get(key, {"kind": "absent"})):
+                fail(f"managed object graph changed before transition: {key or '.'}")
+
+
+def managed_graph_to_files(graph: dict[str, Any]) -> dict[str, bytes | None]:
+    return {
+        relative: None if record["kind"] == "absent" else bytes(record["payload"])
+        for relative, record in graph["files"].items()
+    }
+
+
+def write_exclusive_file_synced(path: Path, content: bytes, mode: int, label: str) -> dict[str, Any]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            fail(f"{label} path is unsafe")
+        fail(f"{label} could not be opened: {exc}")
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                fail(f"{label} write made no progress")
+            view = view[written:]
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        info = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    return {
+        "path": path,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "sha256": sha256_bytes(content),
+    }
+
+
+def current_file_matches_signature(path: Path, signature: dict[str, Any], label: str) -> bool:
+    try:
+        current = file_record(path, label, max_bytes=MANAGED_PAYLOAD_MAX_BYTES)
+    except CursorSetupError:
+        return False
+    return (
+        current["device"] == signature["device"]
+        and current["inode"] == signature["inode"]
+        and current["mode"] == signature["mode"]
+        and current["uid"] == signature["uid"]
+        and current["gid"] == signature["gid"]
+        and current["nlink"] == signature["nlink"]
+        and current["size"] == signature["size"]
+        and current["mtime_ns"] == signature["mtime_ns"]
+        and current["sha256"] == signature["sha256"]
+    )
+
+
+def restore_parent_metadata(target: Path, graph: dict[str, Any]) -> None:
+    for relative_name, record in sorted(
+        graph["parents"].items(), key=lambda item: item[0].count("/"), reverse=True
+    ):
+        if record["kind"] != "directory":
+            continue
+        path = target if relative_name == "" else target / relative_name
+        restore_directory_record_metadata(path, record, f"managed parent {relative_name or '.'}")
+
+
+def restore_directory_record_metadata(path: Path, record: dict[str, Any], label: str) -> None:
+    current = directory_record(path, label)
+    topology_record = dict(record)
+    topology_record["mode"] = current["mode"]
+    topology_record["mtime_ns"] = current["mtime_ns"]
+    if not records_match(topology_record, current):
+        fail(f"{label} changed before metadata restore")
+    if current["mode"] != record["mode"]:
+        os.chmod(path, int(record["mode"]))
+    os.utime(path, ns=(path.lstat().st_atime_ns, int(record["mtime_ns"])))
+    restored = directory_record(path, label)
+    if not records_match(record, restored):
+        fail(f"{label} metadata could not be restored")
+
+
+def remove_empty_created_parents(created_directories: list[dict[str, Any]]) -> None:
+    for signature in reversed(created_directories):
+        rmdir_held_directory(signature, "created managed parent")
+
+
 def write_backup(target: Path, source_state: dict[str, Any]) -> int:
     pool = backup_pool(target)
+    pool_existed = path_exists_no_follow(pool)
+    pool_parent_snapshot = directory_record(pool.parent, "control root")
     slot = choose_backup_slot(pool)
     slot_path = pool / str(slot)
-    if path_exists_no_follow(slot_path):
-        remove_backup_slot(slot_path)
-    slot_path.mkdir(mode=OWNER_DIRECTORY_MODE)
-    slot_path.chmod(OWNER_DIRECTORY_MODE)
     files = capture_managed_files(target)
+    file_records = {
+        relative: (
+            {"present": False, "size": None, "sha256": None}
+            if content is None
+            else {"present": True, "size": len(content), "sha256": sha256_bytes(content)}
+        )
+        for relative, content in files.items()
+    }
     envelope = {
-        "schema_version": 2,
+        "schema_version": 3,
         "product_name": PRODUCT_NAME,
         "build_version": VERSION,
         "slot": slot,
@@ -1654,9 +2834,63 @@ def write_backup(target: Path, source_state: dict[str, Any]) -> int:
             relative: None if content is None else base64.b64encode(content).decode("ascii")
             for relative, content in files.items()
         },
+        "file_records": file_records,
     }
-    (slot_path / BACKUP_NAME).write_bytes(canonical_json(envelope))
-    (slot_path / BACKUP_NAME).chmod(OWNER_FILE_MODE)
+    payload = canonical_json(envelope)
+    pool_snapshot = directory_record(pool, "backup pool")
+    temp_slot = pool / f".{slot}.nddev-backup-tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    old_slot = pool / f".{slot}.nddev-backup-old-{os.getpid()}-{secrets.token_hex(8)}"
+    temp_slot_signature: dict[str, Any] | None = None
+    envelope_signature: dict[str, Any] | None = None
+    old_moved = False
+    published = False
+    try:
+        temp_slot.mkdir(mode=OWNER_DIRECTORY_MODE)
+        temp_slot_signature = held_directory_signature(temp_slot, "backup temporary slot")
+        temp_slot.chmod(OWNER_DIRECTORY_MODE)
+        backup_path = temp_slot / BACKUP_NAME
+        envelope_signature = write_exclusive_file_synced(
+            backup_path, payload, OWNER_FILE_MODE, "backup envelope"
+        )
+        fsync_directory(temp_slot, "backup slot")
+        if path_exists_no_follow(slot_path):
+            require_owner_private_directory(slot_path, f"backup slot {slot}")
+            if not rename_no_replace(slot_path, old_slot, "backup old slot hold"):
+                fail("backup old slot hold already exists")
+            old_moved = True
+            fsync_directory(pool, "backup pool")
+        if not rename_no_replace(temp_slot, slot_path, "backup slot"):
+            fail("backup slot publication lost a no-replace race")
+        if temp_slot_signature is not None:
+            temp_slot_signature["path"] = slot_path
+        published = True
+        fsync_directory(pool, "backup pool")
+        load_backup(target, slot)
+    except BaseException:
+        if temp_slot_signature is not None and envelope_signature is not None:
+            cleanup_path = slot_path if published else temp_slot
+            temp_slot_signature["path"] = cleanup_path
+            if path_exists_no_follow(cleanup_path):
+                with contextlib.suppress(BaseException):
+                    remove_backup_slot_exact(
+                        temp_slot_signature,
+                        envelope_signature,
+                        "backup published slot" if published else "backup temporary slot",
+                    )
+        if old_moved and path_exists_no_follow(old_slot) and not path_exists_no_follow(slot_path):
+            if not rename_no_replace(old_slot, slot_path, "backup old slot restore"):
+                fail("backup old slot restore lost a no-replace race")
+            fsync_directory(pool, "backup pool")
+        restore_directory_record_metadata(pool, pool_snapshot, "backup pool")
+        if not pool_existed and path_exists_no_follow(pool):
+            with contextlib.suppress(OSError):
+                pool.rmdir()
+            fsync_directory(pool.parent, "control root")
+            restore_directory_record_metadata(pool.parent, pool_parent_snapshot, "control root")
+        raise
+    finally:
+        if temp_slot_signature is not None:
+            close_held_directory_signature(temp_slot_signature)
     return slot
 
 
@@ -1671,6 +2905,8 @@ def load_backup(target: Path, slot: int) -> dict[str, Any]:
         require_exact_keys(envelope, BACKUP_KEYS_V1, f"backup slot {slot}")
     elif schema_version == 2:
         require_exact_keys(envelope, BACKUP_KEYS_V2, f"backup slot {slot}")
+    elif schema_version == 3:
+        require_exact_keys(envelope, BACKUP_KEYS_V3, f"backup slot {slot}")
     else:
         fail("backup is not owned by nddev-cursor-cli-app")
     if envelope["product_name"] != PRODUCT_NAME:
@@ -1679,7 +2915,39 @@ def load_backup(target: Path, slot: int) -> dict[str, Any]:
         fail("backup belongs to a different canonical target")
     if envelope["slot"] != slot:
         fail("backup slot identity mismatch")
+    if schema_version == 3:
+        validate_backup_file_records(envelope)
     return envelope
+
+
+def validate_backup_file_records(envelope: dict[str, Any]) -> None:
+    files = envelope.get("files")
+    records = envelope.get("file_records")
+    if not isinstance(files, dict) or not isinstance(records, dict):
+        fail("backup file records must be objects")
+    if set(files) != set(records):
+        fail("backup file records path set mismatch")
+    for relative, encoded in files.items():
+        record = records[relative]
+        if not isinstance(record, dict):
+            fail(f"backup file record for {relative} must be an object")
+        require_exact_keys(record, {"present", "size", "sha256"}, f"backup file record {relative}")
+        if encoded is None:
+            if record != {"present": False, "size": None, "sha256": None}:
+                fail(f"backup absent file record mismatch: {relative}")
+            continue
+        if not isinstance(encoded, str):
+            fail(f"backup payload for {relative} must be a base64 string")
+        try:
+            content = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, UnicodeEncodeError) as exc:
+            fail(f"backup payload for {relative} is invalid: {exc}")
+        if (
+            record.get("present") is not True
+            or record.get("size") != len(content)
+            or record.get("sha256") != sha256_bytes(content)
+        ):
+            fail(f"backup file record digest mismatch: {relative}")
 
 
 def safe_relative(relative: str) -> Path:
@@ -1697,7 +2965,9 @@ def remove_empty_parents(target: Path, path: Path) -> None:
         parent = parent.parent
 
 
-def ensure_real_directory(root: Path, relative: Path) -> None:
+def ensure_real_directory(
+    root: Path, relative: Path, created_directories: list[dict[str, Any]] | None = None
+) -> None:
     current = root
     uid = current_user_id()
     for part in relative.parts:
@@ -1715,6 +2985,10 @@ def ensure_real_directory(root: Path, relative: Path) -> None:
                 fail(f"managed directory must have mode 0700: {current}")
             continue
         current.mkdir(mode=OWNER_DIRECTORY_MODE)
+        if created_directories is not None:
+            created_directories.append(
+                held_directory_signature(current, "created managed parent")
+            )
         current.chmod(OWNER_DIRECTORY_MODE)
 
 
@@ -1744,39 +3018,148 @@ def replace_managed_state(
     *,
     names: tuple[str, ...] | None = None,
 ) -> None:
-    del expected
     selected = tuple(desired) if names is None else names
-    for relative_name in selected:
-        relative = safe_relative(relative_name)
-        destination = target / relative
-        content = desired.get(relative_name)
-        if content is None:
-            if destination.exists() or destination.is_symlink():
-                require_regular_file(
+    if isinstance(expected, dict) and "files" in expected and "parents" in expected:
+        prestate = expected
+    else:
+        prestate = capture_managed_object_graph(target, selected)
+    revalidate_managed_object_graph(target, prestate, selected)
+    if all(
+        (
+            prestate["files"][relative_name]["kind"] == "absent"
+            and desired.get(relative_name) is None
+        )
+        or (
+            prestate["files"][relative_name]["kind"] == "file"
+            and desired.get(relative_name) == prestate["files"][relative_name]["payload"]
+        )
+        for relative_name in selected
+    ):
+        return
+
+    ensure_control_root(target)
+    transaction_root = control_root(target) / f".managed-txn-{os.getpid()}-{secrets.token_hex(8)}"
+    held_root = transaction_root / "held"
+    directory_signatures: list[dict[str, Any]] = []
+    created_directories: list[dict[str, Any]] = []
+    transaction_signature: dict[str, Any] | None = None
+    held_signature: dict[str, Any] | None = None
+    new_records: dict[str, dict[str, Any]] = {}
+    held_records: dict[str, Path] = {}
+    committed = False
+    try:
+        transaction_root.mkdir(mode=OWNER_DIRECTORY_MODE)
+        transaction_signature = held_directory_signature(transaction_root, "managed transaction root")
+        directory_signatures.append(transaction_signature)
+        transaction_root.chmod(OWNER_DIRECTORY_MODE)
+        held_root.mkdir(mode=OWNER_DIRECTORY_MODE)
+        held_signature = held_directory_signature(held_root, "managed held root")
+        directory_signatures.append(held_signature)
+        held_root.chmod(OWNER_DIRECTORY_MODE)
+        for relative_name in selected:
+            relative = safe_relative(relative_name)
+            destination = target / relative
+            content = desired.get(relative_name)
+            before_record = prestate["files"][relative_name]
+            if before_record["kind"] == "file":
+                if content == before_record["payload"]:
+                    continue
+                hold_name = base64.urlsafe_b64encode(relative_name.encode("utf-8")).decode("ascii")
+                held_path = held_root / hold_name
+                current = file_record(
                     destination,
-                    f"managed path {relative.as_posix()}",
+                    f"managed path {relative_name}",
                     max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
                 )
+                if current != before_record:
+                    fail(f"managed path changed before transition: {relative_name}")
+                os.rename(destination, held_path)
+                fsync_directory(destination.parent, "managed parent")
+                held_records[relative_name] = held_path
+            elif content is None:
+                continue
+            if content is not None:
+                ensure_real_directory(target, relative.parent, created_directories)
+                if destination.exists() or destination.is_symlink():
+                    fail(f"managed destination changed before publication: {relative_name}")
+                temporary = destination.with_name(
+                    f".{destination.name}.nddev-tmp-{os.getpid()}-{secrets.token_hex(8)}"
+                )
+                try:
+                    signature = write_exclusive_file_synced(
+                        temporary,
+                        content,
+                        OWNER_FILE_MODE,
+                        f"managed path {relative_name}",
+                    )
+                    os.replace(temporary, destination)
+                    fsync_directory(destination.parent, "managed parent")
+                    signature["path"] = destination
+                    new_records[relative_name] = signature
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        temporary.unlink()
+        committed = True
+    except BaseException:
+        for relative_name, signature in reversed(list(new_records.items())):
+            destination = target / safe_relative(relative_name)
+            if current_file_matches_signature(
+                destination, signature, f"managed path {relative_name}"
+            ):
                 destination.unlink()
-                remove_empty_parents(target, destination)
-            continue
-        ensure_real_directory(target, relative.parent)
-        if destination.exists() or destination.is_symlink():
-            require_regular_file(
-                destination,
-                f"managed path {relative.as_posix()}",
+                fsync_directory(destination.parent, "managed parent")
+        for relative_name, held_path in reversed(list(held_records.items())):
+            destination = target / safe_relative(relative_name)
+            original = prestate["files"][relative_name]
+            if destination.exists() or destination.is_symlink():
+                fail(f"managed rollback refused to overwrite replacement: {relative_name}")
+            current = file_record(
+                held_path,
+                f"held managed path {relative_name}",
                 max_bytes=MANAGED_PAYLOAD_MAX_BYTES,
             )
-        temporary = destination.with_name(
-            f".{destination.name}.nddev-tmp-{os.getpid()}-{secrets.token_hex(8)}"
-        )
-        try:
-            write_exclusive_file(temporary, content)
-            os.replace(temporary, destination)
-            destination.chmod(OWNER_FILE_MODE)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                temporary.unlink()
+            if current != original:
+                fail(f"held managed path changed before rollback: {relative_name}")
+            ensure_real_directory(target, safe_relative(relative_name).parent, created_directories)
+            os.rename(held_path, destination)
+            os.chmod(destination, int(original["mode"]))
+            os.utime(destination, ns=(time.time_ns(), int(original["mtime_ns"])))
+            fsync_directory(destination.parent, "managed parent")
+        remove_empty_created_parents(created_directories)
+        restore_parent_metadata(target, prestate)
+        if held_signature is not None:
+            rmdir_held_directory(held_signature, "managed held root")
+        if transaction_signature is not None:
+            rmdir_held_directory(transaction_signature, "managed transaction root")
+        raise
+    finally:
+        if committed:
+            cleanup_errors: list[str] = []
+            for relative_name, held_path in reversed(list(held_records.items())):
+                original = prestate["files"][relative_name]
+                try:
+                    if not current_file_matches_signature(
+                        held_path, original, f"held managed path {relative_name}"
+                    ):
+                        fail(f"held managed path changed before cleanup: {relative_name}")
+                    held_path.unlink()
+                    fsync_directory(held_path.parent, "managed held root")
+                except BaseException as exc:
+                    cleanup_errors.append(str(exc))
+            if held_signature is not None:
+                try:
+                    rmdir_held_directory(held_signature, "managed held root")
+                except BaseException as exc:
+                    cleanup_errors.append(str(exc))
+            if transaction_signature is not None:
+                try:
+                    rmdir_held_directory(transaction_signature, "managed transaction root")
+                except BaseException as exc:
+                    cleanup_errors.append(str(exc))
+            if cleanup_errors:
+                fail(f"managed transaction cleanup failed: {cleanup_errors[0]}")
+        close_held_directory_signatures(directory_signatures)
+        close_held_directory_signatures(created_directories)
 
 
 def desired_for_selection(
@@ -1830,7 +3213,7 @@ def restore_files_from_backup(envelope: dict[str, Any]) -> dict[str, bytes | Non
     return desired
 
 
-@bootstrap_locked
+@bootstrap_read_locked
 def plan_setup(target: Path, content_setup_id: str, profile_id: str) -> dict[str, Any]:
     render_selection(content_setup_id, profile_id)
     state = inspect_target(target)
@@ -1918,6 +3301,7 @@ def mutate_setup(
             existing_config = load_target_config(target) if state["state"] == "managed" else None
             desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
             before = capture_managed_files(target)
+            before_graph = capture_managed_object_graph(target, tuple(desired))
             changed = [
                 relative for relative, content in desired.items() if before.get(relative) != content
             ]
@@ -1926,7 +3310,7 @@ def mutate_setup(
                 backup_slot = write_backup(target, state)
             try:
                 if changed:
-                    replace_managed_state(target, desired, before)
+                    replace_managed_state(target, desired, before_graph)
                 final = inspect_target(target)
                 if (
                     final["state"] != "managed"
@@ -1937,7 +3321,6 @@ def mutate_setup(
                 ):
                     fail("setup mutation postcondition failed")
             except BaseException:
-                replace_managed_state(target, before, None)
                 raise
     except BaseException:
         if created_target:
@@ -1975,12 +3358,13 @@ def migrate_setup(
         existing_config = load_target_config(target)
         desired = desired_for_selection(target, content_setup_id, profile_id, existing_config)
         before = capture_managed_files(target)
+        before_graph = capture_managed_object_graph(target, tuple(desired))
         changed = [
             relative for relative, content in desired.items() if before.get(relative) != content
         ]
         backup_slot = write_backup(target, state)
         try:
-            replace_managed_state(target, desired, before)
+            replace_managed_state(target, desired, before_graph)
             final = inspect_target(target)
             if (
                 final["state"] != "managed"
@@ -1991,7 +3375,6 @@ def migrate_setup(
             ):
                 fail("migrate postcondition failed")
         except BaseException:
-            replace_managed_state(target, before, None)
             raise
     return {
         "schema_version": 2,
@@ -2015,14 +3398,14 @@ def restore_slot(target: Path, slot: int) -> dict[str, Any]:
         if state["state"] == "managed" and state["drift"] and not state.get("legacy"):
             fail(f"managed target has drift: {', '.join(state['drift'])}")
         before = capture_managed_files(target)
+        before_graph = capture_managed_object_graph(target, tuple(before))
         desired = restore_files_from_backup(envelope)
         try:
-            replace_managed_state(target, desired, before)
+            replace_managed_state(target, desired, before_graph)
             final = inspect_target(target)
             if final["state"] != "managed" or final["drift"]:
                 fail("restore postcondition failed")
         except BaseException:
-            replace_managed_state(target, before, None)
             raise
     return {
         "schema_version": 2,
@@ -2046,11 +3429,11 @@ def remove_setup(target: Path) -> dict[str, Any]:
         if state["state"] != "managed":
             fail(f"target is not managed (state={state['state']})")
         before = capture_managed_files(target)
+        before_graph = capture_managed_object_graph(target, tuple(before))
         desired = desired_for_remove(target)
         try:
-            replace_managed_state(target, desired, before)
+            replace_managed_state(target, desired, before_graph)
         except BaseException:
-            replace_managed_state(target, before, None)
             raise
     return {
         "schema_version": 2,
@@ -2626,7 +4009,7 @@ def remove_empty_directory_if_created(path: Path, existed_before: bool) -> None:
         path.rmdir()
 
 
-@bootstrap_locked
+@bootstrap_read_locked
 def software_status(target: Path) -> dict[str, Any]:
     if not target.exists() and not target.is_symlink():
         return {
@@ -2969,6 +4352,22 @@ def normalized_launch_args(cursor_args: list[str]) -> list[str]:
     return list(cursor_args)
 
 
+def resolve_launch_workspace(workspace: str | Path | None) -> Path:
+    if workspace is None:
+        candidate = Path.cwd()
+    else:
+        candidate = Path(workspace).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        fail("launch workspace must already exist")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail("launch workspace must be a real directory")
+    return candidate.resolve(strict=True)
+
+
 def restore_managed_config_after_launch_locked(target: Path) -> None:
     stamp = load_stamp(target)
     if stamp is None:
@@ -3050,9 +4449,14 @@ def revalidate_executable_identity(
 
 
 def run_cursor_child(
-    executable: Path, forwarded: list[str], environment: dict[str, str]
+    executable: Path, forwarded: list[str], environment: dict[str, str], workspace: Path
 ) -> subprocess.CompletedProcess[Any]:
-    return subprocess.run([str(executable), *forwarded], env=environment, check=False)
+    return subprocess.run(
+        [str(executable), *forwarded],
+        env=environment,
+        cwd=str(workspace),
+        check=False,
+    )
 
 
 def report_cleanup_failure_after_child_exception(
@@ -3170,9 +4574,11 @@ def launch_write_protection(launch_image_root: Path) -> Iterator[None]:
 
 
 @bootstrap_locked
-def launch_cursor(target: Path, cursor_args: list[str]) -> int:
+def launch_cursor(target: Path, cursor_args: list[str], workspace: Path | None = None) -> int:
     forwarded = list(cursor_args)
     reject_managed_launch_overrides(forwarded)
+    launch_workspace = resolve_launch_workspace(workspace)
+    child_args = ["--workspace", str(launch_workspace), *forwarded]
     prepare_lifecycle_target(target, create_missing=False)
     with target_lock(target, protect_lock_parent=True):
         require_clean_managed(target)
@@ -3210,7 +4616,9 @@ def launch_cursor(target: Path, cursor_args: list[str]) -> int:
                         str(launch_image["entrypoint_sha256"]),
                         "Cursor launch image executable",
                     )
-                    completed = run_cursor_child(executable, forwarded, environment)
+                    completed = run_cursor_child(
+                        executable, child_args, environment, launch_workspace
+                    )
                 except BaseException as exc:
                     child_error = exc
                     raise
@@ -3309,6 +4717,10 @@ def build_parser() -> argparse.ArgumentParser:
         "launch", help="Launch Cursor Agent with an isolated config root."
     )
     add_target(launch_parser)
+    launch_parser.add_argument(
+        "--workspace",
+        help="Project workspace directory passed to Cursor Agent as native --workspace.",
+    )
     launch_parser.add_argument("cursor_args", nargs=argparse.REMAINDER)
     return parser
 
@@ -3327,13 +4739,16 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
             "default_setup": DEFAULT_CONTENT_SETUP_ID,
             "default_profile": DEFAULT_PROFILE_ID,
         }
-    target = resolve_target(args.target)
+    launch_workspace = None
+    if args.command == "launch":
+        launch_workspace = resolve_launch_workspace(args.workspace)
+    target = lexical_target_path(args.target)
     if args.command == "status":
+        state = inspect_target(target)
         return {
             "schema_version": 2,
             "command": "status",
-            "target": str(target),
-            **inspect_target(target),
+            **state,
         }
     if args.command == "plan":
         return plan_setup(target, args.setup, args.profile)
@@ -3350,7 +4765,11 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
     if args.command == "remove":
         return remove_setup(target)
     if args.command == "launch":
-        return launch_cursor(target, normalized_launch_args(list(args.cursor_args)))
+        return launch_cursor(
+            target,
+            normalized_launch_args(list(args.cursor_args)),
+            launch_workspace,
+        )
     fail(f"unsupported command: {args.command}")
 
 

@@ -58,6 +58,11 @@ scoped only to the child process:
 python3 cli-tools/nddev_cursor_cli.py launch --target /absolute/cursor-config -- -p "summarize"
 ```
 
+By default, launch captures the manager caller's current working directory once
+and passes that directory to Cursor as native `--workspace` while also using it
+as the child process cwd. Use manager-owned `--workspace /path/to/project`
+before the separator to select a different existing project directory.
+
 The first `--` after manager options is the manager/Cursor separator and is not
 forwarded. A second or later `--` is preserved as an intentional Cursor
 argument.
