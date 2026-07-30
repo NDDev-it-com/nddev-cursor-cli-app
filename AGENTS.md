@@ -1,36 +1,60 @@
-# nddev-cursor-cli-app Agent Instructions
-
-This public repository owns the independently usable Cursor CLI setup manager.
-Keep implementation, contracts, docs, and public validators inside this module.
-Private harness tests, evidence, memories, and operational skills are owned by
-the parent control plane and must not be added here.
+<!--
+GENERATED FILE - DO NOT EDIT DIRECTLY
+generator: gds
+bundle: 0.1.0-dev
+source-commit: 97e8bbaa3a0734b156b03bad704503bc46d7575b
+input-digest: sha256:b7d328b9b2c778643def4f93520c82e037acde00d50bb9e1a3ffd9d310f675e2
+output-digest: sha256:95118edbb75bf6fb08464229b396bc33df8117632821bddb23490ae4f8e8e963
+edit-source:
+  - .gds/repository.yaml
+  - policies/base/repository-default.yaml
+  - policies/owners/organization-default.yaml
+  - policies/roles/public-module.yaml
+  - templates/agents/repository.md.tmpl
+  - templates/github-actions/go.yml.tmpl
+  - templates/harnesses/claude.md.tmpl
+-->
+# GDS repository contract
 
 ## Scope
 
-- Public manager: `cli-tools/nddev_cursor_cli.py`
-- Public validator: `cli-tools/validate_public_contracts.py`
-- Public contracts: `config/nddev-contract.json`, `build/manifest.json`,
-  `build/version.json`, `references/cursor-cli-baseline.json`
-- Public setup/profile catalogs: `setups/`, `profiles/`
-- Public builder plugin: `plugins/nddev-builder/`
+- Repository ID: `repo_01KYFBZ404N0XWPR1RGVWEH819`.
+- Roles: `module`.
+- Canonical repository facts: `.gds/repository.yaml`.
+- Applied bundle: `.gds/bundle.lock.yaml` (`0.1.0-dev`).
+- Compiled policy: `.gds/compiled-policy.json`.
 
-## Rules
+## Boundaries
 
-- Keep setup selection orthogonal to permission profiles.
-- Preserve unmanaged target files and unmanaged Cursor config keys.
-- Keep target-owned backups, locks, rollback, bounded I/O, and secret isolation.
-- Do not write live user Cursor state or private harness artifacts.
-- Do not claim Cursor runtime discovery paths that are not owned by official
-  Cursor behavior and this module's code.
-- Use Conventional Commits without co-author trailers.
+- This Git repository is one independent mutation boundary.
+- Preserve unrelated branches, worktrees, submodules, and dirty changes.
+- Resolve cross-repository work with `gds context --json` before acting.
+- Generated files are projections; change their canonical inputs and regenerate.
 
-## Validation
+## Safety
 
-Run public, module-local checks from this repository root:
+- External writes require explicit approval: `true`.
+- Generated projection edits: `forbidden`.
+- Private parent context persistence: `forbidden`.
+- Visibility contract: `public`; data classification: `public`.
 
-```bash
-python3 plugins/nddev-builder/skills/nddev-builder/scripts/validate-toolkit.py --module-root .
-python3 cli-tools/validate_public_contracts.py
-python3 cli-tools/nddev_cursor_cli.py list --json
-git diff --check
-```
+## Development
+
+- Test: `python3 -m json.tool config/nddev-contract.json`.
+
+## Agent routing
+
+- Start here: run `gds-orient` (or `gds context --json`) to resolve scope before
+  any cross-repository work. It is the orientation entry point.
+- Active skill profiles: `core, module`. Five profiles exist in total
+  (`core`, `estate-admin`, `module`, `device`, `portfolio`); only the listed ones
+  are active for this repository. The catalog is `skills/registry.yaml`, and each
+  skill lives under `skills/canonical/<name>/SKILL.md`.
+- Use on-demand skills for procedures; do not duplicate them here.
+- Treat docs and memories as derived evidence, not mutation authority.
+
+## Done
+
+- Required verification is complete or explicitly `NOT_PROVEN`.
+- Git state and every affected repository boundary are classified.
+- No private data, secret, or unapproved generated drift is introduced.
