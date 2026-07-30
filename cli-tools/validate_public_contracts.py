@@ -105,24 +105,6 @@ EXPECTED_ARTIFACTS = {
         "size": 82521188,
     },
 }
-OBSERVED_VENDOR_ASSETS = {
-    "unsupported_windows": {
-        "product_support": False,
-        "unsupported_host_category": "windows",
-        "source_template": (
-            "https://downloads.cursor.com/lab/2026.07.23-e383d2b/{os}/{arch}/agent-cli-package.zip"
-        ),
-        "provenance": (
-            "official Cursor current-release asset observation only; "
-            "not part of supported NDDev product hosts"
-        ),
-        "verified_date": "2026-07-28",
-        "assets": {
-            "windows/x64/agent-cli-package.zip": {"size": 63067629},
-            "windows/arm64/agent-cli-package.zip": {"size": 58461383},
-        },
-    }
-}
 EXPECTED_NATIVE_CAPABILITY_SURFACES = {
     "commands": {
         "official_documentation": "https://cursor.com/docs/reference/plugins",
@@ -1232,22 +1214,10 @@ def main() -> int:
             errors.append("references/cursor-cli-baseline.json: artifact pins mismatch")
         if baseline.get("host_platform_scope") != BASELINE_PLATFORM_SCOPE:
             errors.append("references/cursor-cli-baseline.json: host platform scope mismatch")
-        if baseline.get("observed_vendor_assets") != OBSERVED_VENDOR_ASSETS:
-            errors.append("references/cursor-cli-baseline.json: observed vendor assets mismatch")
-        observed_assets = (
-            baseline.get("observed_vendor_assets", {})
-            .get("unsupported_windows", {})
-            .get("assets", {})
-        )
-        for asset_path in observed_assets:
-            if asset_path in baseline.get("release", {}).get("artifacts", {}):
-                errors.append("references/cursor-cli-baseline.json: Windows asset is supported")
-            if asset_path in str(
-                baseline.get("host_platform_scope", {}).get("vendor_asset_mapping", {})
-            ):
-                errors.append(
-                    "references/cursor-cli-baseline.json: Windows asset leaked into mapping"
-                )
+        if "observed_vendor_assets" in baseline:
+            errors.append(
+                "references/cursor-cli-baseline.json: observation-only vendor assets are public"
+            )
         if baseline.get("cli_identity", {}).get("command") != "agent":
             errors.append("references/cursor-cli-baseline.json: CLI command must be agent")
         if baseline.get("configuration", {}).get("environment_override") != "CURSOR_CONFIG_DIR":
