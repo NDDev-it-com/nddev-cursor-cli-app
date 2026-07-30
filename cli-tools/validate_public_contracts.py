@@ -1225,6 +1225,8 @@ def main() -> int:
             errors.append("config/nddev-contract.json: MCP servers must not be installed")
 
     if baseline is not None:
+        if baseline.get("schema_version") != 2:
+            errors.append("references/cursor-cli-baseline.json: schema_version must be 2")
         release = baseline.get("release", {})
         if release.get("version") != CURSOR_VERSION:
             errors.append("references/cursor-cli-baseline.json: release version mismatch")

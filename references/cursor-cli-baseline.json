@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "verified_ref": "references/cursor-cli-baseline.json",
   "release": {
     "version": "2026.07.23-e383d2b",
