@@ -626,9 +626,7 @@ def capture_existing_directory_object(path: Path, label: str) -> dict[str, Any]:
     }
 
 
-def restore_existing_directory_object(
-    path: Path, snapshot: dict[str, Any], label: str
-) -> None:
+def restore_existing_directory_object(path: Path, snapshot: dict[str, Any], label: str) -> None:
     errors: list[str] = []
     for _ in range(4):
         try:
@@ -1150,7 +1148,10 @@ def restore_bootstrap_lock_envelope(root: Path, envelope: dict[str, Any]) -> Non
         != envelope["root"]
     ):
         fail("bootstrap lock root exact rollback verification failed")
-    if capture_existing_directory_object(root.parent, "bootstrap lock parent") != envelope["parent"]:
+    if (
+        capture_existing_directory_object(root.parent, "bootstrap lock parent")
+        != envelope["parent"]
+    ):
         fail("bootstrap lock parent exact rollback verification failed")
 
 
@@ -1220,7 +1221,11 @@ def bootstrap_lock_path_for_acquire(target: Any) -> tuple[Path, str, str, dict[s
 
 def product_lock_path_without_create() -> tuple[Path, str, str]:
     digest = bootstrap_lock_digest(PRODUCT_LIFECYCLE_LOCK_KEY)
-    return bootstrap_lock_root_path() / BOOTSTRAP_PRODUCT_LOCK_NAME, PRODUCT_LIFECYCLE_LOCK_KEY, digest
+    return (
+        bootstrap_lock_root_path() / BOOTSTRAP_PRODUCT_LOCK_NAME,
+        PRODUCT_LIFECYCLE_LOCK_KEY,
+        digest,
+    )
 
 
 def product_lock_path_for_acquire() -> tuple[Path, str, str, dict[str, Any]]:
@@ -1245,9 +1250,7 @@ def open_existing_bootstrap_lock_file(path: Path) -> int:
             fail("bootstrap lock path is unsafe")
         fail(f"bootstrap lock could not be opened: {exc}")
     try:
-        require_lock_file_matches_fd(
-            path, descriptor, "bootstrap lock", allowed_nlinks={1, 2}
-        )
+        require_lock_file_matches_fd(path, descriptor, "bootstrap lock", allowed_nlinks={1, 2})
     except BaseException:
         os.close(descriptor)
         raise
@@ -1375,9 +1378,7 @@ def parse_bootstrap_publication_alias_name(name: str) -> tuple[str, str] | None:
     return parsed
 
 
-def read_bootstrap_namespace_entry_binding(
-    path: Path, role: str, digest: str
-) -> dict[str, Any]:
+def read_bootstrap_namespace_entry_binding(path: Path, role: str, digest: str) -> dict[str, Any]:
     content = read_snapshot_file(
         path,
         "bootstrap product namespace entry",
@@ -1521,9 +1522,7 @@ def read_without_product_anchor_if_namespace_stable(
 def recover_bootstrap_publication_alias(
     path: Path, descriptor: int, lock_key: str, digest: str
 ) -> None:
-    info = require_lock_file_matches_fd(
-        path, descriptor, "bootstrap lock", allowed_nlinks={1, 2}
-    )
+    info = require_lock_file_matches_fd(path, descriptor, "bootstrap lock", allowed_nlinks={1, 2})
     if info.st_nlink == 1:
         return
     same_inode: list[Path] = []
@@ -1576,9 +1575,7 @@ def open_new_bootstrap_anchor_temp(path: Path) -> tuple[Path, int]:
     return temporary, descriptor
 
 
-def publish_bootstrap_anchor_no_replace(
-    path: Path, temporary: Path, descriptor: int
-) -> None:
+def publish_bootstrap_anchor_no_replace(path: Path, temporary: Path, descriptor: int) -> None:
     try:
         os.link(temporary, path)
     except FileExistsError:
@@ -1711,9 +1708,7 @@ def bootstrap_anchor_lock(
         if create:
             if envelope is None:
                 fail("bootstrap lock creation requires a rollback envelope")
-            descriptor, locked = open_or_publish_bootstrap_anchor(
-                path, lock_key, digest, envelope
-            )
+            descriptor, locked = open_or_publish_bootstrap_anchor(path, lock_key, digest, envelope)
         else:
             descriptor = open_existing_bootstrap_lock_file(path)
         lock_info = require_lock_file_matches_fd(
@@ -2002,9 +1997,7 @@ def exact_target_lifecycle_guard(target: Path, label: str) -> Iterator[None]:
     except BaseException:
         restore_exact_tree_snapshot(target, snapshot, label)
         fsync_directory(target.parent)
-        restore_existing_directory_object(
-            target.parent, parent_snapshot, f"{label} target parent"
-        )
+        restore_existing_directory_object(target.parent, parent_snapshot, f"{label} target parent")
         if capture_exact_tree_snapshot(target, label) != snapshot:
             fail(f"{label} target exact rollback verification failed")
         raise
@@ -2510,9 +2503,7 @@ def cleanup_intent_path(stage: Path) -> Path:
 
 
 def cleanup_journal_temp_path(journal: Path) -> Path:
-    return journal.with_name(
-        f".{journal.name}.nddev-cleanup-tmp.{os.getpid()}.{time.time_ns()}"
-    )
+    return journal.with_name(f".{journal.name}.nddev-cleanup-tmp.{os.getpid()}.{time.time_ns()}")
 
 
 def is_cleanup_publication_alias(candidate: Path, final: Path) -> bool:
@@ -2828,7 +2819,9 @@ def cleanup_source_from_descriptor(target: Path, descriptor: Any) -> Path:
 def load_cleanup_intent(target: Path, stage: Path) -> dict[str, Any]:
     intent_path = cleanup_intent_path(stage)
     loaded = parse_json_object(
-        read_regular_file(intent_path, "cleanup publication intent", max_bytes=CLEANUP_JOURNAL_MAX_BYTES),
+        read_regular_file(
+            intent_path, "cleanup publication intent", max_bytes=CLEANUP_JOURNAL_MAX_BYTES
+        ),
         "cleanup publication intent",
     )
     require_exact_keys(loaded, CLEANUP_INTENT_KEYS_V1, "cleanup publication intent")
@@ -3290,7 +3283,9 @@ def cleanup_deletion_order(entries: dict[str, dict[str, Any]]) -> list[str]:
     ]
 
 
-def cleanup_remaining_children(entries: dict[str, dict[str, Any]], deleted: set[str]) -> dict[str, set[str]]:
+def cleanup_remaining_children(
+    entries: dict[str, dict[str, Any]], deleted: set[str]
+) -> dict[str, set[str]]:
     remaining = set(entries) - deleted
     children: dict[str, set[str]] = {relative: set() for relative in remaining}
     for relative in remaining:
@@ -3502,8 +3497,7 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
     if path_exists_no_follow(pending):
         cleanup_metadata_error("cleanup-pending state already exists")
     tombstones = [
-        cleanup_tree_manifest(source, name, "cleanup tombstone")
-        for source, name in active_sources
+        cleanup_tree_manifest(source, name, "cleanup tombstone") for source, name in active_sources
     ]
     journal_content = cleanup_journal_bytes(target, tombstones)
     stage: Path | None = None
@@ -3550,7 +3544,9 @@ def publish_cleanup_pending(target: Path, sources: list[tuple[Path, str]]) -> bo
             try:
                 state = cleanup_pending_metadata(target, recover_alias=False)
                 if not state["pending"]:
-                    cleanup_metadata_error("cleanup-pending final validation found no pending state")
+                    cleanup_metadata_error(
+                        "cleanup-pending final validation found no pending state"
+                    )
                 final_validated = True
             except BaseException as validation_error:
                 raise validation_error from exc
@@ -5096,8 +5092,7 @@ def launch_image_runtime_payload_from_disk(root: Path) -> dict[str, tuple[bytes,
         mode = stat.S_IMODE(info.st_mode)
         if mode not in {OWNER_FILE_MODE, OWNER_EXEC_MODE}:
             fail(
-                "Cursor launch image residue is malformed: runtime file mode "
-                f"{relative.as_posix()}"
+                f"Cursor launch image residue is malformed: runtime file mode {relative.as_posix()}"
             )
         files[relative.as_posix()] = (
             read_regular_file(
@@ -7091,7 +7086,9 @@ def prepare_launch_image_tree_for_removal(root: Path) -> list[Path]:
                 fail(f"Cursor launch image cleanup could not list a directory: {exc}")
             stack.extend(reversed(children))
         elif stat.S_ISREG(info.st_mode):
-            require_bounded_size(info, "Cursor launch image cleanup file", SOFTWARE_ARTIFACT_MAX_BYTES)
+            require_bounded_size(
+                info, "Cursor launch image cleanup file", SOFTWARE_ARTIFACT_MAX_BYTES
+            )
             total_size += info.st_size
             if total_size > LAUNCH_IMAGE_MAX_TOTAL_SIZE:
                 fail("Cursor launch image cleanup refused an over-bound byte total")

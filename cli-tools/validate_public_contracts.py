@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import ast
-import base64
 import json
-import re
 import stat
 import sys
 from pathlib import Path
@@ -690,8 +688,7 @@ def validate_builder_projection_parity(errors: list[str]) -> None:
         errors.append("manager builder projection functions are missing")
         return
     projection_source = "\n".join(
-        ast.get_source_segment(source, node) or ""
-        for node in (source_inventory, projection)
+        ast.get_source_segment(source, node) or "" for node in (source_inventory, projection)
     )
     for token in (
         "BUILDER_SOURCE_ROOT",
