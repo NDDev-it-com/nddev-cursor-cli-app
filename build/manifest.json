@@ -11,7 +11,7 @@
     "restore_digest_required": true,
     "slots": 10
   },
-  "build_version": "0.2.0",
+  "build_version": "0.2.1",
   "builder_projection": {
     "default_on": true,
     "hooks_installed": false,
@@ -189,6 +189,10 @@
       "worker"
     ],
     "manager_command": "python3 cli-tools/nddev_cursor_cli.py launch --target <absolute-target> -- [args...]",
+    "target_role": "managed-configuration-runtime-home",
+    "workspace_source": "captured-caller-current-directory",
+    "child_working_directory_policy": "strict-resolved-caller-workspace",
+    "native_workspace_argument": null,
     "path_fallback": false,
     "path_policy": "fixed-minimal-system-path",
     "path_value": "/usr/bin:/bin",

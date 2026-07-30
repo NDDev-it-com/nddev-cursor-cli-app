@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "build_version": "0.2.0",
+  "build_version": "0.2.1",
   "python_requires": ">=3.9",
   "cursor_cli_identity": "agent",
   "cursor_cli_tested": "2026.07.23-e383d2b",
@@ -8,5 +8,5 @@
   "setup_contract_schema": 2,
   "setup_model": "orthogonal-content-setup-and-permission-profile",
   "runtime_baseline_ref": "references/cursor-cli-baseline.json",
-  "nddev_builder_plugin_version": "0.2.0"
+  "nddev_builder_plugin_version": "0.2.1"
 }

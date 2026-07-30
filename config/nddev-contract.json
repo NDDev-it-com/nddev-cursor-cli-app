@@ -150,6 +150,10 @@
       "worker"
     ],
     "manager_command": "python3 cli-tools/nddev_cursor_cli.py launch --target <absolute-target> -- [args...]",
+    "target_role": "managed-configuration-runtime-home",
+    "workspace_source": "captured-caller-current-directory",
+    "child_working_directory_policy": "strict-resolved-caller-workspace",
+    "native_workspace_argument": null,
     "path_fallback": false,
     "path_policy": "fixed-minimal-system-path",
     "path_value": "/usr/bin:/bin",

@@ -86,6 +86,12 @@ and handoff mechanics are owned by `cli-tools/nddev_cursor_cli.py`; the public
 contract is summarized in `config/nddev-contract.json` and
 `build/manifest.json`.
 
+At launch-command entry, the manager captures the caller's current directory
+once, strictly resolves it as an existing accessible project workspace, and
+passes it explicitly as the child process working directory. The managed
+target remains the isolated configuration and runtime home. Cursor Agent has
+no manager-owned native workspace argument in this contract.
+
 The setup/profile model also projects `nddev-builder` as a local native Cursor plugin
 inside the selected target's isolated home. The projection uses Cursor's
 plugin, rules, skills, custom agents, and commands surfaces. It does not

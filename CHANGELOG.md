@@ -2,6 +2,13 @@
 
 All notable changes to `nddev-cursor-cli-app` are documented here.
 
+## [0.2.1] - 2026-07-30
+
+- Capture and strictly resolve the caller workspace once at launch entry, then
+  pass it explicitly as Cursor Agent's child working directory.
+- Declare the managed target and project workspace roles in public status and
+  contracts without inventing a native Cursor workspace flag.
+
 ## [0.2.0] - 2026-07-27
 
 - Breaking pre-1.0 contract change: the setup model is now one content setup

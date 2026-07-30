@@ -439,6 +439,14 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         errors.append(f"{owner}: runtime_launch must reject legacy setup stamps")
     if launch.get("managed_override_args_blocked") != BLOCKED_LAUNCH_OVERRIDES:
         errors.append(f"{owner}: runtime_launch managed override block list mismatch")
+    if launch.get("target_role") != "managed-configuration-runtime-home":
+        errors.append(f"{owner}: runtime_launch target role mismatch")
+    if launch.get("workspace_source") != "captured-caller-current-directory":
+        errors.append(f"{owner}: runtime_launch workspace source mismatch")
+    if launch.get("child_working_directory_policy") != "strict-resolved-caller-workspace":
+        errors.append(f"{owner}: runtime_launch child cwd policy mismatch")
+    if launch.get("native_workspace_argument") is not None:
+        errors.append(f"{owner}: runtime_launch must not invent a native workspace argument")
     if launch.get("target_lock_scope") != "preflight-through-child-and-managed-config-restore":
         errors.append(f"{owner}: runtime_launch target lock scope mismatch")
     if launch.get("bootstrap_lock_scope") != BOOTSTRAP_LOCK_SCOPE:
@@ -481,6 +489,16 @@ def validate_launch_contract(owner: str, launch: dict, errors: list[str]) -> Non
         != "write-protected verified-path handoff with child-held launch-image lease fd under no-sandbox same-UID limits; no portable fd execution claimed"
     ):
         errors.append(f"{owner}: runtime_launch exec handoff boundary mismatch")
+
+
+def validate_launch_workspace_implementation(errors: list[str]) -> None:
+    source = (ROOT / "cli-tools" / "nddev_cursor_cli.py").read_text(encoding="utf-8")
+    if source.count("args.caller_workspace = resolve_caller_workspace()") != 1:
+        errors.append("manager: caller workspace must be captured exactly once at launch entry")
+    if "cwd=str(cwd)" not in source:
+        errors.append("manager: Cursor child must receive an explicit resolved cwd")
+    if '"launch_scope": launch_scope_status()' not in source:
+        errors.append("manager: status must expose launch scope policy")
 
 
 def validate_software(owner: str, software: dict, errors: list[str]) -> None:
@@ -866,6 +884,7 @@ def main() -> int:
     manifest = load_json("build/manifest.json", errors)
     contract = load_json("config/nddev-contract.json", errors)
     baseline = load_json("references/cursor-cli-baseline.json", errors)
+    validate_launch_workspace_implementation(errors)
 
     if version is not None:
         missing = REQUIRED_VERSION_KEYS - set(version)

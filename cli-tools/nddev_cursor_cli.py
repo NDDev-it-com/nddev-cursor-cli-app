@@ -7037,10 +7037,12 @@ def run_cursor_child(
     forwarded: list[str],
     environment: dict[str, str],
     *,
+    cwd: Path,
     pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[Any]:
     return subprocess.run(
         [str(executable), *forwarded],
+        cwd=str(cwd),
         env=environment,
         check=False,
         pass_fds=pass_fds,
@@ -7248,11 +7250,33 @@ def launch_write_protection(launch_image_root: Path) -> Iterator[None]:
                 raise cleanup_error
 
 
-def launch_cursor(target: Path, cursor_args: list[str]) -> int:
-    return with_mutation_bootstrap_target(target, _launch_cursor_locked, cursor_args)
+def resolve_caller_workspace() -> Path:
+    try:
+        workspace = Path.cwd().resolve(strict=True)
+        info = workspace.stat()
+    except (FileNotFoundError, OSError) as exc:
+        fail(f"cannot resolve caller workspace: {exc}")
+    if not stat.S_ISDIR(info.st_mode):
+        fail("caller workspace must resolve to a directory")
+    if not os.access(workspace, os.R_OK | os.X_OK):
+        fail("caller workspace must be readable and searchable")
+    return workspace
 
 
-def _launch_cursor_locked(target: Path, cursor_args: list[str]) -> int:
+def launch_scope_status() -> dict[str, Any]:
+    return {
+        "target_role": "managed-configuration-runtime-home",
+        "workspace_source": "captured-caller-current-directory",
+        "child_working_directory_policy": "strict-resolved-caller-workspace",
+        "native_workspace_argument": None,
+    }
+
+
+def launch_cursor(target: Path, workspace: Path, cursor_args: list[str]) -> int:
+    return with_mutation_bootstrap_target(target, _launch_cursor_locked, workspace, cursor_args)
+
+
+def _launch_cursor_locked(target: Path, workspace: Path, cursor_args: list[str]) -> int:
     forwarded = list(cursor_args)
     reject_managed_launch_overrides(forwarded)
     prepare_lifecycle_target(target, create_missing=False)
@@ -7296,6 +7320,7 @@ def _launch_cursor_locked(target: Path, cursor_args: list[str]) -> int:
                         executable,
                         forwarded,
                         environment,
+                        cwd=workspace,
                         pass_fds=(int(launch_image["lease_fd"]),),
                     )
                 except BaseException as exc:
@@ -7440,6 +7465,7 @@ def run_target_command(target: Path, args: argparse.Namespace) -> dict[str, Any]
             "command": "status",
             "target": str(target),
             **_inspect_target_locked(target),
+            "launch_scope": launch_scope_status(),
         }
     if args.command == "plan":
         return _plan_setup_locked(target, args.setup, args.profile)
@@ -7460,7 +7486,11 @@ def run_target_command(target: Path, args: argparse.Namespace) -> dict[str, Any]
     if args.command == "remove":
         return _remove_setup_locked(target)
     if args.command == "launch":
-        return _launch_cursor_locked(target, normalized_launch_args(list(args.cursor_args)))
+        return _launch_cursor_locked(
+            target,
+            args.caller_workspace,
+            normalized_launch_args(list(args.cursor_args)),
+        )
     fail(f"unsupported command: {args.command}")
 
 
@@ -7475,6 +7505,8 @@ def run(args: argparse.Namespace) -> dict[str, Any] | int:
             "default_profile": DEFAULT_PROFILE_ID,
         }
     if args.command in TARGET_COMMANDS:
+        if args.command == "launch":
+            args.caller_workspace = resolve_caller_workspace()
         if args.command in READ_ONLY_TARGET_COMMANDS:
             return with_read_bootstrap_target(args.target, run_target_command, args)
         return with_mutation_bootstrap_target(args.target, run_target_command, args)
