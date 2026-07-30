@@ -44,7 +44,7 @@ same-user tampering outside the manager.
 
 Production installs use only the pinned official Cursor artifact described by
 `references/cursor-cli-baseline.json`. That baseline owns the current official
-release id, artifact URLs, supported platform artifact map, sizes, and SHA-256
+runtime version, artifact URLs, supported platform artifact map, sizes, and SHA-256
 digests. `build/manifest.json` owns the runtime closure published with this
 module version.
 

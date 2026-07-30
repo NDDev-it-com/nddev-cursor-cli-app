@@ -1,9 +1,8 @@
 {
   "schema_version": 1,
   "verified_ref": "references/cursor-cli-baseline.json",
-  "verified_date": "2026-07-27",
   "release": {
-    "id": "2026.07.23-e383d2b",
+    "version": "2026.07.23-e383d2b",
     "installer": "https://cursor.com/install",
     "installer_sha256": "905a5e6896f526ea24358372cd0983a19e0d262ccd779c317d256771ed84c850",
     "artifact_template": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/{os}/{arch}/agent-cli-package.tar.gz",

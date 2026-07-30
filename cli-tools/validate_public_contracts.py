@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CURSOR_RELEASE_ID = "2026.07.23-e383d2b"
+CURSOR_VERSION = "2026.07.23-e383d2b"
 PYTHON_REQUIRES = ">=3.9"
 BOOTSTRAP_LOCK_SCOPE = (
     "mutations publish or open the product anchor before target observation, then hand off to "
@@ -502,7 +502,7 @@ def validate_launch_workspace_implementation(errors: list[str]) -> None:
 
 
 def validate_software(owner: str, software: dict, errors: list[str]) -> None:
-    if software.get("version") != CURSOR_RELEASE_ID:
+    if software.get("version") != CURSOR_VERSION:
         errors.append(f"{owner}: software_install.version mismatch")
     if software.get("command") != "agent" or software.get("managed_command") != "bin/agent":
         errors.append(f"{owner}: software_install must manage bin/agent")
@@ -849,7 +849,7 @@ def validate_public_doc_hygiene(errors: list[str]) -> None:
         "--json",
     )
     volatile_needles = (
-        CURSOR_RELEASE_ID,
+        CURSOR_VERSION,
         "downloads.cursor.com",
         "`0700`",
         "`0600`",
@@ -901,7 +901,7 @@ def main() -> int:
             errors.append("build/version.json: python_requires must include macOS Python 3.9")
         if version.get("cursor_cli_identity") != "agent":
             errors.append("build/version.json: cursor_cli_identity must be agent")
-        if version.get("cursor_cli_tested") != CURSOR_RELEASE_ID:
+        if version.get("cursor_cli_tested") != CURSOR_VERSION:
             errors.append("build/version.json: cursor_cli_tested mismatch")
         if version.get("cursor_config_schema") != 1:
             errors.append("build/version.json: cursor_config_schema must be 1")
@@ -1225,10 +1225,15 @@ def main() -> int:
             errors.append("config/nddev-contract.json: MCP servers must not be installed")
 
     if baseline is not None:
-        if baseline.get("release", {}).get("id") != CURSOR_RELEASE_ID:
-            errors.append("references/cursor-cli-baseline.json: release id mismatch")
-        if baseline.get("verified_date") != "2026-07-27":
-            errors.append("references/cursor-cli-baseline.json: verified_date mismatch")
+        release = baseline.get("release", {})
+        if release.get("version") != CURSOR_VERSION:
+            errors.append("references/cursor-cli-baseline.json: release version mismatch")
+        if "id" in release:
+            errors.append("references/cursor-cli-baseline.json: legacy release.id is forbidden")
+        if "verified_date" in baseline:
+            errors.append(
+                "references/cursor-cli-baseline.json: observation-only verified_date is public"
+            )
         if baseline.get("release", {}).get("artifacts") != EXPECTED_ARTIFACTS:
             errors.append("references/cursor-cli-baseline.json: artifact pins mismatch")
         if baseline.get("host_platform_scope") != BASELINE_PLATFORM_SCOPE:
@@ -1242,7 +1247,7 @@ def main() -> int:
         if baseline.get("configuration", {}).get("environment_override") != "CURSOR_CONFIG_DIR":
             errors.append("references/cursor-cli-baseline.json: missing CURSOR_CONFIG_DIR")
         install = baseline.get("software_install", {})
-        if install.get("version") != CURSOR_RELEASE_ID:
+        if install.get("version") != CURSOR_VERSION:
             errors.append("references/cursor-cli-baseline.json: software_install.version mismatch")
         if install.get("managed_command") != "bin/agent":
             errors.append("references/cursor-cli-baseline.json: managed_command mismatch")
