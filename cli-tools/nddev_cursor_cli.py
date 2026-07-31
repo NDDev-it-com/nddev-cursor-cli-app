@@ -1070,7 +1070,9 @@ def canonical_target_text(target: Path) -> str:
 
 
 def bootstrap_lock_system_root() -> Path:
-    return Path("/tmp").resolve(strict=True)
+    # Resolve the platform temp directory at call time so isolated callers can
+    # provide a private sticky root without sharing the host /tmp namespace.
+    return Path(tempfile.gettempdir()).resolve(strict=True)
 
 
 def require_bootstrap_lock_system_root() -> Path:
