@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CURSOR_VERSION = "2026.07.23-e383d2b"
+CURSOR_VERSION = "2026.08.04-aaa8809"
 PYTHON_REQUIRES = ">=3.9"
 BOOTSTRAP_LOCK_SCOPE = (
     "mutations publish or open the product anchor before target observation, then hand off to "
@@ -57,7 +57,7 @@ SOFTWARE_PRESENCE_SIGNAL = (
     "software-status JSON exposes present=true and presence entries for "
     "NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, "
     ".nddev-software/cursor-cli/launch-images, "
-    ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent"
+    ".nddev-software/cursor-cli/versions/2026.08.04-aaa8809, or bin/agent"
 )
 SOFTWARE_STATUS_FIELDS = [
     "installed",
@@ -87,20 +87,20 @@ REQUIRED_VERSION_KEYS = {
 }
 EXPECTED_ARTIFACTS = {
     "darwin/arm64/agent-cli-package.tar.gz": {
-        "sha256": "f2eb25851f2079dcdf0558a816e06c402d187abfca93255d35167020439ebbf2",
-        "size": 69706672,
+        "sha256": "fc1d267622ff806a33dbf516148b9fd3957807f4d931c763118c269f92b535fc",
+        "size": 76041076,
     },
     "darwin/x64/agent-cli-package.tar.gz": {
-        "sha256": "f44194dfcb41468f85bfb4e53978ac098a2a78ce629806490c32b80b40975aa2",
-        "size": 71981431,
+        "sha256": "3b2b95fa681745f30b1d031e67d23c1a19934ed42f39dea3ab7d2d7728320aa5",
+        "size": 78986294,
     },
     "linux/arm64/agent-cli-package.tar.gz": {
-        "sha256": "f40b99647cb24e0da885e97620a2048034f1fe8961910d573d827d77c4d26dcb",
-        "size": 81115960,
+        "sha256": "d5196289292a660b59807ac508c9ac36ec1e1a1a7e4697af3ef6824fdea984ee",
+        "size": 84453423,
     },
     "linux/x64/agent-cli-package.tar.gz": {
-        "sha256": "702ad595213bee5df0268be9f80a19f29fcceaa2a42fc55e39f2b5199051f0c4",
-        "size": 82521188,
+        "sha256": "e282068dcb5cdd668b8ce2e3456c58be13bb64a834e1ad49f8534b5cd7aa2fe5",
+        "size": 85882021,
     },
 }
 EXPECTED_NATIVE_CAPABILITY_SURFACES = {

@@ -11,7 +11,7 @@
     "restore_digest_required": true,
     "slots": 10
   },
-  "build_version": "0.2.1",
+  "build_version": "0.2.2",
   "builder_projection": {
     "default_on": true,
     "hooks_installed": false,
@@ -213,12 +213,12 @@
     "host_platform_preflight": "Supported NDDev host IDs are macos-arm64, macos-x64, ubuntu-glibc-arm64, and ubuntu-glibc-x64. Ubuntu desktop/server hosts must report ID=ubuntu and glibc; Cursor publishes no official Ubuntu/glibc version floor. Upstream darwin/* and linux/* artifact paths remain vendor IDs. windows, non-ubuntu-linux, linux-musl, and unsupported-architecture fail before bootstrap lock, target lock, target creation, download, stage, or launch",
     "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target <absolute-target> [--json]",
     "install_precondition": "absent target-owned software presence",
-    "layout": ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/ full dist-package runtime tree plus bin/agent launcher",
+    "layout": ".nddev-software/cursor-cli/versions/2026.08.04-aaa8809/ full dist-package runtime tree plus bin/agent launcher",
     "managed_command": "bin/agent",
     "mechanism": "official-cursor-agent-artifact",
     "npm": null,
     "pip": null,
-    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/launch-images, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
+    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/launch-images, .nddev-software/cursor-cli/versions/2026.08.04-aaa8809, or bin/agent",
     "remove_command": "python3 cli-tools/nddev_cursor_cli.py remove-cli --target <absolute-target> [--json]",
     "remove_precondition": "absent, current, or partial target-owned software presence",
     "stage_and_atomic_swap": true,
@@ -238,7 +238,7 @@
     "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target <absolute-target> [--json]",
     "update_current_behavior": "idempotent no-op without downloading",
     "update_precondition": "existing target-owned software presence, including repairable missing or corrupt identity stamp",
-    "version": "2026.07.23-e383d2b"
+    "version": "2026.08.04-aaa8809"
   },
   "source_roots": {
     "profiles": "profiles",

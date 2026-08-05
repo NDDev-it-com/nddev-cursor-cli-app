@@ -94,7 +94,7 @@ LEGACY_SETUP_PROFILE_IDS = {
     "safe": "safe",
     "review": None,
 }
-CURSOR_VERSION = "2026.07.23-e383d2b"
+CURSOR_VERSION = "2026.08.04-aaa8809"
 CURSOR_RELEASE_BASE_URL = f"https://downloads.cursor.com/lab/{CURSOR_VERSION}"
 CURSOR_RUNTIME_ROOT = Path("dist-package")
 CURSOR_RUNTIME_ENTRYPOINT = Path("cursor-agent")
@@ -122,23 +122,23 @@ MUSL_LOADER_GLOBS = (
 CURSOR_OFFICIAL_ASSETS = {
     ("darwin", "arm64"): (
         "darwin/arm64/agent-cli-package.tar.gz",
-        "f2eb25851f2079dcdf0558a816e06c402d187abfca93255d35167020439ebbf2",
-        69706672,
+        "fc1d267622ff806a33dbf516148b9fd3957807f4d931c763118c269f92b535fc",
+        76041076,
     ),
     ("darwin", "x64"): (
         "darwin/x64/agent-cli-package.tar.gz",
-        "f44194dfcb41468f85bfb4e53978ac098a2a78ce629806490c32b80b40975aa2",
-        71981431,
+        "3b2b95fa681745f30b1d031e67d23c1a19934ed42f39dea3ab7d2d7728320aa5",
+        78986294,
     ),
     ("linux", "arm64"): (
         "linux/arm64/agent-cli-package.tar.gz",
-        "f40b99647cb24e0da885e97620a2048034f1fe8961910d573d827d77c4d26dcb",
-        81115960,
+        "d5196289292a660b59807ac508c9ac36ec1e1a1a7e4697af3ef6824fdea984ee",
+        84453423,
     ),
     ("linux", "x64"): (
         "linux/x64/agent-cli-package.tar.gz",
-        "702ad595213bee5df0268be9f80a19f29fcceaa2a42fc55e39f2b5199051f0c4",
-        82521188,
+        "e282068dcb5cdd668b8ce2e3456c58be13bb64a834e1ad49f8534b5cd7aa2fe5",
+        85882021,
     ),
 }
 SUPPORTED_HOST_IDS = (
@@ -5428,7 +5428,7 @@ def software_presence(target: Path) -> list[str]:
         (launch_images_root(target), ".nddev-software/cursor-cli/launch-images"),
         (
             software_version_dir(target),
-            ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
+            ".nddev-software/cursor-cli/versions/2026.08.04-aaa8809",
         ),
     )
     presence = [
@@ -6273,7 +6273,7 @@ def _software_status_locked(target: Path) -> dict[str, Any]:
         (software_root(target) / "versions", ".nddev-software/cursor-cli/versions"),
         (
             software_version_dir(target),
-            ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
+            ".nddev-software/cursor-cli/versions/2026.08.04-aaa8809",
         ),
     ):
         directory_drift = software_directory_mode_drift(directory, label)
@@ -6303,7 +6303,7 @@ def _software_status_locked(target: Path) -> dict[str, Any]:
     if stamp is None:
         for partial_file, label in (
             (binary, "bin/agent"),
-            (version_binary, ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/cursor-agent"),
+            (version_binary, ".nddev-software/cursor-cli/versions/2026.08.04-aaa8809/cursor-agent"),
         ):
             if partial_file.exists() or partial_file.is_symlink():
                 read_optional_software_file(
@@ -6344,13 +6344,13 @@ def _software_status_locked(target: Path) -> dict[str, Any]:
         elif not binary_mode_ok:
             drift.append("bin/agent:mode")
         if not version_digest_ok:
-            drift.append(".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/cursor-agent")
+            drift.append(".nddev-software/cursor-cli/versions/2026.08.04-aaa8809/cursor-agent")
         elif not version_mode_ok:
-            drift.append(".nddev-software/cursor-cli/versions/2026.07.23-e383d2b/cursor-agent:mode")
+            drift.append(".nddev-software/cursor-cli/versions/2026.08.04-aaa8809/cursor-agent:mode")
         if not runtime_digest_ok:
-            drift.append(".nddev-software/cursor-cli/versions/2026.07.23-e383d2b:runtime")
+            drift.append(".nddev-software/cursor-cli/versions/2026.08.04-aaa8809:runtime")
         elif runtime_identity is not None and runtime_identity["mode_drift"]:
-            drift.append(".nddev-software/cursor-cli/versions/2026.07.23-e383d2b:mode")
+            drift.append(".nddev-software/cursor-cli/versions/2026.08.04-aaa8809:mode")
         installed = (
             binary_digest_ok
             and version_digest_ok
@@ -6488,7 +6488,7 @@ def _install_cursor_cli_locked(target: Path, command: str) -> dict[str, Any]:
             )
             changed = [
                 "bin/agent",
-                ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
+                ".nddev-software/cursor-cli/versions/2026.08.04-aaa8809",
             ]
             if before_stamp_bytes != stamp_bytes:
                 changed.append(f".nddev-software/cursor-cli/{SOFTWARE_STAMP_NAME}")

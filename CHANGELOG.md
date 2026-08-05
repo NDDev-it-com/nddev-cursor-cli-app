@@ -2,6 +2,11 @@
 
 All notable changes to `nddev-cursor-cli-app` are documented here.
 
+## [0.2.2] - 2026-08-06
+
+- Update the tested Cursor Agent CLI to `2026.08.04-aaa8809` and synchronize
+  the official installer and all four supported host artifact identities.
+
 ## [0.2.1] - 2026-07-30
 
 - Capture and strictly resolve the caller workspace once at launch entry, then

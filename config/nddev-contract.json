@@ -263,9 +263,9 @@
     "mechanism": "official-cursor-agent-artifact",
     "npm": null,
     "official_installer": "https://cursor.com/install",
-    "official_source": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/{os}/{arch}/agent-cli-package.tar.gz",
+    "official_source": "https://downloads.cursor.com/lab/2026.08.04-aaa8809/{os}/{arch}/agent-cli-package.tar.gz",
     "pip": null,
-    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/launch-images, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
+    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/launch-images, .nddev-software/cursor-cli/versions/2026.08.04-aaa8809, or bin/agent",
     "remove_command": "python3 cli-tools/nddev_cursor_cli.py remove-cli --target <absolute-target> [--json]",
     "remove_precondition": "absent, current, or partial target-owned software presence",
     "rollback_on_failure": true,
@@ -286,7 +286,7 @@
     "update_command": "python3 cli-tools/nddev_cursor_cli.py update-cli --target <absolute-target> [--json]",
     "update_current_behavior": "idempotent no-op without downloading",
     "update_precondition": "existing target-owned software presence, including repairable missing or corrupt identity stamp",
-    "version": "2026.07.23-e383d2b"
+    "version": "2026.08.04-aaa8809"
   },
   "software_lifecycle": {
     "credential_inheritance": "provider secrets are not inherited by installer subprocesses or launch",
@@ -294,7 +294,7 @@
     "failure_current_behavior": "exact rollback or transaction marker forces current=false",
     "install_command": "python3 cli-tools/nddev_cursor_cli.py install-cli --target /absolute/target --json",
     "install_precondition": "install-cli refuses any existing target-owned software presence; use update-cli for partial or existing state",
-    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/launch-images, .nddev-software/cursor-cli/versions/2026.07.23-e383d2b, or bin/agent",
+    "presence_signal": "software-status JSON exposes present=true and presence entries for NDDEV-CURSOR-CLI-SOFTWARE.json, .nddev-software/cursor-cli, .nddev-software/cursor-cli/launch-images, .nddev-software/cursor-cli/versions/2026.08.04-aaa8809, or bin/agent",
     "private_modes": {
       "binary": "0700",
       "directories": "0700",
@@ -303,7 +303,7 @@
     "remove_command": "python3 cli-tools/nddev_cursor_cli.py remove-cli --target /absolute/target --json",
     "remove_precondition": "remove-cli accepts absent, current, or partial target-owned software state and removes only manager-owned software paths",
     "rollback_on_swap_failure": true,
-    "software_root": ".nddev-software/cursor-cli/versions/2026.07.23-e383d2b",
+    "software_root": ".nddev-software/cursor-cli/versions/2026.08.04-aaa8809",
     "stage_and_atomic_swap": true,
     "stamp_file": "NDDEV-CURSOR-CLI-SOFTWARE.json",
     "stamp_schema": 1,
