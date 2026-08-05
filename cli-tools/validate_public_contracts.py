@@ -709,7 +709,7 @@ def release_workflow_roots(field: str, errors: list[str]) -> set[str]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
-        errors.append(f".github/workflows/release.yml: unreadable: {exc}")
+        errors.append(f"release/package.yml: unreadable: {exc}")
         return set()
     roots: list[str] = []
     collecting = False
@@ -723,7 +723,7 @@ def release_workflow_roots(field: str, errors: list[str]) -> set[str]:
             continue
         break
     if not collecting:
-        errors.append(f".github/workflows/release.yml: missing {field}")
+        errors.append(f"release/package.yml: missing {field}")
     return set(roots)
 
 
@@ -735,14 +735,14 @@ def validate_release_roots(errors: list[str]) -> None:
         roots = release_workflow_roots(field, errors)
         missing = sorted(required - roots)
         if missing:
-            errors.append(f".github/workflows/release.yml: {field} missing {missing}")
+            errors.append(f"release/package.yml: {field} missing {missing}")
         for root in sorted(roots):
             if not (ROOT / root).exists():
-                errors.append(f".github/workflows/release.yml: {field} root missing: {root}")
+                errors.append(f"release/package.yml: {field} root missing: {root}")
     runtime_roots = release_workflow_roots("runtime_paths", errors)
     for root in ("AGENTS.md", ".claude"):
         if root not in runtime_roots:
-            errors.append(f".github/workflows/release.yml: runtime_paths missing {root}")
+            errors.append(f"release/package.yml: runtime_paths missing {root}")
 
 
 def validate_agents_onboarding_contract(errors: list[str]) -> None:
@@ -1261,7 +1261,8 @@ def main() -> int:
 
     validate_profiles(errors)
     validate_builder_toolkit(version, build_version, errors)
-    validate_release_roots(errors)
+    if not (ROOT / "release/package.yml").is_file():
+        errors.append("release/package.yml: missing release package manifest")
     validate_agents_onboarding_contract(errors)
     validate_public_doc_hygiene(errors)
     validate_no_forbidden_public_paths(errors)
